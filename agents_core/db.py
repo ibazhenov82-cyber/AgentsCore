@@ -30,9 +30,12 @@ from .models import (
     Branch,
     Chat,
     DefaultSettings,
+    LongTermMemoryEntry,
     Message,
     ModelInfo,
+    Profile,
     Settings,
+    WorkingMemoryEntry,
 )
 
 # Колонки настроек (одинаковы для agents и chats) и их SQL-типы.
@@ -50,6 +53,12 @@ _SETTINGS_COLUMNS = [
     ("stop_sequences", "TEXT"),  # JSON-массив строк
     ("tool_choice", "TEXT"),
     ("tools_json", "TEXT"),
+    ("memory_tools_enabled", "INTEGER"),
+    ("working_memory_enabled", "INTEGER"),
+    ("long_term_memory_enabled", "INTEGER"),
+    ("episodic_memory_enabled", "INTEGER"),
+    ("semantic_memory_enabled", "INTEGER"),
+    ("procedural_memory_enabled", "INTEGER"),
     ("summary_prompt", "TEXT"),
     ("summary_system_prompt", "TEXT"),
     ("autosummary", "TEXT"),
@@ -100,6 +109,12 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "stop_sequences": json.dumps(settings.stop_sequences, ensure_ascii=False),
         "tool_choice": settings.tool_choice,
         "tools_json": settings.tools_json,
+        "memory_tools_enabled": int(settings.memory_tools_enabled),
+        "working_memory_enabled": int(settings.working_memory_enabled),
+        "long_term_memory_enabled": int(settings.long_term_memory_enabled),
+        "episodic_memory_enabled": int(settings.episodic_memory_enabled),
+        "semantic_memory_enabled": int(settings.semantic_memory_enabled),
+        "procedural_memory_enabled": int(settings.procedural_memory_enabled),
         "summary_prompt": settings.summary_prompt,
         "summary_system_prompt": settings.summary_system_prompt,
         "autosummary": settings.autosummary,
@@ -131,6 +146,27 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         stop_sequences=json.loads(row["stop_sequences"]) if row["stop_sequences"] else [],
         tool_choice=row["tool_choice"],
         tools_json=row["tools_json"] or "",
+        memory_tools_enabled=bool(row["memory_tools_enabled"]) if "memory_tools_enabled" in keys else False,
+        # ВАЖНО: это НЕ дефолт для новых агентов (тот теперь False — см.
+        # `Settings.working_memory_enabled`/`long_term_memory_enabled`) — это
+        # обратная совместимость ТОЛЬКО для строк, созданных ДО появления этих
+        # колонок: после ALTER TABLE такая строка первое время хранит NULL, а
+        # не 0/1, и здесь мы явно отличаем "значения нет" (мигрированная старая
+        # строка → True, не потерять то, что уже было включено) от "явно
+        # выключено" (0, в т.ч. для только что созданных агентов/чатов).
+        working_memory_enabled=(
+            bool(row["working_memory_enabled"])
+            if "working_memory_enabled" in keys and row["working_memory_enabled"] is not None
+            else True
+        ),
+        long_term_memory_enabled=(
+            bool(row["long_term_memory_enabled"])
+            if "long_term_memory_enabled" in keys and row["long_term_memory_enabled"] is not None
+            else True
+        ),
+        episodic_memory_enabled=bool(row["episodic_memory_enabled"]) if "episodic_memory_enabled" in keys and row["episodic_memory_enabled"] is not None else False,
+        semantic_memory_enabled=bool(row["semantic_memory_enabled"]) if "semantic_memory_enabled" in keys and row["semantic_memory_enabled"] is not None else False,
+        procedural_memory_enabled=bool(row["procedural_memory_enabled"]) if "procedural_memory_enabled" in keys and row["procedural_memory_enabled"] is not None else False,
         summary_prompt=row["summary_prompt"],
         summary_system_prompt=(row["summary_system_prompt"] if "summary_system_prompt" in keys else None)
         or Settings.__dataclass_fields__["summary_system_prompt"].default,
@@ -219,6 +255,7 @@ class Database:
                     name TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    default_profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL,
                     {settings_cols_sql}
                 );
 
@@ -228,6 +265,7 @@ class Database:
                     title TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
+                    active_profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL,
                     {settings_cols_sql}
                 );
 
@@ -272,9 +310,47 @@ class Database:
                     PRIMARY KEY (provider, model_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    style TEXT,
+                    format TEXT,
+                    constraints TEXT,
+                    skills_json TEXT NOT NULL DEFAULT '',
+                    orchestration_prompt TEXT,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS working_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE (chat_id, key)
+                );
+
+                CREATE TABLE IF NOT EXISTS long_term_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                    category TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE (agent_id, category, key)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_chats_agent_id ON chats(agent_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_branches_chat_id ON chat_branches(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_working_memory_chat_id ON working_memory(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_long_term_memory_agent_id ON long_term_memory(agent_id);
                 """
             )
             # Защитная миграция: если база создана предыдущей версией сервиса
@@ -287,6 +363,59 @@ class Database:
                 self._ensure_column(conn, "default_settings", name, sql_type)
             for name, sql_type in _MESSAGE_EXTRA_COLUMNS:
                 self._ensure_column(conn, "messages", name, sql_type)
+            self._ensure_column(conn, "chats", "active_profile_id", "TEXT")
+            self._ensure_column(conn, "agents", "default_profile_id", "TEXT")
+            self._migrate_profiles_to_global_catalog(conn)
+
+    def _migrate_profiles_to_global_catalog(self, conn: sqlite3.Connection) -> None:
+        """Раньше `profiles` были привязаны к ОДНОМУ агенту (`agent_id NOT
+        NULL REFERENCES agents(id) ON DELETE CASCADE`) — по замечанию
+        пользователя профили теперь общий справочник для ВСЕХ агентов
+        (выбираются в настройках любого агента/чата), поэтому убираем эту
+        привязку из схемы. SQLite не умеет ALTER TABLE DROP COLUMN/CONSTRAINT
+        для такого случая, поэтому пересобираем таблицу.
+
+        Порядок операций важен: если переименовать САМУ `profiles` (напр. в
+        `profiles_old`) при включённых внешних ключах, SQLite перезапишет
+        текст FK-определения в `chats.active_profile_id` на новое имя — и он
+        останется указывать на `profiles_old` даже после того, как мы создадим
+        новую таблицу `profiles` и удалим `profiles_old` (проверено вручную:
+        JOIN после такой последовательности молча возвращает NULL). Поэтому
+        вместо переименования исходной таблицы создаём НОВУЮ под временным
+        именем, переносим данные, удаляем СТАРУЮ `profiles`, и только потом
+        переименовываем новую в `profiles` — на этом шаге чужие FK ни на что
+        не указывают, переписывать нечего."""
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+        if "agent_id" not in cols:
+            return  # уже мигрировано (или свежая база, сразу созданная по новой схеме)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
+            """
+            CREATE TABLE profiles__migrating_new (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                style TEXT,
+                format TEXT,
+                constraints TEXT,
+                skills_json TEXT NOT NULL DEFAULT '',
+                orchestration_prompt TEXT,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO profiles__migrating_new (
+                id, name, style, format, constraints, skills_json,
+                orchestration_prompt, is_default, created_at, updated_at
+            )
+            SELECT id, name, style, format, constraints, skills_json,
+                   orchestration_prompt, is_default, created_at, updated_at
+            FROM profiles;
+            DROP INDEX IF EXISTS idx_profiles_agent_id;
+            DROP TABLE profiles;
+            ALTER TABLE profiles__migrating_new RENAME TO profiles;
+            """
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
 
     # ---- настройки по умолчанию -----------------------------------------
 
@@ -329,6 +458,13 @@ class Database:
             conn.execute(f"INSERT INTO agents ({', '.join(columns)}) VALUES ({placeholders})", values)
         return Agent(id=agent_id, name=name, created_at=now, updated_at=now, settings=settings)
 
+    @staticmethod
+    def _agent_default_profile_id(row: sqlite3.Row) -> Optional[str]:
+        # Обратная совместимость: строки, созданные до появления этой
+        # колонки, не имеют её вовсе (см. _ensure_column) — просто "профиль
+        # по умолчанию не задан", а не ошибка.
+        return row["default_profile_id"] if "default_profile_id" in row.keys() else None
+
     def get_agent(self, agent_id: str) -> Optional[Agent]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
@@ -337,6 +473,7 @@ class Database:
             return Agent(
                 id=row["id"], name=row["name"], created_at=row["created_at"],
                 updated_at=row["updated_at"], settings=_row_to_settings(row),
+                default_profile_id=self._agent_default_profile_id(row),
             )
 
     def list_agents(self) -> List[Agent]:
@@ -344,7 +481,8 @@ class Database:
             rows = conn.execute("SELECT * FROM agents ORDER BY updated_at DESC").fetchall()
             return [
                 Agent(id=r["id"], name=r["name"], created_at=r["created_at"],
-                      updated_at=r["updated_at"], settings=_row_to_settings(r))
+                      updated_at=r["updated_at"], settings=_row_to_settings(r),
+                      default_profile_id=self._agent_default_profile_id(r))
                 for r in rows
             ]
 
@@ -353,6 +491,13 @@ class Database:
             conn.execute(
                 "UPDATE agents SET name = ?, updated_at = ? WHERE id = ?",
                 (name, int(time.time()), agent_id),
+            )
+
+    def set_agent_default_profile(self, agent_id: str, profile_id: Optional[str]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE agents SET default_profile_id = ?, updated_at = ? WHERE id = ?",
+                (profile_id, int(time.time()), agent_id),
             )
 
     def update_agent_settings(self, agent_id: str, settings: Settings) -> None:
@@ -374,16 +519,21 @@ class Database:
 
     # ---- чаты ---------------------------------------------------------------
 
-    def create_chat(self, agent_id: str, title: str, settings: Settings) -> Chat:
+    def create_chat(
+        self, agent_id: str, title: str, settings: Settings, active_profile_id: Optional[str] = None,
+    ) -> Chat:
         chat_id = str(uuid.uuid4())
         now = int(time.time())
         row = _settings_to_row(settings)
         with self._connect() as conn:
-            columns = ["id", "agent_id", "title", "created_at", "updated_at"] + list(row.keys())
-            values = [chat_id, agent_id, title, now, now] + list(row.values())
+            columns = ["id", "agent_id", "title", "created_at", "updated_at", "active_profile_id"] + list(row.keys())
+            values = [chat_id, agent_id, title, now, now, active_profile_id] + list(row.values())
             placeholders = ", ".join("?" for _ in columns)
             conn.execute(f"INSERT INTO chats ({', '.join(columns)}) VALUES ({placeholders})", values)
-        return Chat(id=chat_id, agent_id=agent_id, title=title, created_at=now, updated_at=now, settings=settings)
+        return Chat(
+            id=chat_id, agent_id=agent_id, title=title, created_at=now, updated_at=now, settings=settings,
+            active_profile_id=active_profile_id,
+        )
 
     def get_chat(self, chat_id: str) -> Optional[Chat]:
         with self._connect() as conn:
@@ -394,6 +544,7 @@ class Database:
                 id=row["id"], agent_id=row["agent_id"], title=row["title"],
                 created_at=row["created_at"], updated_at=row["updated_at"],
                 settings=_row_to_settings(row),
+                active_profile_id=row["active_profile_id"] if "active_profile_id" in row.keys() else None,
             )
 
     def list_chats(self, agent_id: Optional[str] = None) -> List[Chat]:
@@ -406,9 +557,17 @@ class Database:
                 rows = conn.execute("SELECT * FROM chats ORDER BY updated_at DESC").fetchall()
             return [
                 Chat(id=r["id"], agent_id=r["agent_id"], title=r["title"], created_at=r["created_at"],
-                     updated_at=r["updated_at"], settings=_row_to_settings(r))
+                     updated_at=r["updated_at"], settings=_row_to_settings(r),
+                     active_profile_id=r["active_profile_id"] if "active_profile_id" in r.keys() else None)
                 for r in rows
             ]
+
+    def set_chat_active_profile(self, chat_id: str, profile_id: Optional[str]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chats SET active_profile_id = ?, updated_at = ? WHERE id = ?",
+                (profile_id, int(time.time()), chat_id),
+            )
 
     def rename_chat(self, chat_id: str, title: str) -> None:
         with self._connect() as conn:
@@ -588,3 +747,157 @@ class Database:
                 )
                 for r in rows
             ]
+
+    # ---- рабочая память (working_memory, область видимости — чат) ----------
+
+    @staticmethod
+    def _row_to_working_memory(row: sqlite3.Row) -> WorkingMemoryEntry:
+        return WorkingMemoryEntry(
+            id=row["id"], chat_id=row["chat_id"], key=row["key"], value=row["value"],
+            source=row["source"] or "manual", created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def upsert_working_memory(self, chat_id: str, key: str, value: str, source: str = "manual") -> WorkingMemoryEntry:
+        """Сохраняет запись рабочей памяти; если запись с таким `key` в этом
+        чате уже есть — обновляет значение и источник (upsert), не создавая
+        дубликат. Именно так демо-скилл "Покупки" обновляет корзину под
+        ключом "cart" при каждом add_to_cart."""
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO working_memory (chat_id, key, value, source, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(chat_id, key) DO UPDATE SET
+                       value = excluded.value, source = excluded.source, updated_at = excluded.updated_at""",
+                (chat_id, key, value, source, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM working_memory WHERE chat_id = ? AND key = ?", (chat_id, key)
+            ).fetchone()
+            return self._row_to_working_memory(row)
+
+    def list_working_memory(self, chat_id: str) -> List[WorkingMemoryEntry]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM working_memory WHERE chat_id = ? ORDER BY updated_at DESC", (chat_id,)
+            ).fetchall()
+            return [self._row_to_working_memory(r) for r in rows]
+
+    def get_working_memory(self, chat_id: str, key: str) -> Optional[WorkingMemoryEntry]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM working_memory WHERE chat_id = ? AND key = ?", (chat_id, key)
+            ).fetchone()
+            return self._row_to_working_memory(row) if row is not None else None
+
+    def delete_working_memory(self, chat_id: str, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM working_memory WHERE chat_id = ? AND key = ?", (chat_id, key))
+
+    # ---- долговременная память (long_term_memory, область видимости — агент) --
+
+    @staticmethod
+    def _row_to_long_term_memory(row: sqlite3.Row) -> LongTermMemoryEntry:
+        return LongTermMemoryEntry(
+            id=row["id"], agent_id=row["agent_id"], category=row["category"], key=row["key"],
+            value=row["value"], source=row["source"] or "manual",
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def upsert_long_term_memory(self, agent_id: str, category: str, key: str, value: str, source: str = "manual") -> LongTermMemoryEntry:
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO long_term_memory (agent_id, category, key, value, source, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(agent_id, category, key) DO UPDATE SET
+                       value = excluded.value, source = excluded.source, updated_at = excluded.updated_at""",
+                (agent_id, category, key, value, source, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM long_term_memory WHERE agent_id = ? AND category = ? AND key = ?",
+                (agent_id, category, key),
+            ).fetchone()
+            return self._row_to_long_term_memory(row)
+
+    def list_long_term_memory(self, agent_id: str, category: Optional[str] = None) -> List[LongTermMemoryEntry]:
+        with self._connect() as conn:
+            if category is not None:
+                rows = conn.execute(
+                    "SELECT * FROM long_term_memory WHERE agent_id = ? AND category = ? ORDER BY updated_at DESC",
+                    (agent_id, category),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM long_term_memory WHERE agent_id = ? ORDER BY updated_at DESC", (agent_id,)
+                ).fetchall()
+            return [self._row_to_long_term_memory(r) for r in rows]
+
+    def delete_long_term_memory(self, agent_id: str, category: str, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM long_term_memory WHERE agent_id = ? AND category = ? AND key = ?",
+                (agent_id, category, key),
+            )
+
+    # ---- профили-пайплайны (profiles, общий справочник для ВСЕХ агентов) ---
+
+    @staticmethod
+    def _row_to_profile(row: sqlite3.Row) -> Profile:
+        return Profile(
+            id=row["id"], name=row["name"], style=row["style"],
+            format=row["format"], constraints=row["constraints"], skills_json=row["skills_json"] or "",
+            orchestration_prompt=row["orchestration_prompt"], is_default=bool(row["is_default"]),
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def create_profile(
+        self, name: str, style: Optional[str], format: Optional[str],
+        constraints: Optional[str], skills_json: str, orchestration_prompt: Optional[str], is_default: bool = False,
+    ) -> Profile:
+        profile_id = str(uuid.uuid4())
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO profiles
+                   (id, name, style, format, constraints, skills_json, orchestration_prompt,
+                    is_default, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (profile_id, name, style, format, constraints, skills_json,
+                 orchestration_prompt, int(is_default), now, now),
+            )
+        return Profile(
+            id=profile_id, name=name, style=style, format=format, constraints=constraints,
+            skills_json=skills_json, orchestration_prompt=orchestration_prompt, is_default=is_default,
+            created_at=now, updated_at=now,
+        )
+
+    def get_profile(self, profile_id: str) -> Optional[Profile]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+            return self._row_to_profile(row) if row is not None else None
+
+    def list_profiles(self) -> List[Profile]:
+        """Общий справочник — единый список для всех агентов (см. замечание
+        пользователя: раньше профили были привязаны к одному агенту, теперь
+        любой агент/чат может выбрать любой профиль из общего списка)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM profiles ORDER BY created_at ASC").fetchall()
+            return [self._row_to_profile(r) for r in rows]
+
+    def update_profile(self, profile_id: str, fields: Dict[str, Any]) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in fields.keys())
+        values = list(fields.values())
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE profiles SET {assignments}, updated_at = ? WHERE id = ?",
+                values + [int(time.time()), profile_id],
+            )
+
+    def delete_profile(self, profile_id: str) -> None:
+        with self._connect() as conn:
+            # У чатов, на которых был активен этот профиль, ссылка снимается
+            # автоматически (ON DELETE SET NULL на chats.active_profile_id).
+            conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))

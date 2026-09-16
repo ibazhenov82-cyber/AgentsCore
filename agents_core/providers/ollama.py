@@ -160,11 +160,39 @@ class OllamaProvider(BaseProvider):
         except json.JSONDecodeError as exc:
             raise ProviderError(f"tools_json is not valid JSON: {exc}") from exc
 
+    @staticmethod
+    def _build_ollama_messages(messages: List[ProviderMessage]) -> List[Dict[str, Any]]:
+        """Ollama ожидает `tool_calls` с `function.arguments` РАЗОБРАННЫМ
+        словарём (не JSON-текстом, как у DeepSeek/OpenAI) — наш внутренний
+        формат (`ProviderMessage.tool_calls`) всегда хранит `arguments` как
+        JSON-текст для единообразия между провайдерами, поэтому здесь он
+        разбирается обратно перед отправкой. У результата вызова (role="tool")
+        Ollama сопоставляет ответ вызову по имени функции (`tool_name`), а не
+        по id — своих id для tool_calls у Ollama нет."""
+        out: List[Dict[str, Any]] = []
+        for m in messages:
+            d: Dict[str, Any] = {"role": m.role, "content": m.content}
+            if m.tool_calls:
+                native_calls = []
+                for call in m.tool_calls:
+                    fn = call.get("function", {})
+                    args = fn.get("arguments")
+                    try:
+                        parsed_args = json.loads(args) if isinstance(args, str) else (args or {})
+                    except (ValueError, TypeError):
+                        parsed_args = {}
+                    native_calls.append({"function": {"name": fn.get("name", ""), "arguments": parsed_args}})
+                d["tool_calls"] = native_calls
+            if m.role == "tool" and m.name:
+                d["tool_name"] = m.name
+            out.append(d)
+        return out
+
     def _build_payload(self, model_id: str, messages: List[ProviderMessage], settings: Settings, stream: bool) -> Dict[str, Any]:
         caps = self.discover_model(model_id)
         payload: Dict[str, Any] = {
             "model": model_id,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "messages": self._build_ollama_messages(messages),
             "stream": stream,
             "options": self._build_options(settings),
         }
@@ -179,6 +207,26 @@ class OllamaProvider(BaseProvider):
         return payload
 
     # ---- вызовы -----------------------------------------------------------
+
+    @staticmethod
+    def _normalize_tool_calls(native_calls: Optional[list]) -> Optional[list]:
+        """Приводит нативный ответ Ollama (`function.arguments` — уже
+        разобранный словарь, id вызовов отсутствуют) к единому внутреннему
+        формату (id синтетический, `function.arguments` — JSON-текст) —
+        см. докстринг `ProviderMessage.tool_calls`."""
+        if not native_calls:
+            return None
+        result = []
+        for i, call in enumerate(native_calls):
+            fn = call.get("function", {})
+            args = fn.get("arguments")
+            args_text = json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args
+            result.append({
+                "id": call.get("id") or f"ollama-call-{i}",
+                "type": "function",
+                "function": {"name": fn.get("name", ""), "arguments": args_text},
+            })
+        return result
 
     def chat(self, model_id: str, messages: List[ProviderMessage], settings: Settings) -> ChatResult:
         payload = self._build_payload(model_id, messages, settings, stream=False)
@@ -196,12 +244,14 @@ class OllamaProvider(BaseProvider):
             content=message.get("content") or "",
             reasoning_content=message.get("thinking"),
             usage=ChatUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total),
+            tool_calls=self._normalize_tool_calls(message.get("tool_calls")),
         )
 
     def stream_chat(self, model_id: str, messages: List[ProviderMessage], settings: Settings) -> Iterator[StreamDelta]:
         payload = self._build_payload(model_id, messages, settings, stream=True)
         content_acc: List[str] = []
         reasoning_acc: List[str] = []
+        tool_calls_native: List[dict] = []
         prompt_tokens: Optional[int] = None
         completion_tokens: Optional[int] = None
         try:
@@ -225,6 +275,11 @@ class OllamaProvider(BaseProvider):
                 if message.get("thinking"):
                     reasoning_acc.append(message["thinking"])
                     yield StreamDelta(reasoning_content=message["thinking"])
+                if message.get("tool_calls"):
+                    # В отличие от DeepSeek, Ollama не дробит `tool_calls` на
+                    # символьные фрагменты — вызов приходит уже полностью
+                    # сформированным в одном чанке, накопление не требуется.
+                    tool_calls_native.extend(message["tool_calls"])
                 if chunk.get("done"):
                     prompt_tokens = chunk.get("prompt_eval_count")
                     completion_tokens = chunk.get("eval_count")
@@ -244,5 +299,6 @@ class OllamaProvider(BaseProvider):
                 content="".join(content_acc),
                 reasoning_content="".join(reasoning_acc) or None,
                 usage=ChatUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total),
+                tool_calls=self._normalize_tool_calls(tool_calls_native),
             ),
         )

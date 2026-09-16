@@ -14,7 +14,7 @@ DeepSeek не раскрывает лимиты контекстного окн�
 from __future__ import annotations
 
 import json
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from ..models import Settings
 from .base import BaseProvider, ChatResult, ChatUsage, ModelCapabilities, ProviderError, ProviderMessage, StreamDelta
@@ -76,7 +76,20 @@ class DeepSeekProvider(BaseProvider):
         return _FALLBACK_CAPS.get(model_id, _GENERIC_FALLBACK)
 
     def _build_messages(self, messages: List[ProviderMessage]) -> List[dict]:
-        return [{"role": m.role, "content": m.content} for m in messages]
+        """DeepSeek — OpenAI-совместимый формат: сообщение ассистента,
+        запросившее вызов инструментов, несёт поле `tool_calls` "как есть"
+        (наш внутренний формат уже совпадает с форматом DeepSeek/OpenAI —
+        `function.arguments` уже текст JSON, не разобранный объект); ответ
+        на вызов — отдельное сообщение role="tool" с `tool_call_id`."""
+        out = []
+        for m in messages:
+            d: dict = {"role": m.role, "content": m.content}
+            if m.tool_calls:
+                d["tool_calls"] = m.tool_calls
+            if m.role == "tool" and m.tool_call_id:
+                d["tool_call_id"] = m.tool_call_id
+            out.append(d)
+        return out
 
     def _thinking_config(self, settings: Settings, caps: ModelCapabilities) -> Optional[ThinkingConfig]:
         if not caps.supports_thinking:
@@ -129,7 +142,29 @@ class DeepSeekProvider(BaseProvider):
                 completion_tokens=usage.get("completion_tokens"),
                 total_tokens=usage.get("total_tokens"),
             ),
+            tool_calls=choice.get("tool_calls") or None,
         )
+
+    @staticmethod
+    def _merge_tool_call_deltas(acc: Dict[int, dict], chunk_tool_calls: Optional[list]) -> None:
+        """DeepSeek (как и OpenAI) стримит `tool_calls` по кусочкам: каждый
+        чанк несёт `index` (позиция вызова в итоговом списке) и фрагмент
+        `function.arguments` (конкатенируется в валидный JSON только после
+        последнего чанка). `acc` — накопитель по index, мутируется на месте."""
+        if not chunk_tool_calls:
+            return
+        for piece in chunk_tool_calls:
+            idx = piece.get("index", 0)
+            entry = acc.setdefault(idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+            if piece.get("id"):
+                entry["id"] = piece["id"]
+            if piece.get("type"):
+                entry["type"] = piece["type"]
+            fn = piece.get("function") or {}
+            if fn.get("name"):
+                entry["function"]["name"] += fn["name"]
+            if fn.get("arguments"):
+                entry["function"]["arguments"] += fn["arguments"]
 
     def stream_chat(self, model_id: str, messages: List[ProviderMessage], settings: Settings) -> Iterator[StreamDelta]:
         client = self._require_client()
@@ -137,6 +172,7 @@ class DeepSeekProvider(BaseProvider):
         tools = self._parsed_tools(settings)
         content_acc: List[str] = []
         reasoning_acc: List[str] = []
+        tool_calls_acc: Dict[int, dict] = {}
         last_usage: dict = {}
         try:
             for delta in client.stream_chat(
@@ -162,11 +198,13 @@ class DeepSeekProvider(BaseProvider):
                 if delta.reasoning_content:
                     reasoning_acc.append(delta.reasoning_content)
                     yield StreamDelta(reasoning_content=delta.reasoning_content)
+                self._merge_tool_call_deltas(tool_calls_acc, delta.tool_calls)
                 if delta.usage:
                     last_usage = delta.usage
         except DeepSeekError as exc:
             raise ProviderError(str(exc)) from exc
 
+        merged_tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
         yield StreamDelta(
             done=True,
             result=ChatResult(
@@ -177,5 +215,6 @@ class DeepSeekProvider(BaseProvider):
                     completion_tokens=last_usage.get("completion_tokens"),
                     total_tokens=last_usage.get("total_tokens"),
                 ),
+                tool_calls=merged_tool_calls,
             ),
         )

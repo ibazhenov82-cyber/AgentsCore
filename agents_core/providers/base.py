@@ -20,8 +20,23 @@ from ..models import Settings
 
 @dataclass
 class ProviderMessage:
-    role: str  # "system" | "user" | "assistant"
+    role: str  # "system" | "user" | "assistant" | "tool"
     content: str
+    #: Заполняется только для role="assistant", когда ассистент запросил
+    #: вызов инструментов — список в едином внутреннем формате (как у
+    #: OpenAI/DeepSeek): [{"id": str, "type": "function",
+    #: "function": {"name": str, "arguments": "<JSON-текст>"}}]. Провайдер
+    #: сам приводит его к своему нативному формату исходящего запроса
+    #: (см. `ollama.py._build_messages`, где Ollama ожидает `arguments`
+    #: разобранным словарём, а не текстом).
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    #: Заполняется только для role="tool" — id вызова (из tool_calls выше),
+    #: результат которого несёт это сообщение.
+    tool_call_id: Optional[str] = None
+    #: Имя вызванной функции — для role="tool"; не всем провайдерам нужно
+    #: (DeepSeek определяет функцию по tool_call_id), но Ollama сопоставляет
+    #: результат с вызовом по имени, а не по id (своих id у него нет).
+    name: Optional[str] = None
 
 
 @dataclass
@@ -36,6 +51,10 @@ class ChatResult:
     content: str
     reasoning_content: Optional[str] = None
     usage: ChatUsage = field(default_factory=ChatUsage)
+    #: Запрошенные моделью вызовы инструментов — тот же формат, что и
+    #: `ProviderMessage.tool_calls` выше. `None`/пустой список — модель
+    #: ответила обычным текстом, вызовов не было.
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass

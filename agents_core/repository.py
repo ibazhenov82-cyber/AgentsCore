@@ -28,16 +28,95 @@ from .models import (
     Chat,
     CONTEXT_STRATEGY_OPTIONS,
     DefaultSettings,
+    LONG_TERM_MEMORY_CATEGORIES,
+    LONG_TERM_MEMORY_CATEGORY_ENABLE_FIELD,
+    LONG_TERM_MEMORY_CORE_CATEGORIES,
+    LONG_TERM_MEMORY_EXTENDED_CATEGORIES,
+    LongTermMemoryEntry,
     Message,
     ModelInfo,
+    Profile,
     Settings,
+    WorkingMemoryEntry,
     settings_from_defaults,
 )
-from .providers import ProviderError, ProviderMessage, ProviderRegistry
+from .providers import ChatResult, ProviderError, ProviderMessage, ProviderRegistry
+from .skills import registry as skills_registry
+from .skills import shopping_demo
 from .tokens import estimate_messages_tokens
 
 _SETTINGS_FIELD_NAMES = {f.name for f in dataclasses.fields(Settings)}
 _DEFAULT_SETTINGS_FIELD_NAMES = {f.name for f in dataclasses.fields(DefaultSettings)}
+
+#: Максимум "туда-обратно" вызовов модели в одном обмене tool-calling —
+#: защита от зацикливания (модель бесконечно вызывает инструменты вместо
+#: финального текстового ответа). После достижения предела последний
+#: результат провайдера возвращается как есть, даже если в нём снова
+#: запрошены tool_calls.
+_MAX_TOOL_ITERATIONS = 4
+
+# ---------------------------------------------------------------------------
+# Встроенные функции памяти (доступны всем чатам с memory_tools_enabled=true,
+# независимо от активного профиля) — см. итоговый документ, разделы 2 и 3.
+# ---------------------------------------------------------------------------
+
+_SAVE_WORKING_MEMORY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "save_working_memory",
+        "description": (
+            "Сохранить факт в РАБОЧУЮ память текущего чата (данные текущей задачи; "
+            "видны только внутри этого чата, не переносятся в другие чаты этого агента)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Короткий ключ факта, например 'текущая_цель'"},
+                "value": {"type": "string", "description": "Значение факта"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+}
+
+_LONG_TERM_CATEGORY_HINTS = {
+    "profile": "'profile' — факт о пользователе/предпочтение",
+    "decision": "'decision' — принятое решение/договорённость",
+    "knowledge": "'knowledge' — прочее полезное знание",
+    "episodic": "'episodic' — конкретный прошлый эпизод/событие",
+    "semantic": "'semantic' — обобщённое устойчивое знание",
+    "procedural": "'procedural' — как выполнять задачу/процесс",
+}
+
+
+def _build_save_long_term_memory_tool(categories: List[str]) -> dict:
+    """`save_long_term_memory` строится ДИНАМИЧЕСКИ на каждый запрос — `enum`
+    категории сужается до реально включённых сейчас типов памяти (см.
+    `Repository._enabled_long_term_categories`), чтобы модель не пыталась
+    сохранить факт в отключённый пользователем тип."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "save_long_term_memory",
+            "description": (
+                "Сохранить факт в ДОЛГОВРЕМЕННУЮ память агента (переживает текущий чат — "
+                "будет виден и в других чатах этого же агента)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": categories,
+                        "description": "; ".join(_LONG_TERM_CATEGORY_HINTS[c] for c in categories),
+                    },
+                    "key": {"type": "string", "description": "Короткий ключ факта"},
+                    "value": {"type": "string", "description": "Значение факта"},
+                },
+                "required": ["category", "key", "value"],
+            },
+        },
+    }
 
 _SUMMARY_TAG_RE = {
     "previous_summary": re.compile(r"<previous_summary>.*?</previous_summary>", re.DOTALL),
@@ -262,7 +341,11 @@ class Repository:
         # Имя по умолчанию — "Чат N", где N — порядковый номер чата ВНУТРИ
         # этого агента (число уже существующих чатов агента + 1).
         resolved_title = title if title and title.strip() else f"Чат {len(self._db.list_chats(agent_id)) + 1}"
-        return self._db.create_chat(agent_id, resolved_title, settings)
+        # Профиль по умолчанию для агента (см. Agent.default_profile_id)
+        # копируется в новый чат ТОЛЬКО в момент создания — точно так же, как
+        # Settings копируются из agent.settings, а не как живая ссылка;
+        # дальше чат может выбрать другой профиль независимо от агента.
+        return self._db.create_chat(agent_id, resolved_title, settings, active_profile_id=agent.default_profile_id)
 
     def get_chat(self, chat_id: str) -> Chat:
         return self._require_chat(chat_id)
@@ -633,7 +716,7 @@ class Repository:
             raise ValidationError("context_strategy_limit must be > 2 to use sliding_window")
 
     def _build_sliding_window_context(
-        self, chat: Chat, messages: List[Message], new_text: str
+        self, chat: Chat, agent: Agent, messages: List[Message], new_text: str
     ) -> List[ProviderMessage]:
         """Основной запрос при явном флаге `sliding_window=true`: системный
         prompt + последние (context_strategy_limit - 1) сообщений с ролью
@@ -647,6 +730,7 @@ class Repository:
         provider_messages: List[ProviderMessage] = []
         if chat.settings.system_prompt and chat.settings.system_prompt.strip():
             provider_messages.append(ProviderMessage("system", chat.settings.system_prompt))
+        provider_messages += self._build_memory_injection_messages(chat, agent)
         provider_messages += [ProviderMessage(m.role, m.content) for m in recent]
         provider_messages.append(ProviderMessage("user", new_text))
         return provider_messages
@@ -728,9 +812,395 @@ class Repository:
                 updated[key] = {"value": item.get("value"), "confidence": new_confidence}
         return updated
 
+    # ---- память (working_memory / long_term_memory) -------------------------
+
+    def _require_working_memory_entry(self, chat_id: str, key: str) -> WorkingMemoryEntry:
+        entry = self._db.get_working_memory(chat_id, key)
+        if entry is None:
+            raise NotFoundError(f"no such working memory key: {key!r}")
+        return entry
+
+    def list_working_memory(self, chat_id: str) -> List[WorkingMemoryEntry]:
+        self._require_chat(chat_id)
+        return self._db.list_working_memory(chat_id)
+
+    def save_working_memory(self, chat_id: str, key: str, value: str, source: str = "manual") -> WorkingMemoryEntry:
+        """Ручное сохранение (из формы/API) всегда доступно, независимо от
+        настройки `memory_tools_enabled` — она ограничивает только
+        САМОСТОЯТЕЛЬНОЕ сохранение агентом через tool-calling."""
+        self._require_chat(chat_id)
+        if not key or not key.strip():
+            raise ValidationError("key must be a non-empty string")
+        return self._db.upsert_working_memory(chat_id, key.strip(), value, source=source)
+
+    def delete_working_memory(self, chat_id: str, key: str) -> None:
+        self._require_chat(chat_id)
+        self._require_working_memory_entry(chat_id, key)
+        self._db.delete_working_memory(chat_id, key)
+
+    def list_long_term_memory(self, agent_id: str, category: Optional[str] = None) -> List[LongTermMemoryEntry]:
+        self._require_agent(agent_id)
+        if category is not None and category not in LONG_TERM_MEMORY_CATEGORIES:
+            raise ValidationError(f"invalid category: {category!r}")
+        return self._db.list_long_term_memory(agent_id, category)
+
+    def save_long_term_memory(self, agent_id: str, category: str, key: str, value: str, source: str = "manual") -> LongTermMemoryEntry:
+        self._require_agent(agent_id)
+        if category not in LONG_TERM_MEMORY_CATEGORIES:
+            raise ValidationError(f"invalid category: {category!r}")
+        if not key or not key.strip():
+            raise ValidationError("key must be a non-empty string")
+        return self._db.upsert_long_term_memory(agent_id, category, key.strip(), value, source=source)
+
+    def delete_long_term_memory(self, agent_id: str, category: str, key: str) -> None:
+        self._require_agent(agent_id)
+        if category not in LONG_TERM_MEMORY_CATEGORIES:
+            raise ValidationError(f"invalid category: {category!r}")
+        entries = self._db.list_long_term_memory(agent_id, category)
+        if not any(e.key == key for e in entries):
+            raise NotFoundError(f"no such long-term memory key: {key!r}")
+        self._db.delete_long_term_memory(agent_id, category, key)
+
+    # ---- профили-пайплайны ----------------------------------------------------
+
+    def _require_profile(self, profile_id: str) -> Profile:
+        profile = self._db.get_profile(profile_id)
+        if profile is None:
+            raise NotFoundError(f"no such profile: {profile_id}")
+        return profile
+
+    def list_profiles(self) -> List[Profile]:
+        """Общий справочник профилей — один список для ВСЕХ агентов (по
+        замечанию пользователя: профиль описывается один раз и выбирается в
+        настройках любого агента/чата, а не создаётся заново под каждого)."""
+        return self._db.list_profiles()
+
+    def get_profile(self, profile_id: str) -> Profile:
+        return self._require_profile(profile_id)
+
+    @staticmethod
+    def _validate_skills_json(skills_json: str) -> None:
+        if not skills_json.strip():
+            return
+        try:
+            parsed = json.loads(skills_json)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"skills_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, list):
+            raise ValidationError("skills_json must be a JSON array of OpenAI function-tool descriptions")
+
+    @staticmethod
+    def _resolve_skill_names(skill_names: List[str]) -> str:
+        """Переводит имена ЗАРЕГИСТРИРОВАННЫХ скиллов (см. `skills.registry`,
+        ведётся через переменную окружения AGENT_REGISTERED_SKILLS) в готовый
+        `skills_json` — так UI/API может привязать скилл к профилю по имени,
+        не заставляя пользователя вручную писать JSON-схему функции."""
+        resolved = []
+        unknown = []
+        for name in skill_names:
+            skill = skills_registry.get_registered_skill(name)
+            if skill is None:
+                unknown.append(name)
+            else:
+                resolved.append(skill)
+        if unknown:
+            raise ValidationError(f"unknown registered skill(s): {', '.join(unknown)}")
+        return json.dumps(resolved, ensure_ascii=False)
+
+    def list_registered_skills(self) -> List[dict]:
+        """Плоский список скиллов, зарегистрированных сервисом (переменная
+        окружения AGENT_REGISTERED_SKILLS) — из них пользователь выбирает
+        подмножество при создании/редактировании профиля (`skill_names`)."""
+        return skills_registry.list_registered_skills()
+
+    def create_profile(
+        self, name: str, style: Optional[str] = None, format: Optional[str] = None,
+        constraints: Optional[str] = None, skills_json: str = "", orchestration_prompt: Optional[str] = None,
+        skill_names: Optional[List[str]] = None,
+    ) -> Profile:
+        if not name or not name.strip():
+            raise ValidationError("name must be a non-empty string")
+        if skill_names is not None:
+            if skills_json.strip():
+                raise ValidationError("provide either skill_names or skills_json, not both")
+            skills_json = self._resolve_skill_names(skill_names)
+        else:
+            self._validate_skills_json(skills_json)
+        return self._db.create_profile(name.strip(), style, format, constraints, skills_json, orchestration_prompt)
+
+    def update_profile(self, profile_id: str, payload: dict) -> Profile:
+        self._require_profile(profile_id)
+        allowed = {"name", "style", "format", "constraints", "skills_json", "orchestration_prompt", "skill_names"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValidationError(f"unknown profile field(s): {', '.join(sorted(unknown))}")
+        if "name" in payload and (not payload["name"] or not payload["name"].strip()):
+            raise ValidationError("name must be a non-empty string")
+        payload = dict(payload)
+        if "skill_names" in payload:
+            skill_names = payload.pop("skill_names")
+            if payload.get("skills_json", "").strip():
+                raise ValidationError("provide either skill_names or skills_json, not both")
+            payload["skills_json"] = self._resolve_skill_names(skill_names)
+        elif "skills_json" in payload:
+            self._validate_skills_json(payload["skills_json"])
+        self._db.update_profile(profile_id, payload)
+        return self._require_profile(profile_id)
+
+    def delete_profile(self, profile_id: str) -> None:
+        self._require_profile(profile_id)
+        self._db.delete_profile(profile_id)  # у чатов active_profile_id снимается через ON DELETE SET NULL
+
+    def set_chat_active_profile(self, chat_id: str, profile_id: Optional[str]) -> Chat:
+        chat = self._require_chat(chat_id)
+        if profile_id is not None:
+            self._require_profile(profile_id)  # профиль общий — подходит любому агенту/чату
+        self._db.set_chat_active_profile(chat_id, profile_id)
+        return self._require_chat(chat_id)
+
+    def set_agent_default_profile(self, agent_id: str, profile_id: Optional[str]) -> Agent:
+        """Профиль ПО УМОЛЧАНИЮ для агента: не применяется задним числом к
+        уже существующим чатам (у каждого своя, независимая настройка через
+        `set_chat_active_profile`) — только копируется в НОВЫЕ чаты этого
+        агента при создании (см. `create_chat`)."""
+        self._require_agent(agent_id)
+        if profile_id is not None:
+            self._require_profile(profile_id)
+        self._db.set_agent_default_profile(agent_id, profile_id)
+        return self._require_agent(agent_id)
+
+    # ---- единый механизм tool-calling (память + скиллы профиля) -------------
+    #
+    # Реестр "имя функции -> обработчик" — общий для встроенных функций
+    # памяти (доступны всегда, если включён тумблер memory_tools_enabled) и
+    # для доменных скиллов активного профиля (доступны, только пока этот
+    # профиль подключён к чату). Схема функции (что видит модель в `tools`)
+    # и реализация обработчика здесь сознательно разделены: `tools_json`
+    # профиля можно отредактировать (например, поменять description), но
+    # ЧТО РЕАЛЬНО ДЕЛАЕТ функция — фиксировано в коде (см. "Принятые по
+    # умолчанию решения": скиллы фиксированные, не производятся из
+    # произвольного пользовательского JSON).
+
+    @staticmethod
+    def _enabled_long_term_categories(settings: Settings) -> List[str]:
+        """Основные категории (profile/decision/knowledge) включены разом
+        флагом `long_term_memory_enabled`; каждая расширенная категория
+        (episodic/semantic/procedural) — своим отдельным флагом, независимо
+        от основных и друг от друга (см. `models.LONG_TERM_MEMORY_CATEGORY_ENABLE_FIELD`)."""
+        enabled = list(LONG_TERM_MEMORY_CORE_CATEGORIES) if settings.long_term_memory_enabled else []
+        enabled += [c for c in LONG_TERM_MEMORY_EXTENDED_CATEGORIES if getattr(settings, LONG_TERM_MEMORY_CATEGORY_ENABLE_FIELD[c])]
+        return enabled
+
+    def _handle_save_working_memory(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+        if not chat.settings.working_memory_enabled:
+            return {"error": "working memory is disabled for this chat"}
+        key = str(arguments.get("key") or "").strip()
+        if not key:
+            return {"error": "key is required"}
+        value = arguments.get("value")
+        entry = self._db.upsert_working_memory(chat.id, key, "" if value is None else str(value), source="agent")
+        return {"saved": True, "key": entry.key, "value": entry.value, "source": entry.source}
+
+    def _handle_save_long_term_memory(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+        category = arguments.get("category")
+        enabled_categories = self._enabled_long_term_categories(chat.settings)
+        if category not in enabled_categories:
+            return {"error": f"category must be one of the currently enabled types: {enabled_categories}"}
+        key = str(arguments.get("key") or "").strip()
+        if not key:
+            return {"error": "key is required"}
+        value = arguments.get("value")
+        entry = self._db.upsert_long_term_memory(agent.id, category, key, "" if value is None else str(value), source="agent")
+        return {"saved": True, "category": entry.category, "key": entry.key, "value": entry.value, "source": entry.source}
+
+    def _handle_search_products(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+        return {"products": shopping_demo.search_products(arguments.get("query") or "", arguments.get("max_price"))}
+
+    def _current_cart(self, chat_id: str) -> List[str]:
+        entry = self._db.get_working_memory(chat_id, "cart")
+        if entry is None:
+            return []
+        try:
+            parsed = json.loads(entry.value)
+        except (ValueError, TypeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _handle_add_to_cart(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+        product_id = arguments.get("product_id")
+        if not product_id:
+            return {"error": "product_id is required"}
+        try:
+            new_cart, view = shopping_demo.add_to_cart(self._current_cart(chat.id), product_id)
+        except shopping_demo.ShoppingError as exc:
+            return {"error": str(exc)}
+        self._db.upsert_working_memory(chat.id, "cart", json.dumps(new_cart, ensure_ascii=False), source="agent")
+        return view
+
+    def _handle_view_cart(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+        return shopping_demo.view_cart(self._current_cart(chat.id))
+
+    _TOOL_HANDLERS = {
+        "save_working_memory": _handle_save_working_memory,
+        "save_long_term_memory": _handle_save_long_term_memory,
+        "search_products": _handle_search_products,
+        "add_to_cart": _handle_add_to_cart,
+        "view_cart": _handle_view_cart,
+    }
+
+    def _settings_with_merged_tools(self, chat: Chat) -> Settings:
+        """Собирает итоговый `tools` для запроса к провайдеру: собственные
+        функции агента/чата (`tools_json` настроек) + встроенные функции
+        памяти (если включён тумблер) + скиллы активного профиля. Возвращает
+        `chat.settings` без изменений, если добавлять нечего (сохраняет
+        прежнее поведение — tools=None — там, где раньше ничего не менялось)."""
+        tools: list = []
+        if chat.settings.tools_json.strip():
+            try:
+                parsed = json.loads(chat.settings.tools_json)
+                if isinstance(parsed, list):
+                    tools.extend(parsed)
+            except (ValueError, TypeError):
+                pass
+        if chat.settings.memory_tools_enabled:
+            if chat.settings.working_memory_enabled:
+                tools.append(_SAVE_WORKING_MEMORY_TOOL)
+            enabled_categories = self._enabled_long_term_categories(chat.settings)
+            if enabled_categories:
+                tools.append(_build_save_long_term_memory_tool(enabled_categories))
+        if chat.active_profile_id:
+            profile = self._db.get_profile(chat.active_profile_id)
+            if profile and profile.skills_json.strip():
+                try:
+                    parsed = json.loads(profile.skills_json)
+                    if isinstance(parsed, list):
+                        tools.extend(parsed)
+                except (ValueError, TypeError):
+                    pass
+        if not tools:
+            return chat.settings
+        return dataclasses.replace(chat.settings, tools_json=json.dumps(tools, ensure_ascii=False))
+
+    def _execute_tool_call(self, chat: Chat, agent: Agent, call: dict) -> str:
+        """Выполняет ОДИН запрошенный моделью вызов и возвращает JSON-текст —
+        именно он уйдёт обратно провайдеру как содержимое tool-сообщения.
+        Неизвестное имя функции или сбой обработчика не поднимают исключение
+        наружу — модель получает `{"error": ...}` и может отреагировать сама
+        (например, попробовать другой вызов или объяснить пользователю)."""
+        fn = call.get("function") or {}
+        name = fn.get("name") or ""
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            arguments = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+        except (ValueError, TypeError):
+            arguments = {}
+        handler = self._TOOL_HANDLERS.get(name)
+        if handler is None:
+            result = {"error": f"unknown tool: {name!r}"}
+        else:
+            try:
+                result = handler(self, chat, agent, arguments)
+            except Exception as exc:  # сбой одного скилла не должен ронять весь запрос
+                result = {"error": str(exc)}
+        return json.dumps(result, ensure_ascii=False)
+
+    def _run_tool_loop_blocking(
+        self, provider, model_id: str, messages: List[ProviderMessage], settings: Settings,
+        chat: Chat, agent: Agent, result: ChatResult,
+    ) -> ChatResult:
+        iterations = 0
+        while result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
+            messages.append(ProviderMessage("assistant", result.content, tool_calls=result.tool_calls))
+            for call in result.tool_calls:
+                tool_output = self._execute_tool_call(chat, agent, call)
+                fn_name = (call.get("function") or {}).get("name")
+                messages.append(ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name))
+            iterations += 1
+            result = provider.chat(model_id, messages, settings)
+        return result
+
+    # ---- сборка сообщений памяти/профиля для запроса -------------------------
+
+    def _build_memory_injection_messages(self, chat: Chat, agent: Agent) -> List[ProviderMessage]:
+        """Порядок вставки (сразу после system_prompt, до истории диалога) —
+        профиль -> долговременная память -> рабочая память, см. итоговый
+        документ, раздел "Инъекция в запрос". Каждый блок подставляется,
+        только если соответствующий тип памяти включён в `chat.settings`
+        (working_memory_enabled / long_term_memory_enabled + по отдельности
+        episodic_/semantic_/procedural_memory_enabled для расширенных
+        категорий) — выключенный тип не просто "пуст", а полностью
+        отсутствует в запросе к модели, как и не выключавшиеся данные."""
+        blocks: List[ProviderMessage] = []
+        profile = self._db.get_profile(chat.active_profile_id) if chat.active_profile_id else None
+        if profile is not None:
+            parts = [f"Активен профиль «{profile.name}»."]
+            if profile.style:
+                parts.append(f"Стиль ответа: {profile.style}.")
+            if profile.format:
+                parts.append(f"Требования к формату ответа: {profile.format}.")
+            if profile.constraints:
+                parts.append(f"Ограничения: {profile.constraints}.")
+            if profile.orchestration_prompt:
+                parts.append(f"Как использовать доступные функции этого профиля: {profile.orchestration_prompt}")
+            blocks.append(ProviderMessage("system", " ".join(parts)))
+        enabled_categories = set(self._enabled_long_term_categories(chat.settings))
+        long_term = [e for e in self._db.list_long_term_memory(agent.id) if e.category in enabled_categories]
+        if long_term:
+            lines = [f"- [{e.category}] {e.key}: {e.value}" for e in long_term]
+            blocks.append(ProviderMessage(
+                "system",
+                "Долговременная память об этом агенте (сохранённые ранее факты, "
+                "решения и знания — действуют во всех чатах агента):\n" + "\n".join(lines),
+            ))
+        if chat.settings.working_memory_enabled:
+            working = self._db.list_working_memory(chat.id)
+            if working:
+                lines = [f"- {e.key}: {e.value}" for e in working]
+                blocks.append(ProviderMessage(
+                    "system",
+                    "Рабочая память текущего чата (данные текущей задачи):\n" + "\n".join(lines),
+                ))
+        return blocks
+
+    def get_memory_snapshot(self, chat_id: str) -> dict:
+        """То, что реально будет подмешано в СЛЕДУЮЩИЙ запрос модели — разбито
+        по блокам для проверки: `short_term` (эффективный контекст диалога),
+        `working_memory`, `long_term_memory`, `active_profile`, `available_tools`
+        (итоговый список функций после слияния). Основной инструмент проверки
+        для юзкейсов из ТЗ ("проверьте, что попадает в каждый слой")."""
+        chat = self._require_chat(chat_id)
+        agent = self._require_agent(chat.agent_id)
+        messages = self._db.list_messages(chat_id)
+        scoped = self._filter_by_branch(messages, None)
+        effective = self._effective_context(chat, scoped)
+        profile = self._db.get_profile(chat.active_profile_id) if chat.active_profile_id else None
+        merged_settings = self._settings_with_merged_tools(chat)
+        try:
+            available_tools = json.loads(merged_settings.tools_json) if merged_settings.tools_json.strip() else []
+        except (ValueError, TypeError):
+            available_tools = []
+        enabled_categories = set(self._enabled_long_term_categories(chat.settings))
+        enabled_types = (["working"] if chat.settings.working_memory_enabled else []) + [
+            c for c in LONG_TERM_MEMORY_CATEGORIES if c in enabled_categories
+        ]
+        return {
+            "short_term": {
+                "message_count": len(effective),
+                "messages": [{"role": m.role, "content": m.content} for m in effective],
+            },
+            "working_memory": self._db.list_working_memory(chat_id) if chat.settings.working_memory_enabled else [],
+            "long_term_memory": [e for e in self._db.list_long_term_memory(agent.id) if e.category in enabled_categories],
+            "active_profile": profile,
+            "available_tools": available_tools,
+            "memory_tools_enabled": chat.settings.memory_tools_enabled,
+            "enabled_memory_types": enabled_types,
+        }
+
     # ---- отправка сообщений -------------------------------------------------
 
-    def _build_request_context(self, chat: Chat, messages: List[Message], new_text: str) -> List[ProviderMessage]:
+    def _build_request_context(self, chat: Chat, agent: Agent, messages: List[Message], new_text: str) -> List[ProviderMessage]:
         """Путь по умолчанию — без флагов `get_facts`/`sliding_window` и без
         активного `autosummary` в запросе: контекст учитывает только границу
         (ручной или авто-) суммаризации — последнее сообщение с
@@ -742,17 +1212,23 @@ class Repository:
         неявно обрезает контекст на каждой отправке независимо от намерения
         клиента (ограничение "N последних сообщений" при этом всё равно
         учитывается в статистике чата и подсветке вне контекста — см.
-        `_effective_context`, используемый только в `chat_stats`)."""
+        `_effective_context`, используемый только в `chat_stats`).
+
+        Сразу после системного prompt подмешиваются блоки активного профиля
+        и памяти (`_build_memory_injection_messages`) — порядок инъекции:
+        system_prompt -> профиль -> долговременная память -> рабочая память
+        -> история диалога -> новое сообщение пользователя."""
         context = self._context_messages(messages)
         provider_messages = []
         if chat.settings.system_prompt and chat.settings.system_prompt.strip():
             provider_messages.append(ProviderMessage("system", chat.settings.system_prompt))
+        provider_messages += self._build_memory_injection_messages(chat, agent)
         provider_messages += [ProviderMessage(m.role, m.content) for m in context]
         provider_messages.append(ProviderMessage("user", new_text))
         return provider_messages
 
     def _build_sticky_facts_context(
-        self, chat: Chat, messages: List[Message], new_text: str, latest_facts: dict
+        self, chat: Chat, agent: Agent, messages: List[Message], new_text: str, latest_facts: dict
     ) -> List[ProviderMessage]:
         """Основной запрос ассистенту при активной стратегии Sticky Facts
         собирается обычным образом (system + история + новое сообщение
@@ -775,6 +1251,7 @@ class Repository:
         provider_messages: List[ProviderMessage] = []
         if chat.settings.system_prompt and chat.settings.system_prompt.strip():
             provider_messages.append(ProviderMessage("system", chat.settings.system_prompt))
+        provider_messages += self._build_memory_injection_messages(chat, agent)
         provider_messages += [ProviderMessage(m.role, m.content) for m in recent]
         if latest_facts:
             facts_text = "All Facts, fixed before in JSON: " + json.dumps(latest_facts, ensure_ascii=False)
@@ -783,7 +1260,7 @@ class Repository:
         return provider_messages
 
     def _resolve_send_context(
-        self, chat: Chat, messages: List[Message], text: str, get_facts: bool, sliding_window: bool, autosummary: str
+        self, chat: Chat, agent: Agent, messages: List[Message], text: str, get_facts: bool, sliding_window: bool, autosummary: str
     ) -> Tuple[List[ProviderMessage], dict, Optional[Message]]:
         """Собирает сообщения для основного вызова модели и — если запрошено
         обновление фактов — заодно уже известные факты и "границу" (сообщение
@@ -799,11 +1276,11 @@ class Repository:
         pool = self._context_messages(messages) if autosummary != "off" else messages
         if get_facts:
             latest_facts, boundary = self._load_latest_facts(messages)
-            provider_messages = self._build_sticky_facts_context(chat, pool, text, latest_facts)
+            provider_messages = self._build_sticky_facts_context(chat, agent, pool, text, latest_facts)
             return provider_messages, latest_facts, boundary
         if sliding_window:
-            return self._build_sliding_window_context(chat, pool, text), {}, None
-        return self._build_request_context(chat, pool, text), {}, None
+            return self._build_sliding_window_context(chat, agent, pool, text), {}, None
+        return self._build_request_context(chat, agent, pool, text), {}, None
 
     def send_message_blocking(
         self,
@@ -815,6 +1292,7 @@ class Repository:
         branch: Optional[int] = None,
     ) -> Tuple[Message, Message]:
         chat = self._require_chat(chat_id)
+        agent = self._require_agent(chat.agent_id)
         with self._lock_for(chat_id):
             all_messages = self._db.list_messages(chat_id)
             messages = self._filter_by_branch(all_messages, branch)
@@ -825,10 +1303,11 @@ class Repository:
             if autosummary != "off":
                 self._validate_autosummary_send_config(chat, autosummary)
             provider_messages, latest_facts, facts_boundary = self._resolve_send_context(
-                chat, messages, text, get_facts, sliding_window, autosummary
+                chat, agent, messages, text, get_facts, sliding_window, autosummary
             )
             provider_name, model_id = _split_model(chat.settings.model)
             provider = self._registry.get(provider_name)
+            request_settings = self._settings_with_merged_tools(chat)
 
             user_msg = self._db.add_message(
                 Message(
@@ -839,7 +1318,16 @@ class Repository:
 
             started = time.monotonic()
             try:
-                result = provider.chat(model_id, provider_messages, chat.settings)
+                result = provider.chat(model_id, provider_messages, request_settings)
+                # Единый механизм tool-calling: если модель запросила вызов
+                # функций (памяти и/или скиллов активного профиля) — выполняем
+                # их и повторяем запрос, пока модель не ответит обычным
+                # текстом (или не будет достигнут предел итераций). Сам обмен
+                # "вызов -> результат" НЕ сохраняется как сообщения чата —
+                # в истории остаётся только финальный текстовый ответ.
+                result = self._run_tool_loop_blocking(
+                    provider, model_id, provider_messages, request_settings, chat, agent, result
+                )
             except ProviderError as exc:
                 self._db.add_message(
                     Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=branch or 0)
@@ -889,6 +1377,7 @@ class Repository:
         branch: Optional[int] = None,
     ) -> Iterator[dict]:
         chat = self._require_chat(chat_id)
+        agent = self._require_agent(chat.agent_id)
         lock = self._lock_for(chat_id)
         lock.acquire()
         try:
@@ -901,10 +1390,11 @@ class Repository:
             if autosummary != "off":
                 self._validate_autosummary_send_config(chat, autosummary)
             provider_messages, latest_facts, facts_boundary = self._resolve_send_context(
-                chat, messages, text, get_facts, sliding_window, autosummary
+                chat, agent, messages, text, get_facts, sliding_window, autosummary
             )
             provider_name, model_id = _split_model(chat.settings.model)
             provider = self._registry.get(provider_name)
+            request_settings = self._settings_with_merged_tools(chat)
 
             user_msg = self._db.add_message(
                 Message(
@@ -919,47 +1409,79 @@ class Repository:
 
             started = time.monotonic()
             try:
-                for delta in provider.stream_chat(model_id, provider_messages, chat.settings):
-                    if delta.done:
-                        duration_ms = int((time.monotonic() - started) * 1000)
-                        if delta.result.usage.prompt_tokens is not None:
-                            self._db.update_message_prompt_tokens(user_msg.id, delta.result.usage.prompt_tokens)
-                        assistant_msg = self._db.add_message(
-                            Message(
-                                id=0, chat_id=chat_id, role="assistant", content=delta.result.content,
-                                created_at=int(time.time()), reasoning_content=delta.result.reasoning_content,
-                                duration_ms=duration_ms, total_tokens=delta.result.usage.total_tokens,
-                                prompt_tokens=delta.result.usage.prompt_tokens,
-                                completion_tokens=delta.result.usage.completion_tokens,
-                                format=detect_message_format(delta.result.content), branch=branch or 0,
-                            )
+                # Единый механизм tool-calling в потоковом режиме: каждая
+                # "итерация" — один полный потоковый вызов провайдера; если
+                # финальный результат итерации несёт tool_calls, выполняем их,
+                # добавляем сообщения вызова/результата в контекст и запускаем
+                # СЛЕДУЮЩУЮ потоковую итерацию — клиент в этот момент видит
+                # промежуточный статус, а не разрыв соединения. Итоговое
+                # сообщение ассистента, сохраняемое в чат, — это только
+                # содержимое ПОСЛЕДНЕЙ итерации (той, что уже не запросила
+                # новых вызовов); сам обмен "вызов -> результат" в историю
+                # чата не попадает.
+                final_result: Optional[ChatResult] = None
+                iterations = 0
+                while True:
+                    done_result: Optional[ChatResult] = None
+                    for delta in provider.stream_chat(model_id, provider_messages, request_settings):
+                        if delta.done:
+                            done_result = delta.result
+                        else:
+                            yield {"type": "delta", "content": delta.content, "reasoning_content": delta.reasoning_content}
+                    if done_result is not None and done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
+                        yield {"type": "status", "status": "Выполняется вызов инструментов"}
+                        provider_messages.append(
+                            ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
                         )
-                        # Обновление фактов — ПОСЛЕ основного ответа модели и
-                        # ТОЛЬКО теперь, когда потоковая генерация полностью
-                        # завершена (см. Доработка: раньше get_facts был вовсе
-                        # недоступен в потоковом режиме). Статус отдельным
-                        # событием — извлечение может занять заметное время, а
-                        # клиент к этому моменту уже показал весь текст ответа.
-                        if get_facts:
-                            yield {"type": "status", "status": "Обновление фактов"}
-                            dialogue = self._dialogue_since(messages, facts_boundary)
-                            updated_facts = self._extract_facts(
-                                chat, latest_facts, dialogue, text, delta.result.content
+                        for call in done_result.tool_calls:
+                            tool_output = self._execute_tool_call(chat, agent, call)
+                            fn_name = (call.get("function") or {}).get("name")
+                            provider_messages.append(
+                                ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
                             )
-                            facts_json = json.dumps(updated_facts, ensure_ascii=False)
-                            self._db.update_message_facts(assistant_msg.id, facts_json)
-                            assistant_msg = dataclasses.replace(assistant_msg, facts=facts_json)
-                        # Автосуммаризация — тоже ПОСЛЕ основного ответа, как и
-                        # обновление фактов выше; статус отдаётся отдельным
-                        # событием, но только если суммаризация действительно
-                        # потребовалась (а не при каждой отправке с этим флагом).
-                        if autosummary != "off" and self._autosummary_due(chat, messages, autosummary):
-                            yield {"type": "status", "status": "Выполняется суммаризация чата"}
-                            self._summarize_after_send(chat, messages, user_msg, assistant_msg)
-                        self._db.touch_chat(chat_id)
-                        yield {"type": "done", "message": assistant_msg}
-                    else:
-                        yield {"type": "delta", "content": delta.content, "reasoning_content": delta.reasoning_content}
+                        iterations += 1
+                        yield {"type": "status", "status": "Выполняется запрос к модели"}
+                        continue
+                    final_result = done_result
+                    break
+
+                duration_ms = int((time.monotonic() - started) * 1000)
+                if final_result.usage.prompt_tokens is not None:
+                    self._db.update_message_prompt_tokens(user_msg.id, final_result.usage.prompt_tokens)
+                assistant_msg = self._db.add_message(
+                    Message(
+                        id=0, chat_id=chat_id, role="assistant", content=final_result.content,
+                        created_at=int(time.time()), reasoning_content=final_result.reasoning_content,
+                        duration_ms=duration_ms, total_tokens=final_result.usage.total_tokens,
+                        prompt_tokens=final_result.usage.prompt_tokens,
+                        completion_tokens=final_result.usage.completion_tokens,
+                        format=detect_message_format(final_result.content), branch=branch or 0,
+                    )
+                )
+                # Обновление фактов — ПОСЛЕ основного ответа модели и
+                # ТОЛЬКО теперь, когда потоковая генерация полностью
+                # завершена (см. Доработка: раньше get_facts был вовсе
+                # недоступен в потоковом режиме). Статус отдельным
+                # событием — извлечение может занять заметное время, а
+                # клиент к этому моменту уже показал весь текст ответа.
+                if get_facts:
+                    yield {"type": "status", "status": "Обновление фактов"}
+                    dialogue = self._dialogue_since(messages, facts_boundary)
+                    updated_facts = self._extract_facts(
+                        chat, latest_facts, dialogue, text, final_result.content
+                    )
+                    facts_json = json.dumps(updated_facts, ensure_ascii=False)
+                    self._db.update_message_facts(assistant_msg.id, facts_json)
+                    assistant_msg = dataclasses.replace(assistant_msg, facts=facts_json)
+                # Автосуммаризация — тоже ПОСЛЕ основного ответа, как и
+                # обновление фактов выше; статус отдаётся отдельным
+                # событием, но только если суммаризация действительно
+                # потребовалась (а не при каждой отправке с этим флагом).
+                if autosummary != "off" and self._autosummary_due(chat, messages, autosummary):
+                    yield {"type": "status", "status": "Выполняется суммаризация чата"}
+                    self._summarize_after_send(chat, messages, user_msg, assistant_msg)
+                self._db.touch_chat(chat_id)
+                yield {"type": "done", "message": assistant_msg}
             except ProviderError as exc:
                 self._db.add_message(
                     Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=branch or 0)

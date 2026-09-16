@@ -76,6 +76,14 @@ class AgentConfig:
         )
     )
 
+    # Реестр скиллов, доступных для привязки к профилю через API/приложение
+    # (см. `agents_core.skills.registry`) — JSON-массив описаний функций в
+    # формате OpenAI function-tool, тот же формат, что и `Profile.skills_json`.
+    # Регистрация в этой переменной делает скилл ВИДИМЫМ и ВЫБИРАЕМЫМ для
+    # профиля; она не заменяет реализацию обработчика в коде
+    # (`Repository._TOOL_HANDLERS`) — это отдельный, более крупный шаг.
+    REGISTERED_SKILLS_JSON: str = os.environ.get("AGENT_REGISTERED_SKILLS", "").strip()
+
     OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     # По умолчанию предлагается qwen3:0.6b — компактная модель, которую
     # реально запустить локально без мощного GPU; ниже перечислены и другие

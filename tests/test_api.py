@@ -194,6 +194,89 @@ class ApiTestCase(unittest.TestCase):
         resp = self.client.post(f"/chats/{chat['id']}/messages", json={"text": "Привет", "get_facts": True})
         self.assertEqual(resp.status_code, 400)
 
+    def test_memory_snapshot_endpoint_returns_expected_shape(self):
+        # Регрессионный тест на баг: get_memory_snapshot() (эндпоинт)
+        # собирал MemorySnapshotOut() без поля enabled_memory_types,
+        # которое схема требует — pydantic падал с 500 ValidationError.
+        # Repository-тесты (test_memory_and_profiles.py) этого не ловили,
+        # т.к. обращаются к repo.get_memory_snapshot() напрямую, минуя
+        # сборку Pydantic-модели в HTTP-слое.
+        agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
+        chat = self.client.post(f"/agents/{agent['id']}/chat", json={"title": "C1"}).json()
+        resp = self.client.get(f"/chats/{chat['id']}/memory-snapshot")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        for key in (
+            "short_term", "working_memory", "long_term_memory",
+            "active_profile", "available_tools", "memory_tools_enabled",
+            "enabled_memory_types",
+        ):
+            self.assertIn(key, body)
+        # По умолчанию для нового чата все типы памяти выключены —
+        # пользователь включает нужные явно в настройках агента/чата.
+        self.assertEqual(body["enabled_memory_types"], [])
+
+        resp = self.client.put(
+            f"/chats/{chat['id']}/settings",
+            json={"working_memory_enabled": True, "long_term_memory_enabled": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get(f"/chats/{chat['id']}/memory-snapshot")
+        self.assertEqual(resp.status_code, 200)
+        enabled = resp.json()["enabled_memory_types"]
+        self.assertIn("working", enabled)
+        self.assertIn("profile", enabled)
+
+    def test_list_registered_skills_endpoint(self):
+        resp = self.client.get("/skills")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.json(), list)
+
+    def test_profiles_are_a_global_catalog_not_scoped_to_agent(self):
+        # Профили теперь общий справочник: POST/GET /profiles без agent_id
+        # в пути, и созданный профиль виден и подключаем для ЛЮБОГО агента.
+        agent_a = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
+        agent_b = self.client.post("/agent", json={"name": "B", "model": TEST_MODEL_ID}).json()
+        chat_b = self.client.post(f"/agents/{agent_b['id']}/chat", json={"title": "C"}).json()
+
+        resp = self.client.post("/profiles", json={"name": "Общий профиль"})
+        self.assertEqual(resp.status_code, 201)
+        profile = resp.json()
+        self.assertNotIn("agent_id", profile)
+
+        resp = self.client.get("/profiles")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(profile["id"], {p["id"] for p in resp.json()})
+
+        # Подключаем к чату другого агента ("agent_a" тут вообще не при чём).
+        resp = self.client.put(
+            f"/chats/{chat_b['id']}/active-profile", json={"profile_id": profile["id"]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["active_profile_id"], profile["id"])
+        del agent_a  # использован только для проверки отсутствия привязки
+
+    def test_set_agent_default_profile_endpoint_and_new_chat_inheritance(self):
+        agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
+        profile = self.client.post("/profiles", json={"name": "По умолчанию"}).json()
+
+        resp = self.client.put(
+            f"/agents/{agent['id']}/default-profile", json={"profile_id": profile["id"]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["default_profile_id"], profile["id"])
+
+        # Новый чат наследует default_profile_id как свой активный профиль...
+        chat = self.client.post(f"/agents/{agent['id']}/chat", json={"title": "C"}).json()
+        self.assertEqual(chat["active_profile_id"], profile["id"])
+
+        # ...а уже существующие чаты не меняются задним числом.
+        resp = self.client.put(f"/agents/{agent['id']}/default-profile", json={"profile_id": None})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.json()["default_profile_id"])
+        chat_after = self.client.get(f"/chats/{chat['id']}").json()
+        self.assertEqual(chat_after["active_profile_id"], profile["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ from .models import (
     DEFAULT_MODEL_ID,
     DEFAULT_SUMMARY_PROMPT,
     DEFAULT_SUMMARY_SYSTEM_PROMPT,
+    LONG_TERM_MEMORY_CATEGORIES,
 )
 
 
@@ -47,6 +48,19 @@ class SettingsOut(BaseModel):
 
     tool_choice: str = Field(..., description="'auto' | 'none' | 'required'")
     tools_json: str = Field("", description="Сырой JSON-массив описаний инструментов в формате OpenAI function-tool")
+    memory_tools_enabled: bool = Field(
+        False,
+        description=(
+            "Разрешить агенту САМОМУ сохранять память (working/long-term) через встроенные "
+            "функции save_working_memory/save_long_term_memory (тумблер «Разрешить агенту "
+            "сохранять память»). Ручное сохранение через API доступно всегда, независимо от этого поля."
+        ),
+    )
+    working_memory_enabled: bool = Field(True, description="Рабочая память (чат/задача) — попадает в промпт, пока включена.")
+    long_term_memory_enabled: bool = Field(True, description="Долговременная память (категории profile/decision/knowledge) — попадает в промпт, пока включена.")
+    episodic_memory_enabled: bool = Field(False, description="Расширенный тип долговременной памяти — конкретные прошлые эпизоды.")
+    semantic_memory_enabled: bool = Field(False, description="Расширенный тип долговременной памяти — обобщённые знания.")
+    procedural_memory_enabled: bool = Field(False, description="Расширенный тип долговременной памяти — как выполнять задачи/процессы.")
 
     summary_prompt: str = Field(..., description="Шаблон user-prompt суммаризации (теги <previous_summary>/<new_messages>)")
     summary_system_prompt: str = Field(..., description="Системный prompt изолированного вызова суммаризации")
@@ -68,7 +82,10 @@ class SettingsOut(BaseModel):
             "model": "deepseek:deepseek-v4-flash", "system_prompt": "Ты — полезный ассистент.",
             "temperature": 1.0, "top_p": 1.0, "seed": None, "stream": True, "thinking_enabled": True,
             "reasoning_effort": None, "max_tokens": None, "json_mode": False, "stop_sequences": [],
-            "tool_choice": "auto", "tools_json": "", "summary_prompt": DEFAULT_SUMMARY_PROMPT,
+            "tool_choice": "auto", "tools_json": "", "memory_tools_enabled": False,
+            "working_memory_enabled": True, "long_term_memory_enabled": True,
+            "episodic_memory_enabled": False, "semantic_memory_enabled": False, "procedural_memory_enabled": False,
+            "summary_prompt": DEFAULT_SUMMARY_PROMPT,
             "summary_system_prompt": DEFAULT_SUMMARY_SYSTEM_PROMPT,
             "autosummary": "off", "autosummary_by_messages": 10, "autosummary_by_tokens": 50000,
             "context_strategy": None, "context_strategy_limit": None,
@@ -95,6 +112,12 @@ class SettingsPatch(BaseModel):
     stop_sequences: Optional[List[str]] = None
     tool_choice: Optional[str] = None
     tools_json: Optional[str] = None
+    memory_tools_enabled: Optional[bool] = None
+    working_memory_enabled: Optional[bool] = None
+    long_term_memory_enabled: Optional[bool] = None
+    episodic_memory_enabled: Optional[bool] = None
+    semantic_memory_enabled: Optional[bool] = None
+    procedural_memory_enabled: Optional[bool] = None
     summary_prompt: Optional[str] = None
     summary_system_prompt: Optional[str] = None
     autosummary: Optional[str] = None
@@ -362,6 +385,11 @@ class ChatOut(BaseModel):
     updated_at: int
     settings: SettingsOut
     stats: ChatStatsOut
+    active_profile_id: Optional[str] = Field(None, description="Id подключённого профиля-пайплайна персонализации, если есть")
+
+
+class ActiveProfileSetRequest(BaseModel):
+    profile_id: Optional[str] = Field(None, description="Id профиля из общего справочника (`GET /profiles`); null — отключить профиль")
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +416,15 @@ class AgentOut(BaseModel):
     created_at: int
     updated_at: int
     settings: SettingsOut
+    default_profile_id: Optional[str] = Field(
+        None,
+        description=(
+            "Профиль по умолчанию для НОВЫХ чатов этого агента (копируется в "
+            "Chat.active_profile_id только в момент создания чата, как и "
+            "остальные настройки — на уже существующие чаты не влияет). "
+            "Профиль выбирается из общего справочника `GET /profiles`."
+        ),
+    )
 
 
 class AgentWithChatsOut(BaseModel):
@@ -401,6 +438,121 @@ class HealthOut(BaseModel):
     # удобный способ убедиться, что запущен именно тот код, который был
     # задеплоен (а не старая версия сервиса), не читая логи процесса.
     version: str = "1.1.0"
+
+
+# ---------------------------------------------------------------------------
+# Рабочая память (working_memory, область видимости — чат)
+# ---------------------------------------------------------------------------
+
+class WorkingMemoryOut(BaseModel):
+    id: int
+    chat_id: str
+    key: str
+    value: str
+    source: str = Field(..., description="'manual' | 'agent' — кто сохранил запись")
+    created_at: int
+    updated_at: int
+
+
+class WorkingMemorySaveRequest(BaseModel):
+    key: str = Field(..., min_length=1, examples=["текущая_задача"])
+    value: str = Field(..., examples=["собрать корзину покупок до 5000 руб."])
+
+
+# ---------------------------------------------------------------------------
+# Долговременная память (long_term_memory, область видимости — агент)
+# ---------------------------------------------------------------------------
+
+class LongTermMemoryOut(BaseModel):
+    id: int
+    agent_id: str
+    category: str = Field(..., description=f"Одна из: {LONG_TERM_MEMORY_CATEGORIES}")
+    key: str
+    value: str
+    source: str = Field(..., description="'manual' | 'agent' — кто сохранил запись")
+    created_at: int
+    updated_at: int
+
+
+class LongTermMemorySaveRequest(BaseModel):
+    category: str = Field(..., description=f"Одна из: {LONG_TERM_MEMORY_CATEGORIES}")
+    key: str = Field(..., min_length=1, examples=["user_name"])
+    value: str = Field(..., examples=["Иван"])
+
+
+# ---------------------------------------------------------------------------
+# Реестр зарегистрированных скиллов (см. agents_core.skills.registry) —
+# плоский список, из которого выбирают skill_names при создании профиля
+# ---------------------------------------------------------------------------
+
+class RegisteredSkillOut(BaseModel):
+    name: str = Field(..., examples=["search_products"])
+    description: str = Field("", examples=["Найти товары в каталоге демо-магазина..."])
+    parameters: dict = Field(default_factory=dict, description="JSON Schema параметров функции (как в OpenAI function-tool)")
+
+
+# ---------------------------------------------------------------------------
+# Профили-пайплайны персонализации (profiles, общий справочник для ВСЕХ
+# агентов — не привязаны к конкретному агенту, см. GET/POST /profiles)
+# ---------------------------------------------------------------------------
+
+class ProfileOut(BaseModel):
+    id: str
+    name: str
+    style: Optional[str] = None
+    format: Optional[str] = None
+    constraints: Optional[str] = None
+    skills_json: str = Field("", description="JSON-массив описаний функций этого профиля в формате OpenAI function-tool")
+    orchestration_prompt: Optional[str] = Field(None, description="Инструкция модели, как оркестровать скиллы этого профиля")
+    is_default: bool = False
+    created_at: int
+    updated_at: int
+
+
+class ProfileCreate(BaseModel):
+    name: str = Field(..., min_length=1, examples=["Покупки"])
+    style: Optional[str] = Field(None, examples=["дружелюбно, коротко"])
+    format: Optional[str] = None
+    constraints: Optional[str] = None
+    skills_json: str = Field("", description="JSON-массив описаний функций в формате OpenAI function-tool. Взаимоисключимо с skill_names.")
+    skill_names: Optional[List[str]] = Field(
+        None,
+        description="Имена скиллов из GET /skills (реестр AGENT_REGISTERED_SKILLS) — сервер сам соберёт из них skills_json. Взаимоисключимо с skills_json.",
+        examples=[["search_products", "add_to_cart", "view_cart"]],
+    )
+    orchestration_prompt: Optional[str] = None
+
+
+class ProfilePatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1)
+    style: Optional[str] = None
+    format: Optional[str] = None
+    constraints: Optional[str] = None
+    skills_json: Optional[str] = None
+    skill_names: Optional[List[str]] = Field(None, description="См. ProfileCreate.skill_names — заменяет весь набор скиллов профиля.")
+    orchestration_prompt: Optional[str] = None
+
+    def to_payload(self) -> dict:
+        return self.model_dump(exclude_unset=True)
+
+
+# ---------------------------------------------------------------------------
+# Снимок памяти (то, что реально уйдёт в следующий запрос к модели)
+# ---------------------------------------------------------------------------
+
+class MemorySnapshotShortTermOut(BaseModel):
+    message_count: int
+    messages: List[dict] = Field(..., description="[{'role': ..., 'content': ...}, ...] — эффективный контекст диалога")
+
+
+class MemorySnapshotOut(BaseModel):
+    short_term: MemorySnapshotShortTermOut
+    working_memory: List[WorkingMemoryOut] = Field(..., description="Пусто, если working_memory_enabled=false — даже если записи есть в базе")
+    long_term_memory: List[LongTermMemoryOut] = Field(..., description="Только записи включённых сейчас категорий (см. enabled_memory_types)")
+    active_profile: Optional[ProfileOut] = None
+    available_tools: List[dict] = Field(..., description="Итоговый список функций (tools) после слияния — память + скиллы профиля + собственные tools_json")
+    memory_tools_enabled: bool
+    enabled_memory_types: List[str] = Field(..., description="Какие типы памяти сейчас включены и реально участвуют в этом снимке: подмножество ['working', 'profile', 'decision', 'knowledge', 'episodic', 'semantic', 'procedural']")
 
 
 class ErrorOut(BaseModel):

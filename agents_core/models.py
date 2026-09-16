@@ -27,6 +27,38 @@ TOOL_CHOICE_OPTIONS = ["auto", "none", "required"]
 AUTOSUMMARY_OPTIONS = ["off", "messages", "tokens"]
 CONTEXT_STRATEGY_OPTIONS = ["sliding_window", "sticky_facts"]
 
+#: Категории записей долговременной памяти (агент-level, см. `LongTermMemoryEntry`).
+#: Первые три ("основные") доступны всегда, пока включена долговременная
+#: память в целом (`Settings.long_term_memory_enabled`, по умолчанию True).
+#: Остальные три ("расширенные") — это типы памяти из референсных архитектур
+#: (Letta/Redis/Mem0, см. итоговый документ раздел 1), которые в MVP были
+#: сознательно объединены в упрощённые категории profile/decision/knowledge;
+#: теперь доступны как полноценные отдельные типы, но по умолчанию ВЫКЛЮЧЕНЫ
+#: и включаются пользователем на экране памяти по отдельности:
+#: - episodic — конкретные прошлые эпизоды/события ("в чате про БД решили
+#:   отказаться от MongoDB после обсуждения нагрузки");
+#: - semantic — обобщённые устойчивые знания, отделённые от ad hoc категории
+#:   "knowledge" смысловым акцентом на консолидированность/обобщённость;
+#: - procedural — как выполнять задачи/процессы ("как оформлять счёт клиенту").
+LONG_TERM_MEMORY_CORE_CATEGORIES = ["profile", "decision", "knowledge"]
+LONG_TERM_MEMORY_EXTENDED_CATEGORIES = ["episodic", "semantic", "procedural"]
+LONG_TERM_MEMORY_CATEGORIES = LONG_TERM_MEMORY_CORE_CATEGORIES + LONG_TERM_MEMORY_EXTENDED_CATEGORIES
+
+#: Соответствие "расширенной" категории — полю Settings, которое её включает
+#: (используется и бэкендом для фильтрации инъекции/tool-calling, и как
+#: единый источник истины о том, какие поля вообще существуют для этой цели).
+LONG_TERM_MEMORY_CATEGORY_ENABLE_FIELD = {
+    "episodic": "episodic_memory_enabled",
+    "semantic": "semantic_memory_enabled",
+    "procedural": "procedural_memory_enabled",
+}
+
+#: Кто записал конкретную запись памяти (`working_memory`/`long_term_memory`) —
+#: пользователь вручную (через форму) или сам агент (через tool-calling), см.
+#: раздел "Единый механизм tool-calling" итогового документа. Это то самое
+#: явное разделение "что и куда сохраняется", которое требовало ТЗ.
+MEMORY_SOURCE_OPTIONS = ["manual", "agent"]
+
 #: Системный prompt для отдельного (изолированного) LLM-вызова суммаризации —
 #: не путать с обычным `system_prompt` чата, который в этом вызове не участвует.
 DEFAULT_SUMMARY_SYSTEM_PROMPT = """Ты — модуль суммаризации истории диалога между пользователем и AI-ассистентом.
@@ -191,6 +223,34 @@ class Settings:
 
     tool_choice: str = "auto"
     tools_json: str = ""
+    #: Разрешить агенту САМОМУ сохранять память (working/long-term) через
+    #: built-in tool-calling функции `save_working_memory`/`save_long_term_memory`
+    #: (тумблер "Разрешить агенту сохранять память" в настройках чата). Ручное
+    #: сохранение через API/форму доступно ВСЕГДА, независимо от этого флага.
+    memory_tools_enabled: bool = False
+
+    #: Какие слои/типы памяти сейчас "включены" — управляют ТРЕМЯ вещами
+    #: разом: (1) попадают ли данные этого типа в промпт следующего запроса
+    #: (`Repository._build_memory_injection_messages`), (2) отражаются ли в
+    #: `GET /chats/{id}/memory-snapshot`, (3) может ли модель сама писать в
+    #: этот тип через tool-calling (расширенные категории добавляются в enum
+    #: `save_long_term_memory` только пока включены). На хранение данных
+    #: ручным сохранением через API эти флаги НЕ влияют — выключение типа
+    #: только скрывает его из будущих ответов модели, не удаляет записи.
+    #: Управляются как обычные поля настроек агента/чата (см. Android
+    #: `AGENT_SETTINGS_FIELDS`, группа "Память") — раньше жили на отдельном
+    #: экране "Память и профиль", но по замечанию пользователя переехали в
+    #: общие настройки, чтобы не плодить второй набор переключателей.
+    #: По умолчанию ВСЕ пять типов выключены — пользователь включает то, что
+    #: ему нужно, явно (миграция существующих БД, созданных до этого
+    #: изменения, — исключение: working_memory_enabled/long_term_memory_enabled
+    #: там остаются True, см. `db.py`/`_row_to_settings`, чтобы не отключить
+    #: то, что уже было включено и использовалось).
+    working_memory_enabled: bool = False
+    long_term_memory_enabled: bool = False
+    episodic_memory_enabled: bool = False
+    semantic_memory_enabled: bool = False
+    procedural_memory_enabled: bool = False
 
     summary_prompt: str = DEFAULT_SUMMARY_PROMPT
     summary_system_prompt: str = DEFAULT_SUMMARY_SYSTEM_PROMPT
@@ -260,6 +320,7 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "stop_sequences", "title": "Стоп-последовательности (через запятую)", "group": "Параметры ответа"},
     {"sys_name": "tool_choice", "title": "Выбор функции", "group": "Инструменты"},
     {"sys_name": "tools_json", "title": "Список функций в формате OpenAI", "group": "Инструменты"},
+    {"sys_name": "memory_tools_enabled", "title": "Разрешить агенту сохранять память", "group": "Память"},
     {"sys_name": "summary_system_prompt", "title": "Системный prompt для суммаризации", "group": "Суммаризация запросов"},
     {"sys_name": "summary_prompt", "title": "Шаблон prompt пользователя", "group": "Суммаризация запросов"},
     {"sys_name": "autosummary", "title": "Автоматическая суммаризация чата", "group": "Суммаризация запросов"},
@@ -282,6 +343,14 @@ class Agent:
     created_at: int
     updated_at: int
     settings: Settings
+    #: Профиль, который получит НОВЫЙ чат этого агента при создании (просто
+    #: копируется в Chat.active_profile_id — по аналогии с тем, как Settings
+    #: копируются в чат только в момент создания, см. `create_chat`; дальше
+    #: агент и его существующие чаты выбирают профиль независимо друг от
+    #: друга). Реализует "профиль выбирается в настройках агента/чата":
+    #: выбор на уровне агента — это выбор ПО УМОЛЧАНИЮ для будущих чатов, а
+    #: не общий переключатель для всех уже существующих.
+    default_profile_id: Optional[str] = None
 
 
 @dataclass
@@ -292,6 +361,10 @@ class Chat:
     created_at: int
     updated_at: int
     settings: Settings
+    #: Активный профиль-пайплайн (персонализация), применяемый ко ВСЕМ
+    #: запросам этого чата без повторного выбора — None, если не подключён.
+    #: Профиль принадлежит тому же агенту, что и чат (см. `Profile`).
+    active_profile_id: Optional[str] = None
 
 
 @dataclass
@@ -327,6 +400,72 @@ class Message:
     # Факты (стратегия "Sticky Facts"), сохранённые под этим сообщением, в
     # виде сырого JSON-текста вида {"key": {"value": ..., "confidence": ...}}.
     facts: Optional[str] = None
+
+
+@dataclass
+class WorkingMemoryEntry:
+    """Рабочая память — область видимости ЧАТ (данные текущей задачи внутри
+    этого чата). Ключ уникален в пределах чата: повторное сохранение того же
+    ключа обновляет запись (upsert), а не создаёт дубликат — так, например,
+    хранится корзина демо-скилла "Покупки" под ключом "cart"."""
+
+    id: int
+    chat_id: str
+    key: str
+    value: str  # произвольный текст/JSON — интерпретация на совести автора записи
+    source: str = "manual"  # "manual" | "agent"
+    created_at: int = 0
+    updated_at: int = 0
+
+
+@dataclass
+class LongTermMemoryEntry:
+    """Долговременная память — область видимости АГЕНТ (переживает любой
+    отдельный чат этого агента). `category` — одна из LONG_TERM_MEMORY_CATEGORIES
+    ("profile" — факты о пользователе/предпочтения, "decision" — принятые
+    решения и договорённости, "knowledge" — прочие полезные знания).
+    Ключ уникален в пределах (agent_id, category)."""
+
+    id: int
+    agent_id: str
+    category: str  # "profile" | "decision" | "knowledge"
+    key: str
+    value: str
+    source: str = "manual"  # "manual" | "agent"
+    created_at: int = 0
+    updated_at: int = 0
+
+
+@dataclass
+class Profile:
+    """Профиль-пайплайн персонализации (ОБЩИЙ СПРАВОЧНИК для всех агентов —
+    не привязан к конкретному агенту): не просто пресет стиля/формата, а
+    связка (необязательного) стиля ответа с набором доменных скиллов и
+    инструкцией по их оркестровке — например, профиль "Покупки" со скиллами
+    search_products/add_to_cart/view_cart. Подключается к чату через
+    `Chat.active_profile_id` и применяется автоматически ко всем запросам
+    этого чата, без повторного выбора; выбирается в настройках любого
+    агента/чата (см. итоговый документ, п.4 — по замечанию пользователя
+    справочник профилей общий, а не per-агент, чтобы один раз описанный
+    профиль можно было переиспользовать для разных агентов). Редактируется
+    ТОЛЬКО вручную — агент не может создать/изменить профиль сам по себе
+    (решение ради предсказуемости и доверия)."""
+
+    id: str
+    name: str
+    style: Optional[str] = None  # тон/манера ответа, например "формально, по-русски"
+    format: Optional[str] = None  # ограничения формата, например "списком, без вступлений"
+    constraints: Optional[str] = None  # прочие ограничения, например "не более 200 слов"
+    #: JSON-массив описаний функций в формате OpenAI function-tool — ровно
+    #: то, что подмешивается в `tools` запроса, пока этот профиль активен.
+    skills_json: str = ""
+    #: Инструкция модели, КАК оркестровать перечисленные скиллы для задач
+    #: этого домена (например: "сначала search_products, затем предложи
+    #: пользователю сравнение, и только после подтверждения — add_to_cart").
+    orchestration_prompt: Optional[str] = None
+    is_default: bool = False
+    created_at: int = 0
+    updated_at: int = 0
 
 
 @dataclass

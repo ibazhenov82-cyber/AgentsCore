@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Response, status
 
 from ..repository import Repository
 from ..schemas import (
+    ActiveProfileSetRequest,
     AgentCreate,
     AgentOut,
     AgentRename,
@@ -84,6 +85,21 @@ def get_agent_settings(agent_id: str, repo: Repository = Depends(get_repository)
 )
 def update_agent_settings(agent_id: str, patch: SettingsPatch, repo: Repository = Depends(get_repository)) -> SettingsOut:
     return SettingsOut(**dataclasses.asdict(repo.update_agent_settings(agent_id, patch.to_payload())))
+
+
+@router.put(
+    "/agents/{agent_id}/default-profile",
+    response_model=AgentOut,
+    summary="Профиль по умолчанию для новых чатов этого агента",
+    description=(
+        "Не действует задним числом: уже существующие чаты этого агента сохраняют свой "
+        "текущий активный профиль (см. `PUT /chats/{chat_id}/active-profile`) — здесь "
+        "задаётся только то, что унаследует НОВЫЙ чат в момент создания. "
+        "Профиль общий для всех агентов — подходит любой из записей `GET /profiles`."
+    ),
+)
+def set_agent_default_profile(agent_id: str, payload: ActiveProfileSetRequest, repo: Repository = Depends(get_repository)) -> AgentOut:
+    return agent_out(repo.set_agent_default_profile(agent_id, payload.profile_id))
 
 
 @router.post(

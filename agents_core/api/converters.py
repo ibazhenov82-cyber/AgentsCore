@@ -5,16 +5,20 @@ from __future__ import annotations
 
 import dataclasses
 
-from ..models import Agent, Branch, Chat, Message, ModelInfo
+from ..models import Agent, Branch, Chat, LongTermMemoryEntry, Message, ModelInfo, Profile, WorkingMemoryEntry
 from ..schemas import (
     AgentOut,
     BranchOut,
     ChatOut,
     ChatStatsOut,
     DefaultSettingsOut,
+    LongTermMemoryOut,
     MessageOut,
     ModelInfoOut,
+    ProfileOut,
+    RegisteredSkillOut,
     SettingsOut,
+    WorkingMemoryOut,
 )
 
 
@@ -28,7 +32,8 @@ def default_settings_out(settings) -> DefaultSettingsOut:
 
 def agent_out(agent: Agent) -> AgentOut:
     return AgentOut(id=agent.id, name=agent.name, created_at=agent.created_at,
-                     updated_at=agent.updated_at, settings=settings_out(agent.settings))
+                     updated_at=agent.updated_at, settings=settings_out(agent.settings),
+                     default_profile_id=agent.default_profile_id)
 
 
 def chat_stats_out(stats: dict) -> ChatStatsOut:
@@ -45,6 +50,31 @@ def chat_out(chat: Chat, stats: dict) -> ChatOut:
     return ChatOut(
         id=chat.id, agent_id=chat.agent_id, title=chat.title, created_at=chat.created_at,
         updated_at=chat.updated_at, settings=settings_out(chat.settings), stats=chat_stats_out(stats),
+        active_profile_id=chat.active_profile_id,
+    )
+
+
+def working_memory_out(entry: WorkingMemoryEntry) -> WorkingMemoryOut:
+    return WorkingMemoryOut(**dataclasses.asdict(entry))
+
+
+def long_term_memory_out(entry: LongTermMemoryEntry) -> LongTermMemoryOut:
+    return LongTermMemoryOut(**dataclasses.asdict(entry))
+
+
+def profile_out(profile: Profile) -> ProfileOut:
+    return ProfileOut(**dataclasses.asdict(profile))
+
+
+def registered_skill_out(skill: dict) -> RegisteredSkillOut:
+    """`skill` — полное OpenAI function-tool описание
+    ({"type": "function", "function": {"name", "description", "parameters"}}),
+    как хранится в реестре (`agents_core.skills.registry`)."""
+    fn = skill.get("function", {})
+    return RegisteredSkillOut(
+        name=fn.get("name", ""),
+        description=fn.get("description", ""),
+        parameters=fn.get("parameters", {}) or {},
     )
 
 

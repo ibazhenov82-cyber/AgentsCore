@@ -9,7 +9,16 @@ from __future__ import annotations
 
 import unittest
 
-from agents_core.api.converters import agent_out, chat_out, default_settings_out, message_out, model_info_out
+from agents_core.api.converters import (
+    agent_out,
+    chat_out,
+    default_settings_out,
+    long_term_memory_out,
+    message_out,
+    model_info_out,
+    profile_out,
+    working_memory_out,
+)
 from tests.test_repository import TEST_MODEL_ID, make_repository
 
 
@@ -55,6 +64,40 @@ class SchemasTestCase(unittest.TestCase):
         model = self.repo.list_models()[0]
         out = model_info_out(model)
         self.assertEqual(out.id, TEST_MODEL_ID)
+
+    def test_chat_out_exposes_active_profile_id(self):
+        agent = self.repo.create_agent("A", model=TEST_MODEL_ID)
+        chat = self.repo.create_chat(agent.id, "C1")
+        profile = self.repo.create_profile("Профиль")
+        chat = self.repo.set_chat_active_profile(chat.id, profile.id)
+        out = chat_out(chat, self.repo.chat_stats(chat))
+        self.assertEqual(out.active_profile_id, profile.id)
+
+    def test_working_and_long_term_memory_out(self):
+        agent = self.repo.create_agent("A", model=TEST_MODEL_ID)
+        chat = self.repo.create_chat(agent.id, "C1")
+        wm = self.repo.save_working_memory(chat.id, "k", "v")
+        out = working_memory_out(wm)
+        self.assertEqual(out.source, "manual")
+
+        ltm = self.repo.save_long_term_memory(agent.id, "knowledge", "k2", "v2")
+        out2 = long_term_memory_out(ltm)
+        self.assertEqual(out2.category, "knowledge")
+
+    def test_profile_out_roundtrip(self):
+        import json
+
+        from agents_core.skills import shopping_demo
+
+        profile = self.repo.create_profile(
+            "Покупки",
+            skills_json=json.dumps(shopping_demo.TOOL_DEFS, ensure_ascii=False),
+            orchestration_prompt=shopping_demo.DEFAULT_ORCHESTRATION_PROMPT,
+        )
+        out = profile_out(profile)
+        dumped = out.model_dump()
+        self.assertIn("search_products", dumped["skills_json"])
+        self.assertIsNotNone(out.orchestration_prompt)
 
 
 if __name__ == "__main__":

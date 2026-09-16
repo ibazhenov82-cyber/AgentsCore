@@ -24,7 +24,7 @@ from ..repository import (
     Repository,
     ValidationError,
 )
-from . import agents, chats, health, messages, models_routes, settings_routes
+from . import agents, chats, health, memory, messages, models_routes, settings_routes
 
 DESCRIPTION = """
 AgentsCore — HTTP-сервис для работы с LLM-агентами.
@@ -72,6 +72,7 @@ def create_app_with_repository(repo: Repository) -> FastAPI:
     app.include_router(agents.router)
     app.include_router(chats.router)
     app.include_router(messages.router)
+    app.include_router(memory.router)
 
     @app.exception_handler(NotFoundError)
     def _not_found(request: Request, exc: NotFoundError) -> JSONResponse:
