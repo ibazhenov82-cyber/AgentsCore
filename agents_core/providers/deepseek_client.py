@@ -60,6 +60,7 @@ HTTP через `requests`, так что SDK `openai` не нужен. Он р�
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import warnings
@@ -68,6 +69,25 @@ from enum import Enum
 from typing import Any, Dict, Generator, Iterable, List, Optional, Union
 
 import requests
+
+# Логгер каждого исходящего вызова DeepSeek API (метод/URL/параметры,
+# статус ответа, время выполнения) — см. `agents_core.logging_setup` для
+# общей настройки уровня/файла лога (этот модуль намеренно НЕ импортирует
+# ничего из agents_core — см. докстринг модуля выше про самостоятельность
+# пакета — поэтому использует голый `logging` со своим собственным именем
+# логгера, которое всё равно оказывается потомком "agents_core.llm" в
+# иерархии logging и наследует настроенные там обработчики).
+_logger = logging.getLogger("agents_core.llm.deepseek")
+try:
+    _LOG_BODY_LIMIT = int(os.environ.get("AGENT_LOG_BODY_LIMIT", "2000") or "2000")
+except ValueError:
+    _LOG_BODY_LIMIT = 2000
+
+
+def _truncate_for_log(text: str, limit: int = _LOG_BODY_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... (обрезано в логе, всего {len(text)} симв.)"
 
 __all__ = [
     "Model",
@@ -348,6 +368,22 @@ class DeepSeekClient:
         params: Optional[Dict[str, Any]] = None,
         stream: bool = False,
     ) -> requests.Response:
+        # Тело/параметры логируются РОВНО ОДИН РАЗ до цикла попыток (не при
+        # каждом retry) — заголовки (несущие Authorization) в лог никогда не
+        # попадают, только то, что реально приходит в JSON тела запроса.
+        if json_body is not None:
+            try:
+                body_repr = _truncate_for_log(json.dumps(json_body, ensure_ascii=False))
+            except (TypeError, ValueError):
+                body_repr = _truncate_for_log(str(json_body))
+        else:
+            body_repr = "-"
+        _logger.info(
+            "-> %s %s params=%s json=%s%s",
+            method, url, params or {}, body_repr, " (stream)" if stream else "",
+        )
+        started = time.monotonic()
+
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -363,16 +399,30 @@ class DeepSeekClient:
             except requests.RequestException as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
+                    _logger.warning(
+                        "%s %s сетевая ошибка, попытка %d/%d: %s",
+                        method, url, attempt + 1, self.max_retries + 1, exc,
+                    )
                     time.sleep(self.retry_backoff_seconds * (2 ** attempt))
                     continue
+                _logger.error(
+                    "<- %s %s не удалось за %d попыток(и) (%.1f мс): %s",
+                    method, url, self.max_retries + 1, (time.monotonic() - started) * 1000, exc,
+                )
                 raise DeepSeekError(f"Network error calling DeepSeek API: {exc}") from exc
 
             if resp.status_code == 429 or resp.status_code >= 500:
                 if attempt < self.max_retries:
                     retry_after = resp.headers.get("Retry-After")
                     delay = float(retry_after) if retry_after else self.retry_backoff_seconds * (2 ** attempt)
+                    _logger.warning(
+                        "%s %s ответ %s, попытка %d/%d, повтор через %.1fс",
+                        method, url, resp.status_code, attempt + 1, self.max_retries + 1, delay,
+                    )
                     time.sleep(delay)
                     continue
+
+            duration_ms = (time.monotonic() - started) * 1000
 
             if not resp.ok:
                 body: Any
@@ -382,8 +432,16 @@ class DeepSeekClient:
                 except ValueError:
                     body = resp.text
                     message = resp.text
+                _logger.error(
+                    "<- %s %s %s (%.1f мс): %s",
+                    method, url, resp.status_code, duration_ms, _truncate_for_log(str(message)),
+                )
                 raise DeepSeekAPIError(resp.status_code, message, body)
 
+            _logger.info(
+                "<- %s %s %s (%.1f мс)%s",
+                method, url, resp.status_code, duration_ms, " начат поток" if stream else "",
+            )
             return resp
 
         # По идее, сюда дойти невозможно, но это устраивает статические анализаторы типов.

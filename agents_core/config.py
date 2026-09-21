@@ -42,6 +42,36 @@ def _split_csv(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+#: "Работу с задачами требуется переделать" (ТЗ по замене system prompt
+#: "Менеджера задач") — системный prompt, подмешиваемый, пока у чата
+#: включена настройка `task_tracking_enabled`, ЗАПОЛНЯЕМЫЙ ШАБЛОН, а не
+#: готовый текст: `<task_states></task_states>` подставляется описанием
+#: состояний машины прямо из кода (`task_state_machine.format_states_for_prompt`),
+#: `<task_state_machine_invariants></task_state_machine_invariants>` —
+#: текстами инвариантов категории "Правило стейт-машины", привязанных к
+#: машине состояний (настройка `task_state_machine_invariants`, экран
+#: "Модели состояний задач"), каждый на отдельной строке. См.
+#: `Repository._build_task_tracking_prompt`. Значение по умолчанию — ровно
+#: текст шаблона из ТЗ; переопределяется целиком переменной окружения
+#: `TASK_TRACKING_PROMPT_TEMLATE` (можно отредактировать перед запуском
+#: сервиса — см. `.env.example`; т.к. простой загрузчик `.env` не понимает
+#: многострочные значения, перевод строки в переопределении нужно писать
+#: как литеральные символы `\n` — они разворачиваются обратно при чтении).
+DEFAULT_TASK_TRACKING_PROMPT_TEMPLATE = """Если в переписке появляется задача/задачи возвращай со следующими параметрами:
+task - Название задачи,
+state - Этап конечного автомата - TaskState,
+step - Целое от 1 до 4, в соответствии с перечнем TaskState,
+total - Целое число, всего шагов (4 в соответствии с TaskState),
+plan - Утверждённый план, список ["", ..],
+done - Что уже сделано, список ["", ..],
+current - Что делаем сейчас.
+TaskState: <task_states></task_states>
+В дальнейшем при работе в этом диалоге соблюдай следующие правила:
+[TASK STATE MACHINE INVARIANTS]
+<task_state_machine_invariants></task_state_machine_invariants>
+При ответе на запрос, предлагай информацию по задаче (в описанном выше формате), промежуточный или конечный результат (если задача выполнена) и в соответствии с требованиями правил (TASK STATE MACHINE INVARIANTS) запрашивай подтверждение пользователем на продолжение работы."""
+
+
 @dataclass
 class ProviderModelEntry:
     """Одна модель, объявленная в .env для конкретного провайдера."""
@@ -108,6 +138,26 @@ class AgentConfig:
             for model_id in cls.OLLAMA_MODELS:
                 entries.append(ProviderModelEntry("ollama", model_id))
         return entries
+
+    # --- "Менеджер задач": system prompt по шаблону ---------------------
+    # Точное имя переменной — TASK_TRACKING_PROMPT_TEMLATE (см. ТЗ) —
+    # сохранено буквально, чтобы совпадать с тем, что реально будет в .env.
+    # "\n" в значении переменной окружения разворачивается в перевод
+    # строки — см. докстринг DEFAULT_TASK_TRACKING_PROMPT_TEMPLATE выше.
+    TASK_TRACKING_PROMPT_TEMLATE: str = (
+        os.environ.get("TASK_TRACKING_PROMPT_TEMLATE", "").replace("\\n", "\n").strip()
+        or DEFAULT_TASK_TRACKING_PROMPT_TEMPLATE
+    )
+
+    # --- Логирование ---------------------------------------------------
+    # Уровень логирования REST-запросов (agents_core.access) и вызовов
+    # внешних API LLM (agents_core.llm.*) — см. agents_core.logging_setup.
+    LOG_LEVEL: str = os.environ.get("AGENT_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    # Путь к файлу лога В ДОПОЛНЕНИЕ к stderr; пусто — лог только в stderr.
+    LOG_FILE: str = os.environ.get("AGENT_LOG_FILE", "").strip()
+    # Сколько символов тела запроса/ответа или JSON-параметров вызова
+    # показывать в одной строке лога, остальное усекается.
+    LOG_BODY_LIMIT: int = int(os.environ.get("AGENT_LOG_BODY_LIMIT", "2000") or "2000")
 
     @classmethod
     def is_deepseek_configured(cls) -> bool:

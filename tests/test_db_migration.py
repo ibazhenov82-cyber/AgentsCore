@@ -443,5 +443,186 @@ class ProfilesGlobalCatalogMigrationTestCase(unittest.TestCase):
         self.assertIn(profile.id, {p.id for p in repo.list_profiles()})
 
 
+class TaskCatalogToCodeMigrationTestCase(unittest.TestCase):
+    """"Работу с задачами требуется переделать" (новое ТЗ) — раньше
+    состояния/действия/машины состояний задач были справочниками в БД
+    (task_states/task_actions/task_state_machines/task_machine_states/
+    task_transitions), а `tasks` ссылались на них (`machine_id`,
+    `current_state_id`). `Database._migrate_task_catalog_to_code` должна
+    перенести существующие задачи/историю на новую схему (state — строкой,
+    paused — по последнему переходу) без потери данных, а затем удалить
+    старые справочники целиком. Строит старую схему поверх СВЕЖЕЙ БД новой
+    версии (проще, чем вручную собирать весь старый agents/chats DDL) —
+    создаёт агента/чат обычным способом, затем подменяет только
+    task-таблицы на старый вид сырым sqlite3."""
+
+    def setUp(self) -> None:
+        db_fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(db_fd)
+        os.unlink(self.db_path)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.db_path):
+            os.unlink(self.db_path)
+
+    def _make_repo(self) -> Repository:
+        db = Database(self.db_path)
+        registry = FakeRegistry(FakeProvider())
+        model = ModelInfo(
+            id=TEST_MODEL_ID, provider="fake", model_id="test-model", display_name="Test model",
+            is_local=True, context_window=1200, max_input_tokens=1000, max_output_tokens=256,
+            supports_thinking=True, supports_tools=True, supports_json_mode=True, supports_logprobs=False,
+        )
+        return Repository(db, registry, FakeCatalog({TEST_MODEL_ID: model}))
+
+    def _downgrade_to_old_task_schema(self, agent_id: str, chat_id: str) -> dict:
+        """Заменяет новые task-таблицы (только что созданные `Database` по
+        актуальной схеме) на старые, с тремя задачами: (1) активная, этап
+        "execution" (последний переход — NORMAL, значит НЕ на паузе), (2) с
+        состоянием, чьё `system_name` в новой машине не существует (проверка
+        отката на "planning"), последний переход — PAUSE, (3) "отклонённая"
+        через больше не существующее действие DECLINE — проверка переноса с
+        пометкой в примечании. Возвращает id трёх задач."""
+        now = 1_700_000_000
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS task_transition_log;
+                DROP TABLE IF EXISTS tasks;
+                DROP TABLE IF EXISTS task_machine_settings;
+
+                CREATE TABLE task_states (
+                    id TEXT PRIMARY KEY, system_name TEXT NOT NULL, display_name TEXT NOT NULL,
+                    description TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE task_actions (
+                    id TEXT PRIMARY KEY, system_name TEXT NOT NULL, display_name TEXT NOT NULL,
+                    kind TEXT NOT NULL, description TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE task_state_machines (
+                    id TEXT PRIMARY KEY, system_name TEXT NOT NULL, display_name TEXT NOT NULL,
+                    description TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, machine_id TEXT NOT NULL,
+                    title TEXT NOT NULL, current_state_id TEXT NOT NULL, current_step TEXT,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE task_transition_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                    action_id TEXT NOT NULL, from_state_id TEXT NOT NULL, to_state_id TEXT NOT NULL,
+                    applied_by TEXT NOT NULL, note TEXT, created_at INTEGER NOT NULL
+                );
+                """
+            )
+            conn.executemany(
+                "INSERT INTO task_states (id, system_name, display_name, description, created_at, updated_at) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                [
+                    ("s_planning", "planning", "Планирование", now, now),
+                    ("s_execution", "execution", "Выполнение", now, now),
+                    ("s_validation", "validation", "Проверка", now, now),
+                    ("s_done", "done", "Готово", now, now),
+                    ("s_weird", "weird_custom_state", "Кастомное", now, now),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO task_actions (id, system_name, display_name, kind, description, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                [
+                    ("a_normal", "advance", "Продолжить", "NORMAL", now, now),
+                    ("a_pause", "pause", "Пауза", "PAUSE", now, now),
+                    ("a_decline", "decline", "Отклонить", "DECLINE", now, now),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO task_state_machines (id, system_name, display_name, description, created_at, updated_at) "
+                "VALUES ('m1', 'default', 'Стандартный процесс', NULL, ?, ?)", (now, now),
+            )
+
+            task_active, task_fallback, task_declined = "t_active", "t_fallback", "t_declined"
+            conn.executemany(
+                "INSERT INTO tasks (id, chat_id, machine_id, title, current_state_id, current_step, "
+                "created_at, updated_at) VALUES (?, ?, 'm1', ?, ?, ?, ?, ?)",
+                [
+                    (task_active, chat_id, "Активная задача", "s_execution", None, now, now),
+                    (task_fallback, chat_id, "Задача с кастомным состоянием", "s_weird", "шаг X", now, now),
+                    (task_declined, chat_id, "Отклонённая задача", "s_done", None, now, now),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO task_transition_log (task_id, action_id, from_state_id, to_state_id, "
+                "applied_by, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (task_active, "a_pause", "s_planning", "s_planning", "system", None, now),
+                    (task_active, "a_normal", "s_planning", "s_execution", "agent", None, now + 1),
+                    (task_fallback, "a_pause", "s_weird", "s_weird", "manual", "ушёл на встречу", now),
+                    (task_declined, "a_decline", "s_planning", "s_done", "agent", "не актуально", now),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return {"active": task_active, "fallback": task_fallback, "declined": task_declined}
+
+    def test_migration_preserves_tasks_and_maps_state_and_pause_flag(self):
+        repo = self._make_repo()
+        agent = repo.create_agent("Агент", model=TEST_MODEL_ID)
+        chat = repo.create_chat(agent.id, "Чат")
+        ids = self._downgrade_to_old_task_schema(agent.id, chat.id)
+
+        # Переоткрытие БД запускает `_migrate_task_catalog_to_code`.
+        repo2 = self._make_repo()
+
+        active = repo2.get_task(ids["active"])
+        self.assertEqual(active["task"].state, "execution")
+        self.assertEqual(active["status"], "active")  # последний переход NORMAL -> не на паузе
+
+        fallback = repo2.get_task(ids["fallback"])
+        # "weird_custom_state" не входит в новую машину состояний -> откат на "planning".
+        self.assertEqual(fallback["task"].state, "planning")
+        self.assertEqual(fallback["status"], "paused")  # последний переход PAUSE
+        self.assertEqual(fallback["task"].current_step, "шаг X")
+
+        declined = repo2.get_task(ids["declined"])
+        self.assertEqual(declined["task"].state, "done")
+        self.assertEqual(declined["status"], "done")
+        history = declined["history"]
+        self.assertEqual(history[-1]["kind"], "advance")  # DECLINE -> advance (см. kind_map)
+        self.assertIn("Отклонить", history[-1]["note"])  # пометка о перенесённом действии сохранена
+        self.assertIn("не актуально", history[-1]["note"])  # исходное примечание не потеряно
+
+    def test_migration_drops_old_catalog_tables(self):
+        repo = self._make_repo()
+        agent = repo.create_agent("Агент", model=TEST_MODEL_ID)
+        chat = repo.create_chat(agent.id, "Чат")
+        self._downgrade_to_old_task_schema(agent.id, chat.id)
+
+        self._make_repo()  # переоткрытие запускает миграцию
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        finally:
+            conn.close()
+        for old_table in ("task_states", "task_actions", "task_state_machines", "task_machine_states", "task_transitions"):
+            self.assertNotIn(old_table, tables)
+        self.assertIn("tasks", tables)
+        self.assertIn("task_transition_log", tables)
+
+    def test_migration_is_idempotent_on_reopen(self):
+        repo = self._make_repo()
+        agent = repo.create_agent("Агент", model=TEST_MODEL_ID)
+        chat = repo.create_chat(agent.id, "Чат")
+        ids = self._downgrade_to_old_task_schema(agent.id, chat.id)
+        self._make_repo()  # первая миграция
+
+        repo3 = self._make_repo()  # повторное открытие — уже новая схема, миграция не запускается
+        active = repo3.get_task(ids["active"])
+        self.assertEqual(active["task"].state, "execution")
+
+
 if __name__ == "__main__":
     unittest.main()

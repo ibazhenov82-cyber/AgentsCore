@@ -14,13 +14,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import sqlite3
 import threading
 import time
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from .catalog import ModelCatalog
+from .config import AgentConfig
 from .db import Database
 from .format_detect import detect_message_format
+from .invariant_checks import format_violation_warning, validate_response
 from .models import (
     Agent,
     AUTOSUMMARY_OPTIONS,
@@ -28,6 +31,9 @@ from .models import (
     Chat,
     CONTEXT_STRATEGY_OPTIONS,
     DefaultSettings,
+    Invariant,
+    INVARIANT_KIND_LABELS,
+    INVARIANT_KIND_OPTIONS,
     LONG_TERM_MEMORY_CATEGORIES,
     LONG_TERM_MEMORY_CATEGORY_ENABLE_FIELD,
     LONG_TERM_MEMORY_CORE_CATEGORIES,
@@ -37,12 +43,24 @@ from .models import (
     ModelInfo,
     Profile,
     Settings,
+    Task,
+    TASK_APPLIED_BY_OPTIONS,
+    TaskTransitionLog,
     WorkingMemoryEntry,
     settings_from_defaults,
 )
 from .providers import ChatResult, ProviderError, ProviderMessage, ProviderRegistry
 from .skills import registry as skills_registry
 from .skills import shopping_demo
+from .task_state_machine import (
+    allowed_transitions,
+    can_transition,
+    format_states_for_prompt,
+    TASK_STATE_ORDER,
+    TaskState as TaskStateEnum,
+    display_name as task_state_display_name,
+    parse_task_state,
+)
 from .tokens import estimate_messages_tokens
 
 _SETTINGS_FIELD_NAMES = {f.name for f in dataclasses.fields(Settings)}
@@ -118,6 +136,95 @@ def _build_save_long_term_memory_tool(categories: List[str]) -> dict:
         },
     }
 
+# ---------------------------------------------------------------------------
+# "Работу с задачами требуется переделать" (новое ТЗ) — встроенные функции
+# start_task/apply_task_action, доступные чатам с task_tracking_enabled=true.
+# Машина состояний теперь ЕДИНАЯ и задана в коде (`task_state_machine.py`) —
+# в отличие от прежней версии, здесь больше нет выбора модели состояний
+# (`machine_system_name`) и явного действия "Отклонить"; вместо системного
+# имени действия модель называет ЦЕЛЕВОЙ ЭТАП (`target_state`), а enum
+# сужается на каждый запрос до состояний, реально достижимых из текущего
+# этапа хотя бы одной из открытых задач чата (см. `Repository._settings_with_merged_tools`).
+# ---------------------------------------------------------------------------
+
+def _build_start_task_tool() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "start_task",
+            "description": (
+                "Начать отслеживание НОВОЙ задачи в этом чате (см. «Состояние задачи»). "
+                "Используй, когда в сообщении пользователя выделяется отдельная задача, "
+                "которую стоит вести по этапам — не для каждой реплики. НЕ жди прямой просьбы "
+                "пользователя отслеживать задачу или явной команды вроде «возьми в работу» — "
+                "начинай сам, если задача очевидна по смыслу сообщения. В чате может быть "
+                "несколько открытых задач одновременно. Задача всегда начинается с этапа "
+                "«Планирование»."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Короткая формулировка задачи"},
+                    "plan": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Согласованный план — список шагов до выполнения задачи (PLAN). "
+                            "Можно оставить пустым и задать позже через apply_task_action."
+                        ),
+                    },
+                },
+                "required": ["title"],
+            },
+        },
+    }
+
+
+def _build_apply_task_action_tool(target_state_options: List[str]) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "apply_task_action",
+            "description": (
+                "Обновить прогресс уже начатой задачи этого чата — продвинуть этап "
+                "(в т.ч. в рамках автономного продолжения работы «Менеджером задач», без нового "
+                "сообщения пользователя — см. системную реплику «Продолжай самостоятельно "
+                "работать над задачей»), и/или обновить текущий шаг (CURRENT) и список "
+                "выполненных шагов (DONE). Вызывай сам, как только по смыслу переписки (или "
+                "собственного предыдущего ответа) этап можно считать пройденным — не жди, чтобы "
+                "пользователь явно попросил «отправляй дальше»/«на проверку» и т.п. task_id "
+                "ВСЕГДА обязателен (бери из блока [ЗАДАЧА] этого чата — открытых задач может быть "
+                "несколько одновременно, неоднозначность недопустима)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Id задачи из блока [ЗАДАЧА] этого чата"},
+                    "target_state": {
+                        "type": "string",
+                        "enum": target_state_options,
+                        "description": (
+                            "Новый этап (STATE) — должен быть доступен из ТЕКУЩЕГО этапа именно "
+                            "этой задачи; можно не указывать, если этап не меняется, а обновляются "
+                            "только current_step/completed_step."
+                        ),
+                    },
+                    "current_step": {
+                        "type": "string",
+                        "description": "Короткое описание текущего шага (CURRENT), например 'сбор данных по региону EMEA'",
+                    },
+                    "completed_step": {
+                        "type": "string",
+                        "description": "Если предыдущий шаг завершён — его краткое описание; будет добавлено в список DONE",
+                    },
+                    "note": {"type": "string", "description": "Необязательный комментарий к переходу"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    }
+
+
 _SUMMARY_TAG_RE = {
     "previous_summary": re.compile(r"<previous_summary>.*?</previous_summary>", re.DOTALL),
     "new_messages": re.compile(r"<new_messages>.*?</new_messages>", re.DOTALL),
@@ -185,6 +292,24 @@ def _fill_summary_template(template: str, previous_summary: str, new_messages_te
         result = _SUMMARY_TAG_RE["new_messages"].sub(
             lambda _m: f"<new_messages>\n{new_messages_text}\n</new_messages>", result, count=1
         )
+    return result
+
+
+_TASK_STATES_TAG_RE = re.compile(r"<task_states>.*?</task_states>", re.DOTALL)
+_TASK_STATE_MACHINE_INVARIANTS_TAG_RE = re.compile(r"<task_state_machine_invariants>.*?</task_state_machine_invariants>", re.DOTALL)
+
+
+def _fill_task_tracking_template(template: str, task_states_text: str, invariants_text: str) -> str:
+    """Подставляет заполненные значения ВМЕСТО плейсхолдеров
+    `<task_states></task_states>`/`<task_state_machine_invariants></task_state_machine_invariants>`
+    целиком (тег вместе с содержимым заменяется на голый текст — по примеру
+    в ТЗ итоговый prompt содержит "TaskState: 1 - PLANNING (...), ...", а не
+    "TaskState: <task_states>1 - PLANNING (...), ...</task_states>"). Если
+    шаблон был отредактирован пользователем и каких-то тегов в нём нет —
+    возвращает как есть в этой части (тот же принцип, что и
+    `_fill_summary_template`)."""
+    result = _TASK_STATES_TAG_RE.sub(lambda _m: task_states_text, template, count=1)
+    result = _TASK_STATE_MACHINE_INVARIANTS_TAG_RE.sub(lambda _m: invariants_text, result, count=1)
     return result
 
 
@@ -731,6 +856,7 @@ class Repository:
         if chat.settings.system_prompt and chat.settings.system_prompt.strip():
             provider_messages.append(ProviderMessage("system", chat.settings.system_prompt))
         provider_messages += self._build_memory_injection_messages(chat, agent)
+        provider_messages += self._build_task_and_invariant_context(chat, agent)
         provider_messages += [ProviderMessage(m.role, m.content) for m in recent]
         provider_messages.append(ProviderMessage("user", new_text))
         return provider_messages
@@ -969,6 +1095,292 @@ class Repository:
         self._db.set_agent_default_profile(agent_id, profile_id)
         return self._require_agent(agent_id)
 
+    # ---- инварианты ("День 14", общий справочник для ВСЕХ агентов) ---------
+
+    def _require_invariant(self, invariant_id: str) -> Invariant:
+        invariant = self._db.get_invariant(invariant_id)
+        if invariant is None:
+            raise NotFoundError(f"no such invariant: {invariant_id}")
+        return invariant
+
+    def list_invariants(self) -> List[Invariant]:
+        """Общий справочник инвариантов — один список для ВСЕХ агентов, по
+        аналогии с `list_profiles` (заводится и редактируется по образцу
+        профилей, а не привязывается к одному чату/агенту при создании)."""
+        return self._db.list_invariants()
+
+    def get_invariant(self, invariant_id: str) -> Invariant:
+        return self._require_invariant(invariant_id)
+
+    @staticmethod
+    def _validate_invariant_kind(kind: Optional[str]) -> None:
+        if kind is not None and kind not in INVARIANT_KIND_OPTIONS:
+            raise ValidationError(f"invalid invariant kind: {kind!r}")
+
+    def create_invariant(
+        self, title: str, rule_text: str, kind: Optional[str] = None, is_active: bool = True,
+    ) -> Invariant:
+        if not title or not title.strip():
+            raise ValidationError("title must be a non-empty string")
+        if not rule_text or not rule_text.strip():
+            raise ValidationError("rule_text must be a non-empty string")
+        self._validate_invariant_kind(kind)
+        return self._db.create_invariant(title.strip(), rule_text.strip(), kind=kind, is_active=is_active)
+
+    def update_invariant(self, invariant_id: str, payload: dict) -> Invariant:
+        self._require_invariant(invariant_id)
+        allowed = {"title", "rule_text", "kind", "is_active"}
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValidationError(f"unknown invariant field(s): {', '.join(sorted(unknown))}")
+        if "title" in payload and (not payload["title"] or not payload["title"].strip()):
+            raise ValidationError("title must be a non-empty string")
+        if "rule_text" in payload and (not payload["rule_text"] or not payload["rule_text"].strip()):
+            raise ValidationError("rule_text must be a non-empty string")
+        if "kind" in payload:
+            self._validate_invariant_kind(payload["kind"])
+        self._db.update_invariant(invariant_id, payload)
+        return self._require_invariant(invariant_id)
+
+    def delete_invariant(self, invariant_id: str) -> None:
+        self._require_invariant(invariant_id)
+        # Выбор этого инварианта снимается у ВСЕХ агентов/чатов, где он был
+        # выбран — см. `Database.delete_invariant` (в отличие от профилей,
+        # это не FK со SET NULL, а обычный JSON-массив, чистим вручную).
+        self._db.delete_invariant(invariant_id)
+
+    def set_agent_invariants(self, agent_id: str, invariant_ids: List[str]) -> Agent:
+        """Множественный выбор инвариантов для агента — действует во всех
+        его чатах (см. `Repository._effective_invariant_ids`), по аналогии с
+        тем, как `default_profile_id` выбирается из общего справочника, но
+        здесь выбор МНОЖЕСТВЕННЫЙ и это не разовый снимок для новых чатов, а
+        живая настройка самого агента (по замечанию пользователя — как у
+        профилей: общий справочник + множественный выбор в настройках)."""
+        self._require_agent(agent_id)
+        deduped = list(dict.fromkeys(invariant_ids))
+        for invariant_id in deduped:
+            self._require_invariant(invariant_id)
+        self._db.set_agent_invariants(agent_id, deduped)
+        return self._require_agent(agent_id)
+
+    def set_chat_invariants(self, chat_id: str, invariant_ids: List[str]) -> Chat:
+        """То же самое, но уровня чата — итоговый набор для чата является
+        объединением этого списка и `Agent.invariant_ids` его агента."""
+        self._require_chat(chat_id)
+        deduped = list(dict.fromkeys(invariant_ids))
+        for invariant_id in deduped:
+            self._require_invariant(invariant_id)
+        self._db.set_chat_invariants(chat_id, deduped)
+        return self._require_chat(chat_id)
+
+    # ---- машина состояний задач (read-only, задана в коде) -------------------
+    # "Работу с задачами требуется переделать" (новое ТЗ) — каталог
+    # состояний/переходов больше не в БД, см. `task_state_machine.py`; здесь
+    # остаётся только read-only описание для Android-экрана (замена формы
+    # редактирования состояний/действий/машин) и настройка привязанных к
+    # машине инвариантов категории "Правило стейт-машины".
+
+    def get_task_state_machine_info(self) -> dict:
+        """Read-only описание единственной (заданной в коде) машины
+        состояний — номер, отображаемое и системное имя, список достижимых
+        состояний для каждого этапа — плюс текущий список привязанных
+        инвариантов категории "Правило стейт-машины" (см.
+        `set_task_machine_invariants`)."""
+        states = [
+            {
+                "position": index,
+                "state": state.value,
+                "display_name": task_state_display_name(state),
+                "target_states": [s.value for s in allowed_transitions(state)],
+                "target_state_display_names": [task_state_display_name(s) for s in allowed_transitions(state)],
+            }
+            for index, state in enumerate(TASK_STATE_ORDER, start=1)
+        ]
+        invariant_ids = set(self._db.get_task_machine_invariant_ids())
+        invariants = [inv for inv in self._db.list_invariants() if inv.id in invariant_ids]
+        return {"states": states, "invariants": invariants}
+
+    def set_task_machine_invariants(self, invariant_ids: List[str]) -> dict:
+        """Заменяет весь список привязанных к машине состояний инвариантов —
+        только категории "Правило стейт-машины" (по аналогии с
+        `set_agent_invariants`/`set_chat_invariants`, но без объединения:
+        здесь ровно один список на всю систему, см.
+        `Database.set_task_machine_invariant_ids`)."""
+        deduped = list(dict.fromkeys(invariant_ids))
+        for invariant_id in deduped:
+            invariant = self._require_invariant(invariant_id)
+            if invariant.kind != "state_machine_rule":
+                raise ValidationError(
+                    f"invariant {invariant_id!r} has kind {invariant.kind!r}, expected 'state_machine_rule'"
+                )
+        self._db.set_task_machine_invariant_ids(deduped)
+        return self.get_task_state_machine_info()
+
+    # ---- задачи (чтение/агрегирование, изменение — см. tool-calling ниже) ----
+
+    _TASK_STATUS_LABELS = {"active": "активна", "paused": "на паузе", "done": "завершена"}
+
+    def _require_task(self, task_id: str) -> Task:
+        task = self._db.get_task(task_id)
+        if task is None:
+            raise NotFoundError(f"no such task: {task_id}")
+        return task
+
+    def _task_status(self, task: Task) -> str:
+        """"active" | "paused" | "done" — см. `TASK_STATUS_OPTIONS`. Заметно
+        проще прежней версии: "done" прямо по значению `task.state`, "paused"
+        — прямо по флагу `task.paused` (ортогональному состоянию, см.
+        докстринг `task_state_machine`), без обращения к истории переходов."""
+        if task.state == TaskStateEnum.DONE.value:
+            return "done"
+        return "paused" if task.paused else "active"
+
+    def _task_next_state_display_name(self, task: Task) -> Optional[str]:
+        """Этап, в который ведёт "Продолжить"/"Выполнить" из текущего этапа —
+        для карточки-подтверждения в чате и списка задач. Если из текущего
+        этапа возможно несколько целей (см. `TASK_TRANSITIONS` — например,
+        VALIDATION может вернуться в EXECUTION), берётся ПЕРВАЯ по порядку —
+        она всегда прямое продолжение вперёд (порядок задан примером ТЗ:
+        `EXECUTION to listOf(VALIDATION, PLANNING)` — VALIDATION первым).
+        `None`, если задача уже завершена."""
+        targets = allowed_transitions(parse_task_state(task.state))
+        return task_state_display_name(targets[0]) if targets else None
+
+    def _task_summary(self, task: Task, chat_title: Optional[str] = None) -> dict:
+        status = self._task_status(task)
+        summary = {
+            "task": task,
+            "status": status,
+            "status_display": self._TASK_STATUS_LABELS.get(status, status),
+            "state_display_name": task_state_display_name(parse_task_state(task.state)),
+            "next_state_display_name": self._task_next_state_display_name(task) if status != "done" else None,
+        }
+        if chat_title is not None:
+            summary["chat_title"] = chat_title
+        return summary
+
+    def list_tasks_for_chat(self, chat_id: str, include_completed: bool = False) -> List[dict]:
+        self._require_chat(chat_id)
+        tasks = self._db.list_tasks_for_chat(chat_id)
+        summaries = [self._task_summary(t) for t in tasks]
+        if not include_completed:
+            summaries = [s for s in summaries if s["status"] != "done"]
+        return summaries
+
+    def list_tasks_for_agent(self, agent_id: str, include_completed: bool = False) -> List[dict]:
+        """Агрегированный список задач по ВСЕМ чатам агента — блок "Задачи"
+        на карточке агента, с указанием родительского чата у каждой задачи
+        (по замечанию пользователя)."""
+        self._require_agent(agent_id)
+        tasks = self._db.list_tasks_for_agent(agent_id)
+        chat_titles: Dict[str, str] = {}
+        summaries = []
+        for task in tasks:
+            if task.chat_id not in chat_titles:
+                chat = self._db.get_chat(task.chat_id)
+                chat_titles[task.chat_id] = chat.title if chat is not None else task.chat_id
+            summaries.append(self._task_summary(task, chat_title=chat_titles[task.chat_id]))
+        if not include_completed:
+            summaries = [s for s in summaries if s["status"] != "done"]
+        return summaries
+
+    def get_task(self, task_id: str) -> dict:
+        """Полные детали задачи для экрана "Задача": вычисляемый статус,
+        степпер по фиксированным четырём этапам (иконка: "check" — для уже
+        пройденных, "pause" — для текущего, если задача на паузе, "none" —
+        для ещё не достигнутых), доступные действия (продвижение в каждое из
+        достижимых состояний + пауза, если задача сейчас не на паузе) и
+        полная история переходов."""
+        task = self._require_task(task_id)
+        status = self._task_status(task)
+        current_state = parse_task_state(task.state)
+        current_index = TASK_STATE_ORDER.index(current_state)
+
+        stages = []
+        for index, state in enumerate(TASK_STATE_ORDER):
+            is_current = state == current_state
+            if is_current and status == "paused":
+                icon = "pause"
+            elif index <= current_index:
+                icon = "check"
+            else:
+                icon = "none"
+            stages.append({
+                "state": state.value,
+                "display_name": task_state_display_name(state),
+                "is_current": is_current,
+                "is_final": state == TaskStateEnum.DONE,
+                "icon": icon,
+            })
+
+        available_actions = []
+        if status != "done":
+            for target in allowed_transitions(current_state):
+                available_actions.append({
+                    "kind": "advance",
+                    "to_state": target.value,
+                    "to_state_display_name": task_state_display_name(target),
+                })
+            if not task.paused:
+                available_actions.append({
+                    "kind": "pause", "to_state": current_state.value,
+                    "to_state_display_name": task_state_display_name(current_state),
+                })
+
+        def _state_display(value: str) -> str:
+            try:
+                return task_state_display_name(parse_task_state(value))
+            except ValueError:
+                return value
+
+        history = [
+            {
+                "id": log.id,
+                "from_state": log.from_state,
+                "from_state_display_name": _state_display(log.from_state),
+                "to_state": log.to_state,
+                "to_state_display_name": _state_display(log.to_state),
+                "kind": log.kind,
+                "applied_by": log.applied_by,
+                "note": log.note,
+                "created_at": log.created_at,
+            }
+            for log in self._db.list_task_transition_log(task.id)
+        ]
+
+        return {
+            "task": task,
+            "status": status,
+            "status_display": self._TASK_STATUS_LABELS.get(status, status),
+            "state_display_name": task_state_display_name(current_state),
+            "next_state_display_name": self._task_next_state_display_name(task) if status != "done" else None,
+            "step": current_index + 1,
+            "total": len(TASK_STATE_ORDER),
+            "stages": stages,
+            "available_actions": available_actions,
+            "history": history,
+        }
+
+    def apply_manual_task_action(self, task_id: str, action: str, note: Optional[str] = None) -> dict:
+        """Ручное вмешательство человека — теперь только "Пауза" (кнопка
+        "Продолжить"/"Выполнить" ВСЕГДА обращается к модели, см.
+        `run_task_manager_step`; явного действия "Отклонить" в новой модели
+        нет вовсе, см. `task_state_machine.py`)."""
+        task = self._require_task(task_id)
+        if action != "pause":
+            raise ValidationError(f"unsupported manual action: {action!r} (only 'pause' is supported)")
+        if task.state == TaskStateEnum.DONE.value:
+            raise ValidationError("cannot pause a task that is already done")
+        if task.paused:
+            raise ValidationError("task is already paused")
+        self._db.set_task_paused(task.id, True)
+        self._db.add_task_transition_log(task.id, task.state, task.state, kind="pause", applied_by="manual", note=note)
+        return self.get_task(task.id)
+
+    def delete_task(self, task_id: str) -> None:
+        self._require_task(task_id)
+        self._db.delete_task(task_id)
+
     # ---- единый механизм tool-calling (память + скиллы профиля) -------------
     #
     # Реестр "имя функции -> обработчик" — общий для встроенных функций
@@ -991,7 +1403,7 @@ class Repository:
         enabled += [c for c in LONG_TERM_MEMORY_EXTENDED_CATEGORIES if getattr(settings, LONG_TERM_MEMORY_CATEGORY_ENABLE_FIELD[c])]
         return enabled
 
-    def _handle_save_working_memory(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+    def _handle_save_working_memory(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         if not chat.settings.working_memory_enabled:
             return {"error": "working memory is disabled for this chat"}
         key = str(arguments.get("key") or "").strip()
@@ -1001,7 +1413,7 @@ class Repository:
         entry = self._db.upsert_working_memory(chat.id, key, "" if value is None else str(value), source="agent")
         return {"saved": True, "key": entry.key, "value": entry.value, "source": entry.source}
 
-    def _handle_save_long_term_memory(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+    def _handle_save_long_term_memory(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         category = arguments.get("category")
         enabled_categories = self._enabled_long_term_categories(chat.settings)
         if category not in enabled_categories:
@@ -1013,7 +1425,7 @@ class Repository:
         entry = self._db.upsert_long_term_memory(agent.id, category, key, "" if value is None else str(value), source="agent")
         return {"saved": True, "category": entry.category, "key": entry.key, "value": entry.value, "source": entry.source}
 
-    def _handle_search_products(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+    def _handle_search_products(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         return {"products": shopping_demo.search_products(arguments.get("query") or "", arguments.get("max_price"))}
 
     def _current_cart(self, chat_id: str) -> List[str]:
@@ -1026,7 +1438,7 @@ class Repository:
             return []
         return parsed if isinstance(parsed, list) else []
 
-    def _handle_add_to_cart(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+    def _handle_add_to_cart(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         product_id = arguments.get("product_id")
         if not product_id:
             return {"error": "product_id is required"}
@@ -1037,8 +1449,137 @@ class Repository:
         self._db.upsert_working_memory(chat.id, "cart", json.dumps(new_cart, ensure_ascii=False), source="agent")
         return view
 
-    def _handle_view_cart(self, chat: Chat, agent: Agent, arguments: dict) -> dict:
+    def _handle_view_cart(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         return shopping_demo.view_cart(self._current_cart(chat.id))
+
+    # ---- start_task / apply_task_action (tool-calling) -----------------------
+
+    def _open_tasks_for_chat(self, chat: Chat) -> List[Task]:
+        return [t for t in self._db.list_tasks_for_chat(chat.id) if self._task_status(t) != "done"]
+
+    def _task_allowed_target_states(self, task: Task) -> List["TaskStateEnum"]:
+        return allowed_transitions(parse_task_state(task.state))
+
+    def _handle_start_task(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
+        if not chat.settings.task_tracking_enabled:
+            return {"error": "task tracking is disabled for this chat"}
+        title = str(arguments.get("title") or "").strip()
+        if not title:
+            return {"error": "title is required"}
+        plan_raw = arguments.get("plan")
+        plan = [str(s).strip() for s in plan_raw if str(s).strip()] if isinstance(plan_raw, list) else []
+        task = self._db.create_task(chat.id, title, plan=plan)
+        state_name = task_state_display_name(TaskStateEnum.PLANNING)
+        # Редизайн "Менеджера задач" (замечание пользователя, перенесено из
+        # предыдущей версии): прежде чем приступать к планированию/
+        # выполнению/проверке, задача ВСЕГДА показывается пользователю и
+        # ставится на паузу — независимо от `auto_pause` (он относится
+        # только к ПРОДВИЖЕНИЮ уже начатой задачи, см. `_handle_apply_task_action`).
+        self._db.set_task_paused(task.id, True)
+        self._db.add_task_transition_log(
+            task.id, TaskStateEnum.PLANNING.value, TaskStateEnum.PLANNING.value,
+            kind="pause", applied_by="system", note=None,
+        )
+        return {
+            "started": True,
+            "task_id": task.id,
+            "title": task.title,
+            "state": state_name,
+            "status": "paused",
+            "_event": {
+                "task_id": task.id, "task_title": task.title, "from_state_display_name": None,
+                "to_state_display_name": state_name, "kind": "advance",
+            },
+        }
+
+    def _handle_apply_task_action(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
+        if not chat.settings.task_tracking_enabled:
+            return {"error": "task tracking is disabled for this chat"}
+        task_id = arguments.get("task_id")
+        task = self._db.get_task(task_id) if task_id else None
+        if task is None or task.chat_id != chat.id:
+            return {"error": "unknown task_id for this chat"}
+        current_state = parse_task_state(task.state)
+        if current_state == TaskStateEnum.DONE:
+            return {"error": "task is already done"}
+
+        target_state_raw = arguments.get("target_state")
+        to_state = current_state
+        if target_state_raw:
+            try:
+                to_state = parse_task_state(str(target_state_raw))
+            except ValueError:
+                return {"error": f"unknown target_state: {target_state_raw!r}"}
+            if not can_transition(current_state, to_state):
+                options = sorted(s.value for s in allowed_transitions(current_state))
+                return {"error": f"transition {current_state.value} -> {to_state.value} is not allowed; available: {options}"}
+
+        # Редизайн "Менеджера задач": пока auto_pause=true (обычный чат и
+        # кнопка "Продолжить"), одна и та же задача может быть продвинута
+        # (сменить этап) не более ОДНОГО раза за один ответ модели — иначе
+        # пользователь не успеет увидеть промежуточный этап и подтвердить
+        # продолжение. В режиме "Выполнить" (auto_pause=false) это
+        # ограничение не действует.
+        if auto_pause and to_state != current_state and events is not None:
+            if any(e.get("task_id") == task.id and e.get("kind") == "advance" for e in events):
+                return {
+                    "error": (
+                        "task already advanced once in this turn; the task manager pauses after a "
+                        "single step in this mode — stop here and wait for the user to confirm "
+                        "before continuing this task further"
+                    )
+                }
+
+        # Собственно "снимает паузу" из докстринга task_state_machine.py —
+        # раньше нигде не было вызова `set_task_paused(..., False)` вообще
+        # (пауза только ставилась, никогда не снималась программно). Снимаем
+        # её именно здесь, ПЕРЕД применением перехода, а не отдельным логом
+        # "resume" — пауза ортогональна графу переходов (см. task_state_machine.py),
+        # поэтому её снятие не требует отдельной записи в истории: она и так
+        # видна по соседней записи kind="advance" (или по её отсутствию, если
+        # автопауза сразу поставит новую). Обновление БЕЗ смены этапа
+        # (target_state не передан) статус паузы не трогает — им явно
+        # управляет только «Пауза»/продвижение.
+        if to_state != current_state:
+            self._db.set_task_paused(task.id, False)
+
+        current_step_raw = arguments.get("current_step")
+        completed_step = arguments.get("completed_step")
+        note = arguments.get("note")
+        done_steps = list(task.done_steps)
+        if completed_step and str(completed_step).strip():
+            done_steps.append(str(completed_step).strip())
+        self._db.update_task_progress(
+            task.id,
+            state=to_state.value if to_state != current_state else None,
+            current_step=current_step_raw if current_step_raw is not None else task.current_step,
+            done_steps=done_steps if completed_step else None,
+        )
+        if to_state != current_state:
+            self._db.add_task_transition_log(
+                task.id, current_state.value, to_state.value, kind="advance", applied_by="agent", note=note,
+            )
+        # Автопауза сразу после продвижения (auto_pause=true, этап сменился,
+        # новый этап не конечный) — тот же приём, что и при создании задачи.
+        if auto_pause and to_state != current_state and to_state != TaskStateEnum.DONE:
+            self._db.set_task_paused(task.id, True)
+            self._db.add_task_transition_log(
+                task.id, to_state.value, to_state.value, kind="pause", applied_by="system", note=None,
+            )
+        updated_task = self._db.get_task(task.id)
+        status = self._task_status(updated_task) if updated_task is not None else "active"
+        return {
+            "applied": True,
+            "task_id": task.id,
+            "state": task_state_display_name(to_state),
+            "status": status,
+            "_event": {
+                "task_id": task.id, "task_title": task.title,
+                "from_state_display_name": task_state_display_name(current_state),
+                "to_state_display_name": task_state_display_name(to_state),
+                "kind": "advance" if to_state != current_state else "update",
+            },
+        }
 
     _TOOL_HANDLERS = {
         "save_working_memory": _handle_save_working_memory,
@@ -1046,6 +1587,8 @@ class Repository:
         "search_products": _handle_search_products,
         "add_to_cart": _handle_add_to_cart,
         "view_cart": _handle_view_cart,
+        "start_task": _handle_start_task,
+        "apply_task_action": _handle_apply_task_action,
     }
 
     def _settings_with_merged_tools(self, chat: Chat) -> Settings:
@@ -1068,6 +1611,15 @@ class Repository:
             enabled_categories = self._enabled_long_term_categories(chat.settings)
             if enabled_categories:
                 tools.append(_build_save_long_term_memory_tool(enabled_categories))
+        if chat.settings.task_tracking_enabled:
+            tools.append(_build_start_task_tool())
+            open_tasks = self._open_tasks_for_chat(chat)
+            if open_tasks:
+                target_states = sorted({
+                    s.value for task in open_tasks for s in self._task_allowed_target_states(task)
+                })
+                if target_states:
+                    tools.append(_build_apply_task_action_tool(target_states))
         if chat.active_profile_id:
             profile = self._db.get_profile(chat.active_profile_id)
             if profile and profile.skills_json.strip():
@@ -1081,12 +1633,33 @@ class Repository:
             return chat.settings
         return dataclasses.replace(chat.settings, tools_json=json.dumps(tools, ensure_ascii=False))
 
-    def _execute_tool_call(self, chat: Chat, agent: Agent, call: dict) -> str:
+    def _execute_tool_call(
+        self, chat: Chat, agent: Agent, call: dict, events: Optional[List[dict]] = None, auto_pause: bool = True,
+    ) -> str:
         """Выполняет ОДИН запрошенный моделью вызов и возвращает JSON-текст —
         именно он уйдёт обратно провайдеру как содержимое tool-сообщения.
         Неизвестное имя функции или сбой обработчика не поднимают исключение
         наружу — модель получает `{"error": ...}` и может отреагировать сама
-        (например, попробовать другой вызов или объяснить пользователю)."""
+        (например, попробовать другой вызов или объяснить пользователю).
+
+        `events` — необязательный список-аккумулятор (тот же на все итерации
+        одного обмена send_message_blocking/stream_message/run_task_manager_step):
+        обработчики задач (`start_task`/`apply_task_action`) кладут в свой
+        результат служебный ключ `_event` — сюда он переносится и снимается с
+        ответа, уходящего модели, а после завершения tool-цикла список
+        сериализуется в `Message.task_events`, чтобы клиент мог показать
+        переход инлайн в ленте чата (см. `Message.task_events`). Он же
+        передаётся В обработчик — `_handle_apply_task_action` использует его,
+        чтобы не дать модели продвинуть ОДНУ и ту же задачу больше одного
+        раза за один вызов, пока `auto_pause=true` (редизайн "Менеджера
+        задач", см. `_handle_apply_task_action`).
+
+        `auto_pause` — уникальный для КАЖДОГО обмена параметр (передаётся
+        сюда явно, а не хранится изменяемым атрибутом `Repository` — тот
+        singleton, общий на все чаты, и хранение флага там было бы гонкой
+        между параллельными запросами разных чатов): `true` для обычного
+        чата и кнопки "Продолжить" (шаг + пауза), `false` — только для кнопки
+        "Выполнить" (см. `run_task_manager_step`)."""
         fn = call.get("function") or {}
         name = fn.get("name") or ""
         raw_args = fn.get("arguments") or "{}"
@@ -1101,27 +1674,83 @@ class Repository:
             result = {"error": f"unknown tool: {name!r}"}
         else:
             try:
-                result = handler(self, chat, agent, arguments)
+                result = handler(self, chat, agent, arguments, auto_pause, events)
             except Exception as exc:  # сбой одного скилла не должен ронять весь запрос
                 result = {"error": str(exc)}
+        event = result.pop("_event", None) if isinstance(result, dict) else None
+        if event is not None and events is not None:
+            events.append(event)
         return json.dumps(result, ensure_ascii=False)
 
     def _run_tool_loop_blocking(
         self, provider, model_id: str, messages: List[ProviderMessage], settings: Settings,
-        chat: Chat, agent: Agent, result: ChatResult,
+        chat: Chat, agent: Agent, result: ChatResult, events: Optional[List[dict]] = None,
     ) -> ChatResult:
         iterations = 0
         while result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
             messages.append(ProviderMessage("assistant", result.content, tool_calls=result.tool_calls))
             for call in result.tool_calls:
-                tool_output = self._execute_tool_call(chat, agent, call)
+                tool_output = self._execute_tool_call(chat, agent, call, events=events)
                 fn_name = (call.get("function") or {}).get("name")
                 messages.append(ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name))
             iterations += 1
             result = provider.chat(model_id, messages, settings)
         return result
 
+    # ---- "Инварианты" (новое ТЗ): код-уровневая валидация + переспрос -------
+
+    def _validate_and_maybe_retry(
+        self, provider, model_id: str, provider_messages: List[ProviderMessage], settings: Settings,
+        chat: Chat, agent: Agent, result: ChatResult, events: Optional[List[dict]] = None,
+    ) -> Tuple[ChatResult, Optional[str]]:
+        """"Инварианты" (новое ТЗ, раздел "Инварианты", п.2-3) — программная
+        проверка ответа модели для категорий, у которых есть код-чекер (см.
+        `invariant_checks.CHECKERS`); категории без чекера — доверяем
+        модели, ничего не проверяем. При нарушении — ОДИН раз переспрашивает
+        модель, добавив список нарушений системным сообщением (прямой аналог
+        `retry(query, violations)` из примера ТЗ), и возвращает обновлённый
+        результат плюс текст предупреждения для интерфейса чата (см.
+        `invariant_checks.format_violation_warning`), который вызывающий код
+        обязан показать ПЕРЕД текстом ответа. Второй элемент — `None`, если
+        нарушений не было (в т.ч. если инварианты выключены/не выбраны)."""
+        invariants = self._active_invariants(chat, agent)
+        if not invariants:
+            return result, None
+        violations = validate_response(result.content, invariants)
+        if not violations:
+            return result, None
+        warning_text = format_violation_warning(violations)
+        violation_lines = "\n".join(f"- {inv.title}: {reason}" for inv, reason in violations)
+        provider_messages.append(ProviderMessage("assistant", result.content))
+        provider_messages.append(ProviderMessage(
+            "system",
+            "Предыдущий ответ нарушил инвариант(ы):\n" + violation_lines +
+            "\nПерепиши ответ полностью так, чтобы он соответствовал ВСЕМ инвариантам.",
+        ))
+        retried = provider.chat(model_id, provider_messages, settings)
+        retried = self._run_tool_loop_blocking(provider, model_id, provider_messages, settings, chat, agent, retried, events=events)
+        return retried, warning_text
+
     # ---- сборка сообщений памяти/профиля для запроса -------------------------
+
+    def _effective_invariant_ids(self, chat: Chat, agent: Agent) -> List[str]:
+        """Итоговый набор id инвариантов для этого чата — объединение
+        выбранных на уровне агента и выбранных на уровне самого чата (см.
+        `Agent.invariant_ids`/`Chat.invariant_ids`), без дублей, порядок не
+        важен (сортировка по `created_at` наводится уже при построении
+        текста, см. `_active_invariants`/`_build_task_and_invariant_context`)."""
+        return list(dict.fromkeys(list(agent.invariant_ids) + list(chat.invariant_ids)))
+
+    def _active_invariants(self, chat: Chat, agent: Agent) -> List[Invariant]:
+        """"Работу с задачами требуется переделать" (раздел "Инварианты") —
+        отдельного тумблера `invariants_enabled` больше нет: инварианты
+        считаются разрешёнными сами по себе, как только для этого чата/агента
+        выбран хотя бы один (см. `_effective_invariant_ids`); если не выбрано
+        ни одного — они просто не подмешиваются, без отдельного выключателя."""
+        selected_ids = set(self._effective_invariant_ids(chat, agent))
+        if not selected_ids:
+            return []
+        return [inv for inv in self._db.list_invariants() if inv.id in selected_ids and inv.is_active]
 
     def _build_memory_injection_messages(self, chat: Chat, agent: Agent) -> List[ProviderMessage]:
         """Порядок вставки (сразу после system_prompt, до истории диалога) —
@@ -1162,6 +1791,109 @@ class Repository:
                     "system",
                     "Рабочая память текущего чата (данные текущей задачи):\n" + "\n".join(lines),
                 ))
+        return blocks
+
+    def _build_task_tracking_prompt(self) -> str:
+        """Системный prompt "Менеджера задач" (заменяет прежний
+        `_TASK_MANAGER_PROACTIVITY_HINT`) — подмешивается ОДИН раз, пока
+        `task_tracking_enabled=true`, независимо от того, есть ли уже
+        открытые задачи в чате. Заполняется по шаблону
+        `AgentConfig.TASK_TRACKING_PROMPT_TEMLATE` (по умолчанию — текст из
+        ТЗ, редактируется через .env, см. `config.py`): `<task_states>`
+        заполняется описанием состояний машины прямо из кода
+        (`task_state_machine.format_states_for_prompt`), а
+        `<task_state_machine_invariants>` — текстами инвариантов категории
+        "Правило стейт-машины", привязанных к машине состояний (та же
+        настройка, что и в блоке "Rules" на экране "Модели состояний
+        задач" — см. `_state_machine_rule_texts`), по одной на строке."""
+        invariants_text = "\n".join(self._state_machine_rule_texts())
+        return _fill_task_tracking_template(
+            AgentConfig.TASK_TRACKING_PROMPT_TEMLATE, format_states_for_prompt(), invariants_text,
+        )
+
+    def _state_machine_rule_texts(self) -> List[str]:
+        """Тексты инвариантов категории "Правило стейт-машины", привязанных
+        к машине состояний (см. `set_task_machine_invariants`) — это то, что
+        новое ТЗ называет "Rules" в примере `buildPrompt`, только теперь
+        настраивается на экране машины состояний, а не хардкодится."""
+        ids = set(self._db.get_task_machine_invariant_ids())
+        if not ids:
+            return []
+        return [inv.rule_text for inv in self._db.list_invariants() if inv.id in ids and inv.is_active]
+
+    def _build_task_context_block(self, task: Task) -> str:
+        """Скрытый служебный блок с ТЕКУЩИМИ данными ОДНОЙ задачи — те же
+        поля, что модель должна "возвращать" по системному prompt'у (см.
+        `_build_task_tracking_prompt`): task/state/step/total/plan/done/
+        current, плюс id задачи (нужен для `apply_task_action`). Добавляется
+        в промпт МОДЕЛИ отдельным `system`-сообщением — исходный текст
+        запроса пользователя (`Message.content`) при этом не меняется, см.
+        `_build_task_and_invariant_context`.
+
+        `step`/`total` — по шаблону ТЗ это НЕ прогресс по `plan` (как было
+        раньше: пройденных/всего пунктов плана), а позиция ТЕКУЩЕГО состояния
+        в машине состояний (1..4) и общее число её состояний (всегда 4) —
+        см. пример заполнения `task_states` в сопроводительном сообщении к
+        доработке. Прогресс по плану по-прежнему виден целиком через
+        `plan`/`done` (списки), просто не сведён к отдельным числам."""
+        state = parse_task_state(task.state)
+        position = TASK_STATE_ORDER.index(state) + 1
+        total = len(TASK_STATE_ORDER)
+        lines = [
+            f"[ЗАДАЧА] id: {task.id}",
+            f"task: {task.title}",
+            f"state: {state.value}",
+            f"step: {position}",
+            f"total: {total}",
+            f"plan: {json.dumps(task.plan, ensure_ascii=False)}",
+            f"done: {json.dumps(task.done_steps, ensure_ascii=False)}",
+            f"current: {task.current_step or ''}",
+        ]
+        return "\n".join(lines)
+
+    def _build_task_and_invariant_context(self, chat: Chat, agent: Agent) -> List[ProviderMessage]:
+        """"Работу с задачами требуется переделать" (новое ТЗ) — заменяет
+        прежние `_build_task_injection_messages`/`_build_invariant_injection_messages`
+        единым служебным блоком, добавляемым в промпт МОДЕЛИ отдельными
+        `system`-сообщениями (тем же приёмом, что и раньше, и что и
+        `_build_memory_injection_messages`) — исходный текст запроса
+        пользователя не меняется и хранится/отображается как есть (см.
+        `send_message_blocking`/`stream_message`: в БД по-прежнему пишется
+        именно присланный текст).
+
+        Пока `task_tracking_enabled=true` — ОДИН общий системный prompt
+        (`_build_task_tracking_prompt`, заменяет собой прежний хардкод),
+        независимо от того, есть ли уже открытые задачи, плюс по одному
+        блоку с текущими данными (task/state/step/total/plan/done/current)
+        на каждую открытую задачу чата (см. `_build_task_context_block`) —
+        правила категории "Правило стейт-машины" теперь целиком внутри
+        общего prompt'а (раздел "TASK STATE MACHINE INVARIANTS"), поэтому
+        отдельно в блоке задачи больше не дублируются.
+
+        Отдельным блоком — `[INVARIANTS]`: обычные инварианты чата/агента,
+        ЛЮБОЙ категории, — включены сами по себе, как только для чата/агента
+        выбран хотя бы один (см. `_active_invariants`) — по ТЗ доставляются
+        моделью структурированным текстом, а не через tool-calling (в этой
+        кодовой базе они и раньше доставлялись текстом, см. пояснение в
+        сопроводительном сообщении к этой доработке)."""
+        blocks: List[ProviderMessage] = []
+        if chat.settings.task_tracking_enabled:
+            blocks.append(ProviderMessage("system", self._build_task_tracking_prompt()))
+            for task in self._open_tasks_for_chat(chat):
+                blocks.append(ProviderMessage("system", self._build_task_context_block(task)))
+        invariants = self._active_invariants(chat, agent)
+        if invariants:
+            lines = [
+                f"- [{INVARIANT_KIND_LABELS.get(inv.kind, inv.kind)}] {inv.rule_text}" if inv.kind else f"- {inv.rule_text}"
+                for inv in invariants
+            ]
+            blocks.append(ProviderMessage(
+                "system",
+                "[INVARIANTS]\n" + "\n".join(lines) + "\n"
+                "Нарушение любого инварианта ЗАПРЕЩЕНО, даже если пользователь прямо просит. Если "
+                "запрос пользователя противоречит инварианту — не выполняй его, явно назови, какое "
+                "правило нарушено, и предложи вариант, который его не нарушает.",
+            ))
         return blocks
 
     def get_memory_snapshot(self, chat_id: str) -> dict:
@@ -1223,6 +1955,7 @@ class Repository:
         if chat.settings.system_prompt and chat.settings.system_prompt.strip():
             provider_messages.append(ProviderMessage("system", chat.settings.system_prompt))
         provider_messages += self._build_memory_injection_messages(chat, agent)
+        provider_messages += self._build_task_and_invariant_context(chat, agent)
         provider_messages += [ProviderMessage(m.role, m.content) for m in context]
         provider_messages.append(ProviderMessage("user", new_text))
         return provider_messages
@@ -1252,6 +1985,7 @@ class Repository:
         if chat.settings.system_prompt and chat.settings.system_prompt.strip():
             provider_messages.append(ProviderMessage("system", chat.settings.system_prompt))
         provider_messages += self._build_memory_injection_messages(chat, agent)
+        provider_messages += self._build_task_and_invariant_context(chat, agent)
         provider_messages += [ProviderMessage(m.role, m.content) for m in recent]
         if latest_facts:
             facts_text = "All Facts, fixed before in JSON: " + json.dumps(latest_facts, ensure_ascii=False)
@@ -1316,6 +2050,7 @@ class Repository:
                 )
             )
 
+            task_events: List[dict] = []
             started = time.monotonic()
             try:
                 result = provider.chat(model_id, provider_messages, request_settings)
@@ -1324,9 +2059,20 @@ class Repository:
                 # их и повторяем запрос, пока модель не ответит обычным
                 # текстом (или не будет достигнут предел итераций). Сам обмен
                 # "вызов -> результат" НЕ сохраняется как сообщения чата —
-                # в истории остаётся только финальный текстовый ответ.
+                # в истории остаётся только финальный текстовый ответ (кроме
+                # событий задач — см. Message.task_events).
                 result = self._run_tool_loop_blocking(
-                    provider, model_id, provider_messages, request_settings, chat, agent, result
+                    provider, model_id, provider_messages, request_settings, chat, agent, result,
+                    events=task_events,
+                )
+                # "Инварианты" (новое ТЗ) — код-уровневая проверка + один
+                # переспрос модели при нарушении; текст предупреждения (если
+                # было нарушение) выводится ПЕРЕД ответом в интерфейсе чата —
+                # здесь это реализовано как префикс самого сохраняемого
+                # сообщения ассистента (см. `_validate_and_maybe_retry`).
+                result, violation_warning = self._validate_and_maybe_retry(
+                    provider, model_id, provider_messages, request_settings, chat, agent, result,
+                    events=task_events,
                 )
             except ProviderError as exc:
                 self._db.add_message(
@@ -1335,14 +2081,16 @@ class Repository:
                 self._db.touch_chat(chat_id)
                 raise
             duration_ms = int((time.monotonic() - started) * 1000)
+            final_content = f"{violation_warning}\n\n{result.content}" if violation_warning else result.content
 
             assistant_msg = self._db.add_message(
                 Message(
-                    id=0, chat_id=chat_id, role="assistant", content=result.content,
+                    id=0, chat_id=chat_id, role="assistant", content=final_content,
                     created_at=int(time.time()), reasoning_content=result.reasoning_content,
                     duration_ms=duration_ms, total_tokens=result.usage.total_tokens,
                     prompt_tokens=result.usage.prompt_tokens, completion_tokens=result.usage.completion_tokens,
-                    format=detect_message_format(result.content), branch=branch or 0,
+                    format=detect_message_format(final_content), branch=branch or 0,
+                    task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
                 )
             )
 
@@ -1420,6 +2168,7 @@ class Repository:
                 # новых вызовов); сам обмен "вызов -> результат" в историю
                 # чата не попадает.
                 final_result: Optional[ChatResult] = None
+                task_events: List[dict] = []
                 iterations = 0
                 while True:
                     done_result: Optional[ChatResult] = None
@@ -1434,7 +2183,7 @@ class Repository:
                             ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
                         )
                         for call in done_result.tool_calls:
-                            tool_output = self._execute_tool_call(chat, agent, call)
+                            tool_output = self._execute_tool_call(chat, agent, call, events=task_events)
                             fn_name = (call.get("function") or {}).get("name")
                             provider_messages.append(
                                 ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
@@ -1445,17 +2194,35 @@ class Repository:
                     final_result = done_result
                     break
 
+                # "Инварианты" (новое ТЗ) — та же код-уровневая проверка +
+                # переспрос, что и в `send_message_blocking` (см.
+                # `_validate_and_maybe_retry`); переспрос делается ОДНИМ
+                # блокирующим вызовом (не повторным стримом) ради простоты —
+                # это редкий путь (только при нарушении), в отличие от
+                # основного, всегда потокового, ответа. Предупреждение
+                # выводится ПЕРЕД ответом: отдельным `delta`-событием до
+                # того, как в поток уйдёт (пере-сгенерированный) текст ответа.
+                final_result, violation_warning = self._validate_and_maybe_retry(
+                    provider, model_id, provider_messages, request_settings, chat, agent, final_result,
+                    events=task_events,
+                )
+                if violation_warning:
+                    yield {"type": "delta", "content": f"{violation_warning}\n\n", "reasoning_content": None}
+                    yield {"type": "delta", "content": final_result.content, "reasoning_content": None}
+                final_content = f"{violation_warning}\n\n{final_result.content}" if violation_warning else final_result.content
+
                 duration_ms = int((time.monotonic() - started) * 1000)
                 if final_result.usage.prompt_tokens is not None:
                     self._db.update_message_prompt_tokens(user_msg.id, final_result.usage.prompt_tokens)
                 assistant_msg = self._db.add_message(
                     Message(
-                        id=0, chat_id=chat_id, role="assistant", content=final_result.content,
+                        id=0, chat_id=chat_id, role="assistant", content=final_content,
                         created_at=int(time.time()), reasoning_content=final_result.reasoning_content,
                         duration_ms=duration_ms, total_tokens=final_result.usage.total_tokens,
                         prompt_tokens=final_result.usage.prompt_tokens,
                         completion_tokens=final_result.usage.completion_tokens,
-                        format=detect_message_format(final_result.content), branch=branch or 0,
+                        format=detect_message_format(final_content), branch=branch or 0,
+                        task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
                     )
                 )
                 # Обновление фактов — ПОСЛЕ основного ответа модели и
@@ -1485,6 +2252,185 @@ class Repository:
             except ProviderError as exc:
                 self._db.add_message(
                     Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=branch or 0)
+                )
+                self._db.touch_chat(chat_id)
+                yield {"type": "error", "message": str(exc)}
+        finally:
+            lock.release()
+
+    # ---- "Менеджер задач" (обновление "Дня 13") ------------------------------
+    #
+    # Пока задача активна (не на паузе, не завершена), пользователь может
+    # ничего не писать — система сама, без нового сообщения, просит модель
+    # продолжить работу над задачей и стримит ответ; клиент вызывает
+    # `run_task_manager_step` ещё раз, пока в событии `done` не придёт
+    # `should_continue=False` (задача продвинута этим шагом и осталась
+    # активной — единственная причина продолжать цикл). Пауза — это ЧЕЛОВЕК,
+    # нажавший кнопку (см. `apply_manual_task_action` с `kind=PAUSE`), а не
+    # что-то, что цикл решает сам: цикл просто не запускает следующий шаг,
+    # если задача не активна. Один шаг НЕ создаёт сообщение с ролью `user` в
+    # истории — эфемерная реплика "продолжай" подмешивается только в ЭТОТ
+    # конкретный запрос к провайдеру (тем же приёмом, что уже используется
+    # для инъекции памяти/задач/инвариантов), а результат сохраняется как
+    # обычное сообщение ассистента с `is_task_manager_step=True`.
+    # ---------------------------------------------------------------------------
+
+    def _task_manager_continue_text(self, task: Task) -> str:
+        # Этап/шаг/план/done задачи модель уже видит в блоке [ЗАДАЧА]/[STATE]/
+        # [CURRENT]/[PLAN]/[DONE] (см. `_build_task_and_invariant_context`,
+        # подмешивается в этот же запрос) — здесь только сама команда
+        # продолжить, без дублирования состояния.
+        return (
+            f"Продолжай самостоятельно работать над задачей «{task.title}» "
+            "(текущий этап и шаг — в системном блоке [ЗАДАЧА] этого запроса). "
+            "Если для продолжения не хватает информации от пользователя — задай вопрос и НЕ вызывай "
+            "apply_task_action в этом ответе (менеджер задач сам остановится и дождётся пользователя). "
+            "Если этап пройден — продвинь его вызовом apply_task_action, как обычно."
+        )
+
+    def _consecutive_task_manager_steps(self, chat_id: str) -> int:
+        """Подряд идущие сообщения ассистента с `is_task_manager_step=True`
+        считая с конца истории чата, до первого сообщения другого рода
+        (обычный ответ на реальное сообщение пользователя, ошибка и т.п.) —
+        используется как защита от зацикливания (см.
+        `Settings.task_manager_max_steps`). Считается на уровне ЧАТА в
+        целом, а не отдельной задачи — упрощение: в рамках одного чата
+        обычно ведётся не более одной активной задачи одновременно."""
+        count = 0
+        for m in reversed(self._db.list_messages(chat_id)):
+            if m.role == "assistant" and m.is_task_manager_step:
+                count += 1
+                continue
+            break
+        return count
+
+    def run_task_manager_step(self, chat_id: str, task_id: str, auto_pause: bool = True) -> Iterator[dict]:
+        """Один автономный шаг "Менеджера задач" — тот же формат событий,
+        что и `stream_message` (`status`/`delta`/`done`/`error`), но `done`
+        дополнительно несёт `should_continue` (клиент вызывает этот метод
+        ещё раз, если true) и `task_status` (актуальный статус задачи после
+        шага). Требует `task_tracking_enabled=true` и статус задачи ЛЮБОЙ,
+        кроме "done" — иначе `ValidationError`.
+
+        `auto_pause` (редизайн "Менеджера задач", кнопки "Продолжить"/
+        "Выполнить" — замечание пользователя): `true` (по умолчанию, кнопка
+        "Продолжить") — задача МОЖЕТ быть на паузе прямо сейчас (это
+        нормально: "Продолжить" одним действием снимает паузу И продвигает
+        этап, т.к. допустимость перехода определяется `can_transition` и не
+        зависит от статуса паузы), но после того как модель продвинет её
+        вызовом `apply_task_action` (kind="advance"), шаг сам поставит её на
+        паузу заново — `should_continue` в этом случае приходит `false`,
+        клиент вызывает эндпоинт ещё раз только по новому нажатию
+        пользователя. `false` (кнопка "Выполнить") — пауза не вставляется
+        автоматически, `should_continue=true` до состояния done (или пока
+        модель не остановится сама) — клиент вызывает эндпоинт в цикле;
+        пользователь может прервать цикл в любой момент отдельным вызовом
+        ручного действия "Пауза" (см. `apply_manual_task_action`)."""
+        chat = self._require_chat(chat_id)
+        agent = self._require_agent(chat.agent_id)
+        task = self._require_task(task_id)
+        if task.chat_id != chat_id:
+            raise NotFoundError(f"task {task_id!r} does not belong to chat {chat_id!r}")
+        if not chat.settings.task_tracking_enabled:
+            raise ValidationError("task tracking is disabled for this chat")
+        current_status = self._task_status(task)
+        if current_status == "done":
+            raise ValidationError("task is already done; task manager is not applicable")
+
+        lock = self._lock_for(chat_id)
+        lock.acquire()
+        try:
+            max_steps = chat.settings.task_manager_max_steps
+            if max_steps > 0 and self._consecutive_task_manager_steps(chat_id) >= max_steps:
+                notice = (
+                    "Достигнут лимит автоматических шагов Менеджера задач подряд — нажмите "
+                    "«Продолжить», чтобы продолжить вручную."
+                )
+                assistant_msg = self._db.add_message(Message(
+                    id=0, chat_id=chat_id, role="assistant", content=notice,
+                    created_at=int(time.time()), format="text", branch=0,
+                    is_task_manager_step=True,
+                ))
+                self._db.touch_chat(chat_id)
+                yield {"type": "done", "message": assistant_msg, "should_continue": False, "task_status": current_status}
+                return
+
+            all_messages = self._db.list_messages(chat_id)
+            messages = self._filter_by_branch(all_messages, None)
+            continue_text = self._task_manager_continue_text(task)
+            provider_messages = self._build_request_context(chat, agent, messages, continue_text)
+            provider_name, model_id = _split_model(chat.settings.model)
+            provider = self._registry.get(provider_name)
+            request_settings = self._settings_with_merged_tools(chat)
+
+            yield {"type": "status", "status": "Менеджер задач продолжает работу"}
+
+            started = time.monotonic()
+            try:
+                final_result: Optional[ChatResult] = None
+                task_events: List[dict] = []
+                iterations = 0
+                while True:
+                    done_result: Optional[ChatResult] = None
+                    for delta in provider.stream_chat(model_id, provider_messages, request_settings):
+                        if delta.done:
+                            done_result = delta.result
+                        else:
+                            yield {"type": "delta", "content": delta.content, "reasoning_content": delta.reasoning_content}
+                    if done_result is not None and done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
+                        yield {"type": "status", "status": "Выполняется вызов инструментов"}
+                        provider_messages.append(
+                            ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
+                        )
+                        for call in done_result.tool_calls:
+                            tool_output = self._execute_tool_call(chat, agent, call, events=task_events, auto_pause=auto_pause)
+                            fn_name = (call.get("function") or {}).get("name")
+                            provider_messages.append(
+                                ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
+                            )
+                        iterations += 1
+                        yield {"type": "status", "status": "Менеджер задач продолжает работу"}
+                        continue
+                    final_result = done_result
+                    break
+
+                # "Инварианты" (новое ТЗ) — код-уровневая проверка + один
+                # переспрос модели при нарушении, тот же путь, что и в
+                # `stream_message` (см. `_validate_and_maybe_retry`).
+                # Предупреждение выводится ПЕРЕД ответом: отдельным
+                # `delta`-событием до (пере-сгенерированного) текста ответа.
+                final_result, violation_warning = self._validate_and_maybe_retry(
+                    provider, model_id, provider_messages, request_settings, chat, agent, final_result,
+                    events=task_events,
+                )
+                if violation_warning:
+                    yield {"type": "delta", "content": f"{violation_warning}\n\n", "reasoning_content": None}
+                    yield {"type": "delta", "content": final_result.content, "reasoning_content": None}
+                final_content = f"{violation_warning}\n\n{final_result.content}" if violation_warning else final_result.content
+
+                duration_ms = int((time.monotonic() - started) * 1000)
+                assistant_msg = self._db.add_message(Message(
+                    id=0, chat_id=chat_id, role="assistant", content=final_content,
+                    created_at=int(time.time()), reasoning_content=final_result.reasoning_content,
+                    duration_ms=duration_ms, total_tokens=final_result.usage.total_tokens,
+                    prompt_tokens=final_result.usage.prompt_tokens,
+                    completion_tokens=final_result.usage.completion_tokens,
+                    format=detect_message_format(final_content), branch=0,
+                    task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
+                    is_task_manager_step=True,
+                ))
+                self._db.touch_chat(chat_id)
+
+                refreshed_task = self._db.get_task(task_id)
+                new_status = self._task_status(refreshed_task) if refreshed_task is not None else current_status
+                advanced_this_task = any(
+                    e.get("task_id") == task_id and e.get("kind") == "advance" for e in task_events
+                )
+                should_continue = new_status == "active" and advanced_this_task
+                yield {"type": "done", "message": assistant_msg, "should_continue": should_continue, "task_status": new_status}
+            except ProviderError as exc:
+                self._db.add_message(
+                    Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=0)
                 )
                 self._db.touch_chat(chat_id)
                 yield {"type": "error", "message": str(exc)}

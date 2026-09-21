@@ -13,6 +13,7 @@ from agents_core.api.converters import (
     agent_out,
     chat_out,
     default_settings_out,
+    invariant_out,
     long_term_memory_out,
     message_out,
     model_info_out,
@@ -98,6 +99,30 @@ class SchemasTestCase(unittest.TestCase):
         dumped = out.model_dump()
         self.assertIn("search_products", dumped["skills_json"])
         self.assertIsNotNone(out.orchestration_prompt)
+
+    def test_invariant_out_roundtrip(self):
+        invariant = self.repo.create_invariant(
+            "Clean Architecture", "presentation не обращается к data напрямую", kind="tech_decision",
+        )
+        out = invariant_out(invariant)
+        dumped = out.model_dump()
+        self.assertEqual(dumped["rule_text"], "presentation не обращается к data напрямую")
+        self.assertEqual(dumped["kind"], "tech_decision")
+        self.assertTrue(dumped["is_active"])
+
+    def test_agent_and_chat_out_expose_invariant_ids(self):
+        agent = self.repo.create_agent("A", model=TEST_MODEL_ID)
+        chat = self.repo.create_chat(agent.id, "C1")
+        invariant = self.repo.create_invariant("Правило", "текст правила")
+        self.repo.set_agent_invariants(agent.id, [invariant.id])
+        agent = self.repo.get_agent(agent.id)
+        out = agent_out(agent)
+        self.assertEqual(out.invariant_ids, [invariant.id])
+
+        chat = self.repo.get_chat(chat.id)
+        stats = self.repo.chat_stats(chat)
+        chat_schema = chat_out(chat, stats)
+        self.assertEqual(chat_schema.invariant_ids, [])
 
 
 if __name__ == "__main__":

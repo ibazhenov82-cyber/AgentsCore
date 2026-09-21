@@ -16,12 +16,44 @@ https://docs.ollama.com/api/
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
+from ..logging_setup import truncate
 from ..models import Settings
 from .base import BaseProvider, ChatResult, ChatUsage, ModelCapabilities, ProviderError, ProviderMessage, StreamDelta
+
+# См. `agents_core.providers.deepseek_client` — тот же принцип, но этот
+# модуль и так уже не самостоятелен (импортирует `..models`), поэтому здесь
+# можно использовать общие хелперы усечения/маскирования из
+# `agents_core.logging_setup` напрямую.
+_logger = logging.getLogger("agents_core.llm.ollama")
+
+
+def _log_call(method: str, url: str, *, json_body: Optional[Dict[str, Any]] = None) -> float:
+    if json_body is not None:
+        try:
+            body_repr = truncate(json.dumps(json_body, ensure_ascii=False))
+        except (TypeError, ValueError):
+            body_repr = truncate(str(json_body))
+    else:
+        body_repr = "-"
+    _logger.info("-> %s %s json=%s", method, url, body_repr)
+    return time.monotonic()
+
+
+def _log_response(method: str, url: str, started: float, status_code: Any, *, note: str = "") -> None:
+    duration_ms = (time.monotonic() - started) * 1000
+    _logger.info("<- %s %s %s (%.1f мс)%s", method, url, status_code, duration_ms, f" {note}" if note else "")
+
+
+def _log_error(method: str, url: str, started: float, exc: Exception) -> None:
+    duration_ms = (time.monotonic() - started) * 1000
+    _logger.error("<- %s %s ОШИБКА (%.1f мс): %s", method, url, duration_ms, exc)
+
 
 _DEFAULT_TIMEOUT = 120
 
@@ -41,10 +73,14 @@ class OllamaProvider(BaseProvider):
         self._session = requests.Session()
 
     def health(self) -> bool:
+        url = f"{self._base_url}/api/tags"
+        started = _log_call("GET", url)
         try:
-            resp = self._session.get(f"{self._base_url}/api/tags", timeout=10)
+            resp = self._session.get(url, timeout=10)
+            _log_response("GET", url, started, resp.status_code)
             return resp.ok
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            _log_error("GET", url, started, exc)
             return False
 
     def model_health(self, model_id: str) -> bool:
@@ -52,12 +88,16 @@ class OllamaProvider(BaseProvider):
         `GET /api/tags` (поле `model` каждой записи), а не только если сам
         сервер Ollama отвечает — сервер может быть жив, но конкретная модель
         ещё не подтянута/переименована."""
+        url = f"{self._base_url}/api/tags"
+        started = _log_call("GET", url)
         try:
-            resp = self._session.get(f"{self._base_url}/api/tags", timeout=10)
+            resp = self._session.get(url, timeout=10)
+            _log_response("GET", url, started, resp.status_code)
             if not resp.ok:
                 return False
             data = resp.json()
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as exc:
+            _log_error("GET", url, started, exc)
             return False
         entries = data.get("models") or []
         return any(entry.get("model") == model_id or entry.get("name") == model_id for entry in entries)
@@ -76,14 +116,16 @@ class OllamaProvider(BaseProvider):
             supports_json_mode=True,  # `format: "json"` поддерживается Ollama для любой модели
             supports_logprobs=False,  # Ollama не отдаёт logprobs
         )
+        url = f"{self._base_url}/api/show"
+        started = _log_call("POST", url, json_body={"model": model_id})
         try:
-            resp = self._session.post(
-                f"{self._base_url}/api/show", json={"model": model_id}, timeout=15
-            )
+            resp = self._session.post(url, json={"model": model_id}, timeout=15)
+            _log_response("POST", url, started, resp.status_code)
             if not resp.ok:
                 return fallback
             data = resp.json()
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as exc:
+            _log_error("POST", url, started, exc)
             return fallback
 
         model_info: Dict[str, Any] = data.get("model_info") or {}
@@ -230,11 +272,15 @@ class OllamaProvider(BaseProvider):
 
     def chat(self, model_id: str, messages: List[ProviderMessage], settings: Settings) -> ChatResult:
         payload = self._build_payload(model_id, messages, settings, stream=False)
+        url = f"{self._base_url}/api/chat"
+        started = _log_call("POST", url, json_body=payload)
         try:
-            resp = self._session.post(f"{self._base_url}/api/chat", json=payload, timeout=self._timeout)
+            resp = self._session.post(url, json=payload, timeout=self._timeout)
             resp.raise_for_status()
+            _log_response("POST", url, started, resp.status_code)
             data = resp.json()
         except requests.RequestException as exc:
+            _log_error("POST", url, started, exc)
             raise ProviderError(f"Ollama request failed: {exc}") from exc
         message = data.get("message") or {}
         prompt_tokens = data.get("prompt_eval_count")
@@ -249,6 +295,8 @@ class OllamaProvider(BaseProvider):
 
     def stream_chat(self, model_id: str, messages: List[ProviderMessage], settings: Settings) -> Iterator[StreamDelta]:
         payload = self._build_payload(model_id, messages, settings, stream=True)
+        url = f"{self._base_url}/api/chat"
+        started = _log_call("POST", url, json_body=payload)
         content_acc: List[str] = []
         reasoning_acc: List[str] = []
         tool_calls_native: List[dict] = []
@@ -259,6 +307,7 @@ class OllamaProvider(BaseProvider):
                 f"{self._base_url}/api/chat", json=payload, timeout=self._timeout, stream=True
             )
             resp.raise_for_status()
+            _log_response("POST", url, started, resp.status_code, note="начат поток")
             for raw_line in resp.iter_lines(decode_unicode=True):
                 if not raw_line:
                     continue
@@ -285,6 +334,7 @@ class OllamaProvider(BaseProvider):
                     completion_tokens = chunk.get("eval_count")
                     break
         except requests.RequestException as exc:
+            _log_error("POST", url, started, exc)
             raise ProviderError(f"Ollama request failed: {exc}") from exc
         finally:
             try:
@@ -293,6 +343,7 @@ class OllamaProvider(BaseProvider):
                 pass
 
         total = (prompt_tokens or 0) + (completion_tokens or 0) if (prompt_tokens or completion_tokens) else None
+        _log_response("POST", url, started, "done", note="поток завершён")
         yield StreamDelta(
             done=True,
             result=ChatResult(
