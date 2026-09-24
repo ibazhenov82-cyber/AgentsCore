@@ -100,6 +100,18 @@ class SettingsOut(BaseModel):
     frequency_penalty: Optional[float] = Field(None, ge=-2, le=2)
     presence_penalty: Optional[float] = Field(None, ge=-2, le=2)
 
+    tools_sources: List[str] = Field(
+        default_factory=list,
+        description=(
+            "СПРАВОЧНОЕ поле, только для интерфейса (не влияет на сам запрос к модели) — какие "
+            "источники инструментов реально дают эффект в этом чате/агенте прямо сейчас: 'own' "
+            "(свой JSON в tools_json), 'memory' (save_working_memory/save_long_term_memory), "
+            "'task' (start_task/apply_task_action), 'skills' (скиллы активного профиля чата — "
+            "только для чата, не для агента), 'mcp' (инструменты подключённого MCP-сервера). "
+            "Пустой список — ни один источник сейчас ничего не добавляет к tools_json запроса."
+        ),
+    )
+
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "model": "deepseek:deepseek-v4-flash", "system_prompt": "Ты — полезный ассистент.",
@@ -272,6 +284,16 @@ class MessageOut(BaseModel):
             "(`POST /chats/{chat_id}/tasks/{task_id}/task-manager/step`), а не ответом на реальное "
             "сообщение пользователя — перед ним в истории нет соответствующего сообщения с ролью "
             "`user`. Клиент показывает такие сообщения с пометкой «Менеджер задач»."
+        ),
+    )
+    mcp_events: Optional[str] = Field(
+        None,
+        description=(
+            "JSON-массив событий вызова инструментов через MCP-сервер (интеграция с отдельным "
+            "MCP-сервисом), применённых ЗА ЭТОТ конкретный ответ: [{\"type\":\"mcp_call\",\"name\","
+            "\"status\":\"started\"|\"finished\",\"ok\",\"error\"}, ...]. Отдельно от task_events — "
+            "разные источники событий. Пусто/null, если MCP выключен для чата либо инструменты через "
+            "него не вызывались за этот ответ."
         ),
     )
 

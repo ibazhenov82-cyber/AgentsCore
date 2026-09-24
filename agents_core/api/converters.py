@@ -30,17 +30,27 @@ from ..schemas import (
 )
 
 
-def settings_out(settings) -> SettingsOut:
-    return SettingsOut(**dataclasses.asdict(settings))
+def settings_out(settings, tools_sources=None) -> SettingsOut:
+    return SettingsOut(**dataclasses.asdict(settings), tools_sources=tools_sources or [])
+
+
+def _tools_sources(repo, settings, chat=None):
+    # `repo` необязателен (см. вызовы ниже без него — например, внутренние
+    # тесты конвертеров) — тогда tools_sources просто пустой список, как и
+    # раньше это поле не существовало ни для кого.
+    if repo is None:
+        return []
+    return repo._tools_sources_for(settings, chat)
 
 
 def default_settings_out(settings) -> DefaultSettingsOut:
     return DefaultSettingsOut(**dataclasses.asdict(settings))
 
 
-def agent_out(agent: Agent) -> AgentOut:
+def agent_out(agent: Agent, repo=None) -> AgentOut:
     return AgentOut(id=agent.id, name=agent.name, created_at=agent.created_at,
-                     updated_at=agent.updated_at, settings=settings_out(agent.settings),
+                     updated_at=agent.updated_at,
+                     settings=settings_out(agent.settings, tools_sources=_tools_sources(repo, agent.settings)),
                      default_profile_id=agent.default_profile_id, invariant_ids=agent.invariant_ids)
 
 
@@ -54,10 +64,12 @@ def chat_stats_out(stats: dict) -> ChatStatsOut:
     )
 
 
-def chat_out(chat: Chat, stats: dict) -> ChatOut:
+def chat_out(chat: Chat, stats: dict, repo=None) -> ChatOut:
     return ChatOut(
         id=chat.id, agent_id=chat.agent_id, title=chat.title, created_at=chat.created_at,
-        updated_at=chat.updated_at, settings=settings_out(chat.settings), stats=chat_stats_out(stats),
+        updated_at=chat.updated_at,
+        settings=settings_out(chat.settings, tools_sources=_tools_sources(repo, chat.settings, chat)),
+        stats=chat_stats_out(stats),
         active_profile_id=chat.active_profile_id, invariant_ids=chat.invariant_ids,
     )
 

@@ -103,9 +103,14 @@ class DeepSeekProvider(BaseProvider):
         if not settings.tools_json.strip():
             return None
         try:
-            return json.loads(settings.tools_json)
+            parsed = json.loads(settings.tools_json)
         except json.JSONDecodeError as exc:
             raise ProviderError(f"tools_json is not valid JSON: {exc}") from exc
+        # "[]" — легальное значение (так режим «Выбрать из доступных» в
+        # AgentsApp кодирует "явно не выбрано ни одного инструмента"), но
+        # DeepSeek/OpenAI отвергают пустой массив `tools` в запросе —
+        # отправляем как "инструментов нет" (None → поле не попадает в payload).
+        return parsed or None
 
     def chat(self, model_id: str, messages: List[ProviderMessage], settings: Settings) -> ChatResult:
         client = self._require_client()

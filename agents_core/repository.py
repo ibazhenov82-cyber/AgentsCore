@@ -24,6 +24,7 @@ from .config import AgentConfig
 from .db import Database
 from .format_detect import detect_message_format
 from .invariant_checks import format_violation_warning, validate_response
+from .mcp_client import MCPClient, MCPClientError
 from .models import (
     Agent,
     AUTOSUMMARY_OPTIONS,
@@ -350,12 +351,22 @@ def _format_messages_block(messages: List[Message]) -> str:
 
 
 class Repository:
-    def __init__(self, db: Database, registry: ProviderRegistry, catalog: ModelCatalog):
+    def __init__(
+        self, db: Database, registry: ProviderRegistry, catalog: ModelCatalog,
+        mcp_client: Optional[MCPClient] = None,
+    ):
         self._db = db
         self._registry = registry
         self._catalog = catalog
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        #: Клиент отдельного MCP-сервера (новое ТЗ, третий компонент) —
+        #: `None` по умолчанию (полностью опционально, обратная
+        #: совместимость: существующие вызовы `Repository(db, registry,
+        #: catalog)` продолжают работать без изменений и без сетевого
+        #: похода куда-либо за инструментами). См. `_settings_with_merged_tools`
+        #: и `_execute_tool_call` — единственные два места, где он используется.
+        self._mcp_client = mcp_client
 
     def _lock_for(self, chat_id: str) -> threading.Lock:
         with self._locks_guard:
@@ -1629,12 +1640,104 @@ class Repository:
                         tools.extend(parsed)
                 except (ValueError, TypeError):
                     pass
+        # Реальный баг, найденный на практике: раньше ПОЛНЫЙ список
+        # инструментов живого MCP-сервера подмешивался БЕЗУСЛОВНО, при любом
+        # состоянии `tools_json` этого чата — режим «Выбрать из доступных» в
+        # настройках AgentsApp (сохраняет туда ТОЛЬКО отмеченные инструменты)
+        # на деле НИЧЕГО не ограничивал: модель получала (и вызывала) все
+        # инструменты MCP-сервера, включая `execute_git_command` (произвольная
+        # git-команда над локальной рабочей копией), не выбранный в чате.
+        #
+        # Правило теперь (по замечанию пользователя "использование
+        # инструментов должно быть ограничено настройкой"): модели доступны
+        # РОВНО те MCP-инструменты, что перечислены в `tools_json` чата/агента
+        # (выбором в «Выбрать из доступных» или вручную в JSON). Ничего не
+        # выбрано — ни одного MCP-инструмента. Встроенные инструменты памяти/
+        # задач/скиллов по-прежнему управляются своими тумблерами (выше).
+        #
+        # `list_tools()` всё равно вызывается (если в чате вообще что-то
+        # выбрано) — он обновляет кэш `MCPClient`, по которому
+        # `_execute_tool_call` понимает, что имя принадлежит MCP-серверу и
+        # вызов нужно отправить туда. Сам не бросает исключение при
+        # недоступности сервера (отдаёт кэш последнего успешного ответа).
+        if self._mcp_client is not None and chat.settings.tools_json.strip():
+            self._mcp_client.list_tools()
         if not tools:
             return chat.settings
-        return dataclasses.replace(chat.settings, tools_json=json.dumps(tools, ensure_ascii=False))
+        # Дедупликация по имени функции (первое вхождение побеждает) —
+        # например, если в `tools_json` вручную вписана функция с тем же
+        # именем, что и у скилла профиля: большинство провайдеров отвергают
+        # запрос с повторяющимися именами функций. tools_json идёт первым и
+        # потому имеет приоритет.
+        seen_names: set = set()
+        deduped: list = []
+        for tool in tools:
+            name = None
+            if isinstance(tool, dict):
+                name = (tool.get("function") or {}).get("name") if isinstance(tool.get("function"), dict) else None
+            if name is None or name not in seen_names:
+                if name is not None:
+                    seen_names.add(name)
+                deduped.append(tool)
+        return dataclasses.replace(chat.settings, tools_json=json.dumps(deduped, ensure_ascii=False))
+
+    def _tools_sources_for(self, settings: Settings, chat: Optional[Chat] = None) -> List[str]:
+        """Список активных ИСТОЧНИКОВ инструментов текущего чата/агента —
+        только для интерфейса (новое ТЗ, `SettingsOut.tools_sources`), чтобы
+        клиент мог подсветить, что реально даёт эффект (например, не
+        показывать раздел «Инструменты MCP» активным, если MCP выключен для
+        этого агента/сервиса в целом). НЕ влияет на сам запрос к модели —
+        это отдельный, чисто описательный расчёт по тем же условиям, что и
+        `_settings_with_merged_tools` выше (нарочно раздельно: тот метод
+        решает, что дописать в tools_json, этот — что из этого показать в UI,
+        сохранять их синхронными приходится за счёт одинаковых условий, а не
+        общего кода, т.к. `_settings_with_merged_tools` возвращает готовый
+        `Settings`, а не список источников)."""
+        sources: List[str] = []
+        if settings.tools_json.strip():
+            sources.append("own")
+        if settings.memory_tools_enabled and (
+            settings.working_memory_enabled or self._enabled_long_term_categories(settings)
+        ):
+            sources.append("memory")
+        if settings.task_tracking_enabled:
+            sources.append("task")
+        if chat is not None and chat.active_profile_id:
+            profile = self._db.get_profile(chat.active_profile_id)
+            if profile and profile.skills_json.strip():
+                sources.append("skills")
+        # MCP-инструменты больше не подмешиваются автоматически (см.
+        # `_settings_with_merged_tools`) — источник "mcp" активен, только если
+        # среди выбранных в `tools_json` есть хотя бы один инструмент,
+        # известный MCP-серверу.
+        if self._mcp_client is not None and any(
+            self._mcp_client.has_cached_tool(name) for name in self._offered_tool_names(settings)
+        ):
+            sources.append("mcp")
+        return sources
+
+    @staticmethod
+    def _offered_tool_names(settings: Settings) -> set:
+        """Имена функций, РЕАЛЬНО предложенных модели в этом запросе (т.е.
+        итоговый `tools_json` после `_settings_with_merged_tools`) — граница,
+        по которой `_execute_tool_call` разрешает диспетчеризацию на
+        MCP-сервер (см. там)."""
+        if not settings.tools_json.strip():
+            return set()
+        try:
+            parsed = json.loads(settings.tools_json)
+        except (ValueError, TypeError):
+            return set()
+        names: set = set()
+        for tool in parsed if isinstance(parsed, list) else []:
+            fn = tool.get("function") if isinstance(tool, dict) else None
+            if isinstance(fn, dict) and fn.get("name"):
+                names.add(fn["name"])
+        return names
 
     def _execute_tool_call(
         self, chat: Chat, agent: Agent, call: dict, events: Optional[List[dict]] = None, auto_pause: bool = True,
+        mcp_events: Optional[List[dict]] = None, allowed_mcp_names: Optional[set] = None,
     ) -> str:
         """Выполняет ОДИН запрошенный моделью вызов и возвращает JSON-текст —
         именно он уйдёт обратно провайдеру как содержимое tool-сообщения.
@@ -1659,7 +1762,26 @@ class Repository:
         singleton, общий на все чаты, и хранение флага там было бы гонкой
         между параллельными запросами разных чатов): `true` для обычного
         чата и кнопки "Продолжить" (шаг + пауза), `false` — только для кнопки
-        "Выполнить" (см. `run_task_manager_step`)."""
+        "Выполнить" (см. `run_task_manager_step`).
+
+        `mcp_events` — отдельный от `events` аккумулятор (см.
+        `Message.mcp_events`): заполняется ТОЛЬКО когда вызов на самом деле
+        уходит на MCP-сервер (имя не найдено среди `_TOOL_HANDLERS`, но есть
+        в последнем успешном `list_tools()` клиента) — событиями
+        `{"type":"mcp_call","name","status":"started"|"finished","ok","error"}`.
+        Собственные инструменты (`_TOOL_HANDLERS`) в него не попадают — они
+        уже отражены (при необходимости) в `events`/`task_events`.
+
+        `allowed_mcp_names` — вторая линия защиты для ограничения
+        инструментов настройками чата (баг, найденный на практике: модель
+        вызвала `execute_git_command`, не выбранный в настройках чата). Кэш
+        `MCPClient` хранит ПОЛНЫЙ список инструментов сервера независимо от
+        настроек конкретного чата, поэтому одной проверки
+        `has_cached_tool` недостаточно: если передан этот набор (все реальные
+        вызывающие места передают — см. `_offered_tool_names`), на
+        MCP-сервер уходят только те имена, что были реально предложены модели
+        в этом запросе; остальные получают тот же ответ, что и заведомо
+        неизвестное имя. `None` — без ограничения (прежнее поведение)."""
         fn = call.get("function") or {}
         name = fn.get("name") or ""
         raw_args = fn.get("arguments") or "{}"
@@ -1670,13 +1792,34 @@ class Repository:
         except (ValueError, TypeError):
             arguments = {}
         handler = self._TOOL_HANDLERS.get(name)
-        if handler is None:
-            result = {"error": f"unknown tool: {name!r}"}
-        else:
+        if handler is not None:
             try:
                 result = handler(self, chat, agent, arguments, auto_pause, events)
             except Exception as exc:  # сбой одного скилла не должен ронять весь запрос
                 result = {"error": str(exc)}
+        elif (
+            self._mcp_client is not None
+            and self._mcp_client.has_cached_tool(name)
+            and (allowed_mcp_names is None or name in allowed_mcp_names)
+        ):
+            # Инструмент неизвестен локально, но известен MCP-серверу —
+            # диспетчеризация туда (новое ТЗ, интеграция с MCP-сервером).
+            if mcp_events is not None:
+                mcp_events.append({"type": "mcp_call", "name": name, "status": "started", "ok": None, "error": None})
+            try:
+                result = self._mcp_client.call_tool(name, arguments)
+                ok = not (isinstance(result, dict) and "error" in result)
+                if mcp_events is not None:
+                    mcp_events.append({
+                        "type": "mcp_call", "name": name, "status": "finished", "ok": ok,
+                        "error": result.get("error") if isinstance(result, dict) and not ok else None,
+                    })
+            except MCPClientError as exc:  # сетевой сбой самого MCP-сервера
+                result = {"error": str(exc)}
+                if mcp_events is not None:
+                    mcp_events.append({"type": "mcp_call", "name": name, "status": "finished", "ok": False, "error": str(exc)})
+        else:
+            result = {"error": f"unknown tool: {name!r}"}
         event = result.pop("_event", None) if isinstance(result, dict) else None
         if event is not None and events is not None:
             events.append(event)
@@ -1685,17 +1828,57 @@ class Repository:
     def _run_tool_loop_blocking(
         self, provider, model_id: str, messages: List[ProviderMessage], settings: Settings,
         chat: Chat, agent: Agent, result: ChatResult, events: Optional[List[dict]] = None,
+        mcp_events: Optional[List[dict]] = None,
     ) -> ChatResult:
         iterations = 0
+        allowed_mcp_names = self._offered_tool_names(settings)
         while result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
             messages.append(ProviderMessage("assistant", result.content, tool_calls=result.tool_calls))
             for call in result.tool_calls:
-                tool_output = self._execute_tool_call(chat, agent, call, events=events)
+                tool_output = self._execute_tool_call(
+                    chat, agent, call, events=events, mcp_events=mcp_events, allowed_mcp_names=allowed_mcp_names,
+                )
                 fn_name = (call.get("function") or {}).get("name")
                 messages.append(ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name))
             iterations += 1
             result = provider.chat(model_id, messages, settings)
-        return result
+        return self._finalize_after_tool_cap(provider, model_id, messages, settings, result)
+
+    def _finalize_after_tool_cap(
+        self, provider, model_id: str, messages: List[ProviderMessage], settings: Settings, result: ChatResult,
+    ) -> ChatResult:
+        """Баг, найденный на практике (реальный лог пользователя): цикл
+        tool-calling обрывается по `_MAX_TOOL_ITERATIONS`, а не потому что
+        модель сама закончила — `result` в этот момент несёт СЛЕДУЮЩий раунд
+        `tool_calls`, который так и не будет выполнен, а `result.content`
+        часто вообще пуст (весь бюджет ответа модель потратила на
+        `reasoning_content`, планируя очередные вызовы). Раньше это сырое
+        промежуточное состояние сохранялось как финальное сообщение
+        ассистента — пользователь получал пустой ответ (реальный кейс: 8
+        подряд вызовов git_host_*, а на выходе — пустая строка вместо
+        структуры проекта).
+
+        Если `result.tool_calls` всё ещё непуст — значит бюджет итераций
+        исчерпан, а не модель закончила сама: делаем ОДИН дополнительный
+        запрос БЕЗ инструментов (`tools_json=""` — `_parsed_tools` при
+        пустой строке возвращает `None`, провайдер не передаст `tools` в
+        API и модель физически не сможет запросить ещё один вызов),
+        явно попросив подвести итог по уже полученным (и УЖЕ добавленным
+        в `messages`) результатам инструментов. Если `tool_calls` пуст —
+        модель закончила сама, `result` уже финальный, ничего делать не
+        надо."""
+        if not result.tool_calls:
+            return result
+        forced_messages = list(messages)
+        forced_messages.append(ProviderMessage(
+            "system",
+            "Лимит вызовов инструментов на этот ответ исчерпан, инструменты больше "
+            "недоступны. Сформулируй окончательный ответ пользователю на основе уже "
+            "полученных выше результатов вызовов инструментов, не пытаясь вызвать "
+            "ещё один инструмент.",
+        ))
+        no_tools_settings = dataclasses.replace(settings, tools_json="")
+        return provider.chat(model_id, forced_messages, no_tools_settings)
 
     # ---- "Инварианты" (новое ТЗ): код-уровневая валидация + переспрос -------
 
@@ -2051,6 +2234,7 @@ class Repository:
             )
 
             task_events: List[dict] = []
+            mcp_events: List[dict] = []
             started = time.monotonic()
             try:
                 result = provider.chat(model_id, provider_messages, request_settings)
@@ -2060,10 +2244,11 @@ class Repository:
                 # текстом (или не будет достигнут предел итераций). Сам обмен
                 # "вызов -> результат" НЕ сохраняется как сообщения чата —
                 # в истории остаётся только финальный текстовый ответ (кроме
-                # событий задач — см. Message.task_events).
+                # событий задач — см. Message.task_events — и вызовов через
+                # MCP-сервер, см. Message.mcp_events).
                 result = self._run_tool_loop_blocking(
                     provider, model_id, provider_messages, request_settings, chat, agent, result,
-                    events=task_events,
+                    events=task_events, mcp_events=mcp_events,
                 )
                 # "Инварианты" (новое ТЗ) — код-уровневая проверка + один
                 # переспрос модели при нарушении; текст предупреждения (если
@@ -2091,6 +2276,7 @@ class Repository:
                     prompt_tokens=result.usage.prompt_tokens, completion_tokens=result.usage.completion_tokens,
                     format=detect_message_format(final_content), branch=branch or 0,
                     task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
+                    mcp_events=json.dumps(mcp_events, ensure_ascii=False) if mcp_events else None,
                 )
             )
 
@@ -2169,6 +2355,7 @@ class Repository:
                 # чата не попадает.
                 final_result: Optional[ChatResult] = None
                 task_events: List[dict] = []
+                mcp_events: List[dict] = []
                 iterations = 0
                 while True:
                     done_result: Optional[ChatResult] = None
@@ -2183,7 +2370,17 @@ class Repository:
                             ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
                         )
                         for call in done_result.tool_calls:
-                            tool_output = self._execute_tool_call(chat, agent, call, events=task_events)
+                            mcp_events_before = len(mcp_events)
+                            tool_output = self._execute_tool_call(
+                                chat, agent, call, events=task_events, mcp_events=mcp_events,
+                                allowed_mcp_names=self._offered_tool_names(request_settings),
+                            )
+                            # Новые события MCP (см. Message.mcp_events) уходят в поток СРАЗУ
+                            # (started/finished этого конкретного вызова), а не только постфактум
+                            # в сохранённом сообщении — клиент показывает "Инструмент: <name>" по
+                            # ходу генерации, не дожидаясь конца ответа.
+                            for mcp_event in mcp_events[mcp_events_before:]:
+                                yield mcp_event
                             fn_name = (call.get("function") or {}).get("name")
                             provider_messages.append(
                                 ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
@@ -2193,6 +2390,18 @@ class Repository:
                         continue
                     final_result = done_result
                     break
+
+                # Реальный баг, найденный на практике: если `tool_calls` у
+                # `final_result` всё ещё непуст — цикл выше оборвался по
+                # `_MAX_TOOL_ITERATIONS`, а не потому что модель закончила
+                # сама, и `final_result.content` в этом случае часто пуст
+                # (см. `_finalize_after_tool_cap`) — без этого шага
+                # пользователь получал бы пустое сообщение вместо ответа.
+                if final_result is not None and final_result.tool_calls:
+                    yield {"type": "status", "status": "Формулирую итоговый ответ"}
+                    final_result = self._finalize_after_tool_cap(
+                        provider, model_id, provider_messages, request_settings, final_result,
+                    )
 
                 # "Инварианты" (новое ТЗ) — та же код-уровневая проверка +
                 # переспрос, что и в `send_message_blocking` (см.
@@ -2223,6 +2432,7 @@ class Repository:
                         completion_tokens=final_result.usage.completion_tokens,
                         format=detect_message_format(final_content), branch=branch or 0,
                         task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
+                        mcp_events=json.dumps(mcp_events, ensure_ascii=False) if mcp_events else None,
                     )
                 )
                 # Обновление фактов — ПОСЛЕ основного ответа модели и
@@ -2369,6 +2579,7 @@ class Repository:
             try:
                 final_result: Optional[ChatResult] = None
                 task_events: List[dict] = []
+                mcp_events: List[dict] = []
                 iterations = 0
                 while True:
                     done_result: Optional[ChatResult] = None
@@ -2383,7 +2594,13 @@ class Repository:
                             ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
                         )
                         for call in done_result.tool_calls:
-                            tool_output = self._execute_tool_call(chat, agent, call, events=task_events, auto_pause=auto_pause)
+                            mcp_events_before = len(mcp_events)
+                            tool_output = self._execute_tool_call(
+                                chat, agent, call, events=task_events, auto_pause=auto_pause, mcp_events=mcp_events,
+                                allowed_mcp_names=self._offered_tool_names(request_settings),
+                            )
+                            for mcp_event in mcp_events[mcp_events_before:]:
+                                yield mcp_event
                             fn_name = (call.get("function") or {}).get("name")
                             provider_messages.append(
                                 ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
@@ -2393,6 +2610,15 @@ class Repository:
                         continue
                     final_result = done_result
                     break
+
+                # См. аналогичное исправление и комментарий в `stream_message`
+                # выше и в `_finalize_after_tool_cap` — тот же баг актуален и
+                # для потокового продолжения Менеджера задач.
+                if final_result is not None and final_result.tool_calls:
+                    yield {"type": "status", "status": "Формулирую итоговый ответ"}
+                    final_result = self._finalize_after_tool_cap(
+                        provider, model_id, provider_messages, request_settings, final_result,
+                    )
 
                 # "Инварианты" (новое ТЗ) — код-уровневая проверка + один
                 # переспрос модели при нарушении, тот же путь, что и в
@@ -2417,6 +2643,7 @@ class Repository:
                     completion_tokens=final_result.usage.completion_tokens,
                     format=detect_message_format(final_content), branch=0,
                     task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
+                    mcp_events=json.dumps(mcp_events, ensure_ascii=False) if mcp_events else None,
                     is_task_manager_step=True,
                 ))
                 self._db.touch_chat(chat_id)

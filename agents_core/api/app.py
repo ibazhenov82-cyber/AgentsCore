@@ -9,6 +9,8 @@ agents_core.main` запускает именно то, что возвраща�
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -17,6 +19,7 @@ from ..catalog import ModelCatalog
 from ..config import AgentConfig
 from ..db import Database
 from ..logging_setup import configure_logging
+from ..mcp_client import MCPClient
 from ..providers import ProviderError, ProviderRegistry
 from ..repository import (
     NotConfiguredError,
@@ -46,14 +49,26 @@ AgentsCore — HTTP-сервис для работы с LLM-агентами.
 """
 
 
-def create_app(config: type = AgentConfig) -> FastAPI:
+def create_app(config: type = AgentConfig, enable_mcp: Optional[bool] = None) -> FastAPI:
     """Полная сборка: настоящая БД + настоящие провайдеры (согласно
-    `AgentConfig`). Это то, что запускает `agents_core.main`."""
+    `AgentConfig`). Это то, что запускает `agents_core.main`.
+
+    `enable_mcp` (новое ТЗ, интеграция с отдельным MCP-сервером) — по
+    умолчанию `None`: решение принимается по конфигу
+    (`config.is_mcp_configured()`, т.е. и `MCP_ENABLED=true`, и непустой
+    `MCP_SERVER_URL`). Явный `True`/`False` переопределяет это (тесты,
+    ручной запуск с другим набором флагов) — `True` при пустом
+    `MCP_SERVER_URL` всё равно не создаёт клиента (не с чем соединяться)."""
     db = Database(config.DB_PATH)
     registry = ProviderRegistry(config)
     catalog = ModelCatalog(db, registry, config)
     catalog.load_or_discover()
-    repo = Repository(db, registry, catalog)
+    mcp_enabled = config.is_mcp_configured() if enable_mcp is None else (enable_mcp and bool(config.MCP_SERVER_URL))
+    mcp_client = (
+        MCPClient(config.MCP_SERVER_URL, api_key=config.MCP_API_KEY or None, timeout=config.MCP_REQUEST_TIMEOUT)
+        if mcp_enabled else None
+    )
+    repo = Repository(db, registry, catalog, mcp_client=mcp_client)
     return create_app_with_repository(repo)
 
 

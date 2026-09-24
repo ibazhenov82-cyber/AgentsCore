@@ -190,7 +190,7 @@ def delete_profile(profile_id: str, repo: Repository = Depends(get_repository)) 
 )
 def set_chat_active_profile(chat_id: str, payload: ActiveProfileSetRequest, repo: Repository = Depends(get_repository)) -> ChatOut:
     chat = repo.set_chat_active_profile(chat_id, payload.profile_id)
-    return chat_out(chat, repo.chat_stats(chat))
+    return chat_out(chat, repo.chat_stats(chat), repo)
 
 
 # ---- снимок памяти ---------------------------------------------------------

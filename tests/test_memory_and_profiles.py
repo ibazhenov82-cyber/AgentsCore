@@ -60,13 +60,19 @@ class ToolCallingFakeProvider:
     def discover_model(self, model_id: str):
         raise NotImplementedError
 
-    def _next_tool_calls(self) -> Optional[list]:
+    def _next_tool_calls(self, settings) -> Optional[list]:
+        # Как настоящий DeepSeek (см. `DeepSeekProvider._parsed_tools`):
+        # без `tools` в запросе модель физически не может запросить вызов —
+        # `_finalize_after_tool_cap` полагается именно на это свойство,
+        # обнуляя `tools_json` для принудительного финального запроса.
+        if not getattr(settings, "tools_json", ""):
+            return None
         return self.tool_calls_queue.pop(0) if self.tool_calls_queue else None
 
     def chat(self, model_id: str, messages: List[ProviderMessage], settings) -> ChatResult:
         self.last_messages = list(messages)
         self.calls_log.append(list(messages))
-        tool_calls = self._next_tool_calls()
+        tool_calls = self._next_tool_calls(settings)
         return ChatResult(
             content="" if tool_calls else self.final_text,
             usage=ChatUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
@@ -76,7 +82,7 @@ class ToolCallingFakeProvider:
     def stream_chat(self, model_id: str, messages: List[ProviderMessage], settings) -> Iterator[StreamDelta]:
         self.last_messages = list(messages)
         self.calls_log.append(list(messages))
-        tool_calls = self._next_tool_calls()
+        tool_calls = self._next_tool_calls(settings)
         content = "" if tool_calls else self.final_text
         if content:
             yield StreamDelta(content=content)
@@ -486,16 +492,42 @@ class ToolCallingLoopTests(unittest.TestCase):
     def test_tool_loop_respects_max_iterations(self):
         provider = self.repo._tool_provider  # type: ignore[attr-defined]
         # Модель "зацикливается", всегда прося новый вызов — цикл должен
-        # остановиться после _MAX_TOOL_ITERATIONS и вернуть последний
-        # результат (пустой текст) как есть, а не зависнуть.
+        # остановиться после _MAX_TOOL_ITERATIONS и НЕ отдать пользователю
+        # сырое промежуточное состояние с пустым текстом (реальный баг,
+        # найденный на практике: пользователь получал пустой ответ вместо
+        # структуры проекта после серии из 8 подряд вызовов git_host_*) — а
+        # сделать один принудительный финальный запрос без инструментов
+        # (см. `_finalize_after_tool_cap`), который здесь эмулирует
+        # `ToolCallingFakeProvider._next_tool_calls`: без tools в запросе
+        # модель не может вернуть новый tool_calls, только текст.
         from agents_core.repository import _MAX_TOOL_ITERATIONS
         provider.tool_calls_queue = [
             [_tool_call(f"call{i}", "save_working_memory", {"key": "k", "value": str(i)})]
             for i in range(_MAX_TOOL_ITERATIONS + 2)
         ]
-        self.repo.send_message_blocking(self.chat.id, "Привет")
-        # Один начальный вызов + ровно _MAX_TOOL_ITERATIONS повторов.
-        self.assertEqual(len(provider.calls_log), _MAX_TOOL_ITERATIONS + 1)
+        _, assistant_msg = self.repo.send_message_blocking(self.chat.id, "Привет")
+        # Один начальный вызов + ровно _MAX_TOOL_ITERATIONS повторов + один
+        # принудительный финальный запрос без инструментов.
+        self.assertEqual(len(provider.calls_log), _MAX_TOOL_ITERATIONS + 2)
+        # Пользователь должен получить осмысленный текстовый ответ, а не "".
+        self.assertEqual(assistant_msg.content, provider.final_text)
+
+    def test_streaming_tool_loop_respects_max_iterations(self):
+        # Тот же баг/фикс, что и в test_tool_loop_respects_max_iterations,
+        # но для потокового пути (stream_message) — там раньше была
+        # отдельная, независимая от блокирующего пути копия цикла, со
+        # своим собственным местом для того же обрыва.
+        provider = self.repo._tool_provider  # type: ignore[attr-defined]
+        from agents_core.repository import _MAX_TOOL_ITERATIONS
+        provider.tool_calls_queue = [
+            [_tool_call(f"call{i}", "save_working_memory", {"key": "k", "value": str(i)})]
+            for i in range(_MAX_TOOL_ITERATIONS + 2)
+        ]
+        events = list(self.repo.stream_message(self.chat.id, "Привет"))
+        done_events = [e for e in events if e["type"] == "done"]
+        self.assertEqual(len(done_events), 1)
+        self.assertEqual(done_events[0]["message"].content, provider.final_text)
+        self.assertEqual(len(provider.calls_log), _MAX_TOOL_ITERATIONS + 2)
 
     def test_streaming_tool_call_shopping_flow(self):
         profile = _make_shopping_profile(self.repo, self.agent.id)

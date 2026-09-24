@@ -159,6 +159,24 @@ class AgentConfig:
     # показывать в одной строке лога, остальное усекается.
     LOG_BODY_LIMIT: int = int(os.environ.get("AGENT_LOG_BODY_LIMIT", "2000") or "2000")
 
+    # --- MCP-сервер (третий, отдельно разворачиваемый компонент) --------
+    # AgentsCore подключается к нему как MCP-клиент (Streamable HTTP) для
+    # получения списка дополнительных инструментов и их вызова —
+    # см. `agents_core.mcp_client.MCPClient`. Выключено по умолчанию:
+    # существующие развёртывания без MCP-сервера не затрагиваются.
+    MCP_ENABLED: bool = os.environ.get("MCP_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+    # Например "http://mcp:8001/mcp" (тот же адрес, что слушает mcp_server).
+    MCP_SERVER_URL: str = os.environ.get("MCP_SERVER_URL", "").strip()
+    # Заготовка под будущую аутентификацию к MCP-серверу — пока нигде не
+    # используется (см. mcp_server/.env.example, тот же принцип).
+    MCP_API_KEY: str = os.environ.get("MCP_API_KEY", "").strip()
+    # Таймаут запросов к MCP-серверу (секунды).
+    MCP_REQUEST_TIMEOUT: float = float(os.environ.get("MCP_REQUEST_TIMEOUT", "30") or "30")
+
     @classmethod
     def is_deepseek_configured(cls) -> bool:
         return bool(cls.DEEPSEEK_API_KEY)
+
+    @classmethod
+    def is_mcp_configured(cls) -> bool:
+        return cls.MCP_ENABLED and bool(cls.MCP_SERVER_URL)

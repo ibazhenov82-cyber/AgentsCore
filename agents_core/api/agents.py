@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 from typing import List
 
 from fastapi import APIRouter, Depends, Response, status
@@ -17,7 +16,7 @@ from ..schemas import (
     SettingsOut,
     SettingsPatch,
 )
-from .converters import agent_out, chat_out
+from .converters import agent_out, chat_out, settings_out
 from .deps import get_repository
 
 router = APIRouter(tags=["Agents"])
@@ -31,7 +30,7 @@ router = APIRouter(tags=["Agents"])
 )
 def list_agents_with_chats(repo: Repository = Depends(get_repository)) -> List[AgentWithChatsOut]:
     return [
-        AgentWithChatsOut(agent=agent_out(agent), chats=[chat_out(c, s) for c, s in zip(chats, stats_list)])
+        AgentWithChatsOut(agent=agent_out(agent, repo), chats=[chat_out(c, s, repo) for c, s in zip(chats, stats_list)])
         for agent, chats, stats_list in repo.list_agents_with_chats()
     ]
 
@@ -48,17 +47,17 @@ def list_agents_with_chats(repo: Repository = Depends(get_repository)) -> List[A
     ),
 )
 def create_agent(payload: AgentCreate, repo: Repository = Depends(get_repository)) -> AgentOut:
-    return agent_out(repo.create_agent(payload.name, model=payload.model))
+    return agent_out(repo.create_agent(payload.name, model=payload.model), repo)
 
 
 @router.get("/agents/{agent_id}", response_model=AgentOut, summary="Детали агента")
 def get_agent(agent_id: str, repo: Repository = Depends(get_repository)) -> AgentOut:
-    return agent_out(repo.get_agent(agent_id))
+    return agent_out(repo.get_agent(agent_id), repo)
 
 
 @router.patch("/agents/{agent_id}", response_model=AgentOut, summary="Переименовать агента")
 def rename_agent(agent_id: str, payload: AgentRename, repo: Repository = Depends(get_repository)) -> AgentOut:
-    return agent_out(repo.rename_agent(agent_id, payload.name))
+    return agent_out(repo.rename_agent(agent_id, payload.name), repo)
 
 
 @router.delete(
@@ -74,7 +73,8 @@ def delete_agent(agent_id: str, repo: Repository = Depends(get_repository)) -> R
 
 @router.get("/agents/{agent_id}/settings", response_model=SettingsOut, summary="Настройки агента")
 def get_agent_settings(agent_id: str, repo: Repository = Depends(get_repository)) -> SettingsOut:
-    return SettingsOut(**dataclasses.asdict(repo.get_agent(agent_id).settings))
+    settings = repo.get_agent(agent_id).settings
+    return settings_out(settings, tools_sources=repo._tools_sources_for(settings))
 
 
 @router.put(
@@ -84,7 +84,8 @@ def get_agent_settings(agent_id: str, repo: Repository = Depends(get_repository)
     description="Частичное тело допустимо. В отличие от настроек чата, здесь можно менять и модель.",
 )
 def update_agent_settings(agent_id: str, patch: SettingsPatch, repo: Repository = Depends(get_repository)) -> SettingsOut:
-    return SettingsOut(**dataclasses.asdict(repo.update_agent_settings(agent_id, patch.to_payload())))
+    settings = repo.update_agent_settings(agent_id, patch.to_payload())
+    return settings_out(settings, tools_sources=repo._tools_sources_for(settings))
 
 
 @router.put(
@@ -99,7 +100,7 @@ def update_agent_settings(agent_id: str, patch: SettingsPatch, repo: Repository 
     ),
 )
 def set_agent_default_profile(agent_id: str, payload: ActiveProfileSetRequest, repo: Repository = Depends(get_repository)) -> AgentOut:
-    return agent_out(repo.set_agent_default_profile(agent_id, payload.profile_id))
+    return agent_out(repo.set_agent_default_profile(agent_id, payload.profile_id), repo)
 
 
 @router.post(
@@ -111,4 +112,4 @@ def set_agent_default_profile(agent_id: str, payload: ActiveProfileSetRequest, r
 )
 def create_chat(agent_id: str, payload: ChatCreate, repo: Repository = Depends(get_repository)) -> ChatOut:
     chat = repo.create_chat(agent_id, payload.title)
-    return chat_out(chat, repo.chat_stats(chat))
+    return chat_out(chat, repo.chat_stats(chat), repo)

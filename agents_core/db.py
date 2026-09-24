@@ -108,6 +108,7 @@ _MESSAGE_EXTRA_COLUMNS = [
     ("facts", "TEXT"),
     ("task_events", "TEXT"),
     ("is_task_manager_step", "INTEGER NOT NULL DEFAULT 0"),
+    ("mcp_events", "TEXT"),
 ]
 
 
@@ -315,7 +316,8 @@ class Database:
                     branch INTEGER NOT NULL DEFAULT 0,
                     facts TEXT,
                     task_events TEXT,
-                    is_task_manager_step INTEGER NOT NULL DEFAULT 0
+                    is_task_manager_step INTEGER NOT NULL DEFAULT 0,
+                    mcp_events TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_branches (
@@ -898,15 +900,15 @@ class Database:
                 """INSERT INTO messages
                    (chat_id, role, content, created_at, reasoning_content, is_summary,
                     duration_ms, total_tokens, prompt_tokens, completion_tokens,
-                    format, branch, facts, task_events, is_task_manager_step)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    format, branch, facts, task_events, is_task_manager_step, mcp_events)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.chat_id, message.role, message.content, message.created_at,
                     message.reasoning_content, int(message.is_summary),
                     message.duration_ms, message.total_tokens,
                     message.prompt_tokens, message.completion_tokens,
                     message.format, message.branch, message.facts, message.task_events,
-                    int(message.is_task_manager_step),
+                    int(message.is_task_manager_step), message.mcp_events,
                 ),
             )
             message.id = cur.lastrowid
@@ -938,6 +940,7 @@ class Database:
             facts=row["facts"] if "facts" in keys else None,
             task_events=row["task_events"] if "task_events" in keys else None,
             is_task_manager_step=bool(row["is_task_manager_step"]) if "is_task_manager_step" in keys and row["is_task_manager_step"] is not None else False,
+            mcp_events=row["mcp_events"] if "mcp_events" in keys else None,
         )
 
     def list_messages(self, chat_id: str) -> List[Message]:
