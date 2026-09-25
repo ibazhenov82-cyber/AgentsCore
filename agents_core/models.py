@@ -265,10 +265,7 @@ class Settings:
     #: экране "Память и профиль", но по замечанию пользователя переехали в
     #: общие настройки, чтобы не плодить второй набор переключателей.
     #: По умолчанию ВСЕ пять типов выключены — пользователь включает то, что
-    #: ему нужно, явно (миграция существующих БД, созданных до этого
-    #: изменения, — исключение: working_memory_enabled/long_term_memory_enabled
-    #: там остаются True, см. `db.py`/`_row_to_settings`, чтобы не отключить
-    #: то, что уже было включено и использовалось).
+    #: ему нужно, явно.
     working_memory_enabled: bool = False
     long_term_memory_enabled: bool = False
     episodic_memory_enabled: bool = False
@@ -439,6 +436,13 @@ class Chat:
     #: чата). Итоговый набор, который увидит модель в этом чате, — это
     #: объединение инвариантов агента и инвариантов самого чата.
     invariant_ids: List[str] = field(default_factory=list)
+    #: Асинхронные запуски (ТЗ «асинхронные ответы», раздел 2.6) — последнее
+    #: сообщение, которое пользователь видел в этом чате; всё, что новее
+    #: (ответы ассистента в финальном статусе и запросы планировщика),
+    #: считается непрочитанным.
+    last_read_message_id: int = 0
+    #: Кто создал чат: "app" (пользователь) | "scheduler" (планировщик).
+    source: str = "app"
 
 
 @dataclass
@@ -457,7 +461,7 @@ class Branch:
 class Message:
     id: int
     chat_id: str
-    role: str  # "user" | "assistant" | "error"
+    role: str  # "user" | "assistant"
     content: str
     created_at: int
     reasoning_content: Optional[str] = None
@@ -493,17 +497,58 @@ class Message:
     #: сообщения с пометкой "Менеджер задач" рядом со временем, чтобы не
     #: создавалось впечатление, будто что-то потерялось.
     is_task_manager_step: bool = False
-    #: MCP-инструменты (новое ТЗ, интеграция с отдельным MCP-сервером) —
-    #: сырой JSON-массив событий вызова инструментов, полученных ЧЕРЕЗ
-    #: MCP-клиент (`Repository._execute_tool_call`, ветка диспетчеризации в
-    #: `mcp_client.MCPClient.call_tool`), применённых во время формирования
-    #: ЭТОГО ответа: [{"type":"mcp_call","name","status":"started"|"finished",
-    #: "ok","error"}, ...]. Намеренно ОТДЕЛЬНО от `task_events` — разные
-    #: источники (свои обработчики vs внешний MCP-сервер) и разный формат
-    #: события (здесь есть промежуточный статус "started", тогда как
-    #: `task_events` — только уже свершившиеся переходы). `None`/пусто, если
-    #: MCP выключен для чата или во время ответа не было вызовов через него.
-    mcp_events: Optional[str] = None
+    #: Асинхронные запуски (ТЗ, раздел 2.1). `status`: "complete" — обычное
+    #: завершённое сообщение; "streaming" — черновик, который сейчас
+    #: дописывается запуском; "cancelled"/"interrupted"/"failed" — ответ
+    #: остановлен пользователем / прерван перезапуском сервиса / завершился
+    #: ошибкой (текст — в `error`, частичный ответ — в `content`). В контекст
+    #: следующих запросов к модели попадают только "complete".
+    status: str = "complete"
+    #: Запуск (`Run.id`), создавший сообщение.
+    run_id: Optional[str] = None
+    #: Вызовы ВСЕХ инструментов за этот ответ (не только MCP): JSON-массив
+    #: [{"type":"tool_call","name","source","status","ok","error"}, ...],
+    #: `source` — "mcp" | "memory" | "task" | "skill".
+    tool_events: Optional[str] = None
+    #: Текст ошибки для `status == "failed"`.
+    error: Optional[str] = None
+    #: Кто отправил сообщение пользователя: "app" | "scheduler". Запросы
+    #: планировщика считаются непрочитанными (пользователь их не писал).
+    source: str = "app"
+
+
+#: Финальные статусы сообщения — всё, кроме черновика.
+MESSAGE_FINAL_STATUSES = ("complete", "cancelled", "interrupted", "failed")
+
+
+@dataclass
+class Run:
+    """Асинхронный запуск (ТЗ, раздел 2.1) — одна единица работы в чате:
+    ответ на сообщение (`kind="message"`), один шаг Менеджера задач
+    (`"task_step"`) или серия шагов до завершения задачи (`"task_run"`).
+    Выполняется в фоне (`runs.RunManager`) независимо от соединения клиента;
+    события — в памяти (`runs.RunEventLog`), черновик ответа — в `messages`."""
+
+    id: str
+    chat_id: str
+    kind: str  # "message" | "task_step" | "task_run"
+    source: str = "app"  # "app" | "scheduler"
+    status: str = "queued"  # queued | running | succeeded | failed | cancelled | interrupted
+    current_status: Optional[str] = None
+    request_json: str = "{}"
+    client_request_id: Optional[str] = None
+    user_message_id: Optional[int] = None
+    assistant_message_id: Optional[int] = None
+    task_id: Optional[str] = None
+    last_seq: int = 0
+    error: Optional[str] = None
+    created_at: int = 0
+    started_at: Optional[int] = None
+    finished_at: Optional[int] = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in ("queued", "running")
 
 
 @dataclass
@@ -691,6 +736,10 @@ class Task:
     paused: bool = False
     plan: List[str] = field(default_factory=list)
     done_steps: List[str] = field(default_factory=list)
+    #: Описание задачи — задаётся при создании через API
+    #: (`POST /chats/{id}/tasks`, в т.ч. планировщиком); модель видит его в
+    #: блоке [ЗАДАЧА]. У задач, заведённых самой моделью (`start_task`), пусто.
+    description: str = ""
     current_step: Optional[str] = None
     created_at: int = 0
     updated_at: int = 0

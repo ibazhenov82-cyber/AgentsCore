@@ -10,7 +10,7 @@ Pydantic-модели запросов/ответов HTTP API. Отдельно
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -74,7 +74,7 @@ class SettingsOut(BaseModel):
             "элементы интерфейса задач (бэдж/ссылку/вкладку/агрегированный блок). Заведение и "
             "продвижение задачи не требует от пользователя специальных фраз — модель решает сама, "
             "по смыслу переписки; пока задача активна, работает «Менеджер задач» (см. "
-            "`POST /chats/{chat_id}/tasks/{task_id}/task-manager/step`)."
+            "`POST /chats/{chat_id}/tasks/{task_id}/runs`)."
         ),
     )
     task_manager_max_steps: int = Field(
@@ -281,22 +281,31 @@ class MessageOut(BaseModel):
         False,
         description=(
             "`True`, если сообщение сгенерировано автономным шагом «Менеджера задач» "
-            "(`POST /chats/{chat_id}/tasks/{task_id}/task-manager/step`), а не ответом на реальное "
+            "(`POST /chats/{chat_id}/tasks/{task_id}/runs`), а не ответом на реальное "
             "сообщение пользователя — перед ним в истории нет соответствующего сообщения с ролью "
             "`user`. Клиент показывает такие сообщения с пометкой «Менеджер задач»."
         ),
     )
-    mcp_events: Optional[str] = Field(
-        None,
+    status: str = Field(
+        "complete",
         description=(
-            "JSON-массив событий вызова инструментов через MCP-сервер (интеграция с отдельным "
-            "MCP-сервисом), применённых ЗА ЭТОТ конкретный ответ: [{\"type\":\"mcp_call\",\"name\","
-            "\"status\":\"started\"|\"finished\",\"ok\",\"error\"}, ...]. Отдельно от task_events — "
-            "разные источники событий. Пусто/null, если MCP выключен для чата либо инструменты через "
-            "него не вызывались за этот ответ."
+            "'complete' — обычное завершённое сообщение; 'streaming' — черновик идущего ответа "
+            "(дописывается запуском, см. `run_id`); 'cancelled' — остановлен пользователем; "
+            "'interrupted' — прерван перезапуском сервиса; 'failed' — ошибка (текст в `error`). "
+            "В контекст следующих запросов к модели попадают только 'complete'."
         ),
     )
-
+    run_id: Optional[str] = Field(None, description="Запуск (`GET /runs/{run_id}`), создавший сообщение")
+    tool_events: Optional[str] = Field(
+        None,
+        description=(
+            "JSON-массив вызовов ВСЕХ инструментов за этот ответ: "
+            "{\"type\":\"tool_call\",\"name\",\"source\":\"mcp|memory|task|skill|unknown\","
+            "\"status\":\"started|finished\",\"ok\",\"error\"}"
+        ),
+    )
+    error: Optional[str] = Field(None, description="Текст ошибки для status='failed'")
+    source: str = Field("app", description="Кто отправил сообщение пользователя: 'app' | 'scheduler'")
 
 _SLIDING_WINDOW_DESCRIPTION = (
     "Запросить обрезку контекста стратегией Sliding Window. Требует "
@@ -318,51 +327,6 @@ _AUTOSUMMARY_DESCRIPTION = (
     "ответа модели: если порог достигнут — выполняется суммаризация по существующему "
     "алгоритму, и в чат сохраняется новое summary-сообщение."
 )
-
-
-class SendMessageRequest(BaseModel):
-    text: str = Field(..., min_length=1, examples=["Привет! Расскажи в двух словах, кто ты."])
-    get_facts: bool = Field(
-        False,
-        description=(
-            "Запросить извлечение/обновление фактов (стратегия Sticky Facts). "
-            "Требует context_strategy='sticky_facts' и context_strategy_limit > 2 у чата, иначе 400. "
-            "Извлечение выполняется ПОСЛЕ основного ответа модели; обновлённые факты возвращаются "
-            "в `assistant_message.facts` (не в `user_message.facts`)."
-        ),
-    )
-    sliding_window: bool = Field(False, description=_SLIDING_WINDOW_DESCRIPTION)
-    autosummary: str = Field("off", description=_AUTOSUMMARY_DESCRIPTION)
-    branch: Optional[int] = Field(None, description="Номер ветки диалога, в которую отправляется сообщение; не задано — основная ветка (0)")
-
-
-class StreamSendMessageRequest(BaseModel):
-    text: str = Field(..., min_length=1, examples=["Напиши короткое стихотворение про осень."])
-    get_facts: bool = Field(
-        False,
-        description=(
-            "Запросить извлечение/обновление фактов (стратегия Sticky Facts) — доступно и в потоковом "
-            "режиме: извлечение запускается только после того, как потоковая генерация ответа полностью "
-            "завершена. Клиент увидит промежуточные события `{\"type\": \"status\", ...}` "
-            "(\"Выполняется запрос к модели\", затем, если задано это поле, \"Обновление фактов\") "
-            "до финального события `done`, в котором `message.facts` уже содержит обновлённые факты."
-        ),
-    )
-    sliding_window: bool = Field(False, description=_SLIDING_WINDOW_DESCRIPTION)
-    autosummary: str = Field(
-        "off",
-        description=_AUTOSUMMARY_DESCRIPTION + (
-            " В потоковом режиме, если суммаризация действительно потребовалась, клиент "
-            "увидит дополнительное событие статуса \"Выполняется суммаризация чата\" перед "
-            "финальным `done`."
-        ),
-    )
-    branch: Optional[int] = Field(None, description="Номер ветки диалога, в которую отправляется сообщение; не задано — основная ветка (0)")
-
-
-class SendMessageResponse(BaseModel):
-    user_message: MessageOut
-    assistant_message: MessageOut
 
 
 class BulkDeleteRequest(BaseModel):
@@ -437,6 +401,7 @@ class ChatCreate(BaseModel):
         examples=["Чат 1"],
         description="Если не задано — автоматически подставляется \"Чат N\" по порядковому номеру чата внутри агента.",
     )
+    source: str = Field("app", description="Кто создаёт чат: 'app' | 'scheduler' (планировщик)")
 
 
 class ChatCopyRequest(BaseModel):
@@ -464,6 +429,13 @@ class ChatOut(BaseModel):
             "объединение этого списка и `AgentOut.invariant_ids` агента этого чата."
         ),
     )
+    source: str = Field("app", description="Кто создал чат: 'app' | 'scheduler'")
+    active_run: Optional["RunBriefOut"] = Field(None, description="Идущий сейчас запуск в этом чате, если есть")
+    unread_count: int = Field(0, description="Непрочитанные: ответы ассистента и запросы планировщика новее отметки прочтения")
+    first_unread_message_id: Optional[int] = Field(None, description="К нему приложение прокручивает чат при открытии")
+    last_read_message_id: int = Field(0, description="Отметка прочтения (`POST /chats/{id}/read`)")
+    last_message_at: Optional[int] = Field(None, description="Время последнего сообщения — для сортировки списка")
+    preview: Optional[str] = Field(None, description="Начало последнего сообщения (до 120 символов)")
 
 
 class ActiveProfileSetRequest(BaseModel):
@@ -528,11 +500,10 @@ class AgentWithChatsOut(BaseModel):
 
 
 class HealthOut(BaseModel):
+    """Лёгкий ping. Версии API пока не ведутся — приложение работает только
+    с актуальной версией сервера."""
+
     status: str = "ok"
-    # Версия совпадает с `FastAPI(version=...)` в `create_app_with_repository` —
-    # удобный способ убедиться, что запущен именно тот код, который был
-    # задеплоен (а не старая версия сервиса), не читая логи процесса.
-    version: str = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -830,28 +801,128 @@ class TaskManualActionRequest(BaseModel):
     действия "Отклонить" в новой модели нет вовсе (ТЗ: "действия отклонить
     не требуется", см. `task_state_machine.py`); кнопка «Продолжить»
     человека, наоборот, ВСЕГДА обращается к модели — см.
-    `POST /chats/{chat_id}/tasks/{task_id}/task-manager/step` вместо этого
+    `POST /chats/{chat_id}/tasks/{task_id}/runs` вместо этого
     эндпоинта."""
 
     action: str = Field("pause", min_length=1, description="Сейчас поддерживается только 'pause'", examples=["pause"])
     note: Optional[str] = Field(None, description="Необязательный комментарий к ручному переходу")
 
 
-class TaskManagerStepRequest(BaseModel):
-    """Тело запроса шага «Менеджера задач». `auto_pause=true` (по умолчанию,
-    кнопка «Продолжить») — после того как модель продвинет этап вызовом
-    `apply_task_action` (kind=advance), шаг автоматически ставит задачу на
-    паузу и `should_continue` приходит `false` — клиент вызывает эндпоинт
-    заново только по нажатию
-    пользователем. `auto_pause=false` (кнопка «Выполнить») — пауза не
-    вставляется автоматически, и `should_continue=true` до тех пор, пока
-    задача не станет `done` или модель не остановится сама (не вызовет
-    apply_task_action) — клиент вызывает эндпоинт в цикле, пока не придёт
-    `should_continue=false`; пользователь может прервать цикл в любой момент
-    отдельным вызовом «Пауза» (не через этот эндпоинт)."""
-
-    auto_pause: bool = Field(True, description="true — один шаг и снова пауза («Продолжить»); false — без паузы до done («Выполнить»)")
-
-
 class ErrorOut(BaseModel):
     error: str
+
+
+# ---------------------------------------------------------------------------
+# Асинхронные запуски, непрочитанные, создание задачи (ТЗ, этап 1)
+# ---------------------------------------------------------------------------
+
+class RunBriefOut(BaseModel):
+    id: str
+    kind: str = Field(..., description="'message' | 'task_step' | 'task_run'")
+    status: str = Field(..., description="'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'")
+    current_status: Optional[str] = Field(None, description="Текущая фаза для интерфейса")
+
+
+class RunOut(RunBriefOut):
+    chat_id: str
+    source: str = "app"
+    task_id: Optional[str] = None
+    client_request_id: Optional[str] = None
+    user_message_id: Optional[int] = None
+    assistant_message_id: Optional[int] = None
+    last_seq: int = 0
+    error: Optional[str] = None
+    created_at: int
+    started_at: Optional[int] = None
+    finished_at: Optional[int] = None
+
+
+class RunCreateRequest(BaseModel):
+    text: str = Field(..., min_length=1, examples=["Покажи структуру проекта"])
+    get_facts: bool = Field(
+        False,
+        description="Извлечь факты стратегией Sticky Facts. Требует context_strategy='sticky_facts' у чата, иначе 400",
+    )
+    sliding_window: bool = Field(False, description=_SLIDING_WINDOW_DESCRIPTION)
+    autosummary: str = Field("off", description=_AUTOSUMMARY_DESCRIPTION)
+    branch: Optional[int] = Field(None, description="Ветка диалога; не задано — основная")
+    client_request_id: Optional[str] = Field(
+        None, max_length=200,
+        description="Ключ идемпотентности: повтор с тем же значением возвращает уже созданный запуск",
+    )
+    source: str = Field("app", description="'app' | 'scheduler'")
+
+
+class RunCreatedOut(BaseModel):
+    run: RunOut
+    user_message: Optional[MessageOut] = None
+    assistant_message: Optional[MessageOut] = Field(None, description="Черновик ответа (status='streaming')")
+
+
+class RunSnapshotOut(BaseModel):
+    run: RunOut
+    assistant_message: Optional[MessageOut] = Field(None, description="Сохранённый черновик или итог ответа")
+    snapshot_seq: int = Field(..., description="Номер события, по которому актуален черновик — подписывайтесь с него")
+
+
+class TaskRunCreateRequest(BaseModel):
+    auto_pause: bool = Field(
+        False,
+        description="true — один шаг Менеджера задач («Продолжить»); false — шаги подряд до завершения («Выполнить»)",
+    )
+    client_request_id: Optional[str] = Field(None, max_length=200)
+    source: str = Field("app", description="'app' | 'scheduler'")
+
+
+class TaskCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, examples=["Разобрать новые issues"])
+    description: str = Field("", examples=["Составь план работ на неделю по новым issues AgentsCore"])
+    source: str = Field("app", description="'app' | 'scheduler'")
+    run: Optional[TaskRunCreateRequest] = Field(
+        None, description="Сразу создать запуск Менеджера задач (например `{\"auto_pause\": false}` — выполнить до конца)",
+    )
+
+
+class TaskCreatedOut(BaseModel):
+    task: "TaskSummaryOut"
+    message: MessageOut
+    run: Optional[RunOut] = None
+
+
+class ChatReadRequest(BaseModel):
+    message_id: int = Field(..., ge=0, description="Последнее показанное пользователю сообщение")
+
+
+class ChatActivityOut(BaseModel):
+    chat_id: str
+    unread_count: int = 0
+    first_unread_message_id: Optional[int] = None
+    last_message_at: Optional[int] = None
+    preview: Optional[str] = None
+
+
+class EventsCursorOut(BaseModel):
+    cursor: int = Field(..., description="Номер последнего события общей ленты — подписывайтесь `GET /events?after=<cursor>`")
+
+
+ChatOut.model_rebuild()
+TaskCreatedOut.model_rebuild()
+
+
+class McpToolOut(BaseModel):
+    """Инструмент одного из подключённых MCP-серверов — для выбора
+    инструментов в настройках агента/чата. `name` — ровно то имя, под
+    которым инструмент предлагается модели (с префиксом сервера, если имя
+    совпало на нескольких серверах)."""
+
+    name: str
+    original_name: str = Field(..., description="Имя инструмента на самом MCP-сервере")
+    server: str = Field(..., description="Имя MCP-сервера из MCP_SERVERS ('tools' для MCP_SERVER_URL)")
+    group: str = Field(
+        ...,
+        description="Подпись источника для интерфейса: группа из `_meta[\"agentscore/group\"]` инструмента "
+        "(«GIT API», «Локальный GIT», «Планировщик»), иначе — имя сервера из MCP_SERVERS",
+    )
+    title: str = Field("", description="Краткое русское описание")
+    description: str = ""
+    parameters: Dict[str, Any] = Field(default_factory=dict)

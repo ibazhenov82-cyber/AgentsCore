@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from ..models import Agent, Branch, Chat, Invariant, LongTermMemoryEntry, Message, ModelInfo, Profile, WorkingMemoryEntry
+from ..models import Agent, Branch, Chat, Invariant, LongTermMemoryEntry, Message, ModelInfo, Profile, Run, WorkingMemoryEntry
 from ..schemas import (
     AgentOut,
     BranchOut,
@@ -17,6 +17,8 @@ from ..schemas import (
     MessageOut,
     ModelInfoOut,
     ProfileOut,
+    RunBriefOut,
+    RunOut,
     RegisteredSkillOut,
     SettingsOut,
     TaskAvailableActionOut,
@@ -65,13 +67,56 @@ def chat_stats_out(stats: dict) -> ChatStatsOut:
 
 
 def chat_out(chat: Chat, stats: dict, repo=None) -> ChatOut:
+    # Непрочитанные и идущий запуск (ТЗ «асинхронные ответы», 2.3/2.6) —
+    # только когда передан репозиторий (без него — нули, как в тестах
+    # конвертеров).
+    activity: dict = {}
+    active_run = None
+    if repo is not None:
+        activity = repo.chat_activity([chat.id]).get(chat.id) or {}
+        run = repo._db.active_run_for_chat(chat.id)
+        active_run = run_brief_out(run) if run is not None else None
     return ChatOut(
         id=chat.id, agent_id=chat.agent_id, title=chat.title, created_at=chat.created_at,
         updated_at=chat.updated_at,
         settings=settings_out(chat.settings, tools_sources=_tools_sources(repo, chat.settings, chat)),
         stats=chat_stats_out(stats),
         active_profile_id=chat.active_profile_id, invariant_ids=chat.invariant_ids,
+        source=chat.source, active_run=active_run, last_read_message_id=chat.last_read_message_id,
+        unread_count=activity.get("unread_count") or 0,
+        first_unread_message_id=activity.get("first_unread_message_id"),
+        last_message_at=activity.get("last_message_at"),
+        preview=activity.get("preview"),
     )
+
+
+def run_brief_out(run: Run) -> RunBriefOut:
+    return RunBriefOut(id=run.id, kind=run.kind, status=run.status, current_status=run.current_status)
+
+
+def run_out(run: Run) -> RunOut:
+    return RunOut(
+        id=run.id, kind=run.kind, status=run.status, current_status=run.current_status, chat_id=run.chat_id,
+        source=run.source, task_id=run.task_id, client_request_id=run.client_request_id,
+        user_message_id=run.user_message_id, assistant_message_id=run.assistant_message_id,
+        last_seq=run.last_seq, error=run.error, created_at=run.created_at, started_at=run.started_at,
+        finished_at=run.finished_at,
+    )
+
+
+#: Ключи событий лент, в которых лежат доменные объекты (`Message`) — при
+#: отправке клиенту превращаются в JSON схемы `MessageOut`.
+_EVENT_MESSAGE_KEYS = ("message", "assistant_message", "user_message")
+
+
+def event_out(event: dict) -> dict:
+    """Событие ленты запуска/общей ленты → JSON-совместимый dict."""
+    data = dict(event)
+    for key in _EVENT_MESSAGE_KEYS:
+        value = data.get(key)
+        if isinstance(value, Message):
+            data[key] = message_out(value).model_dump()
+    return data
 
 
 def working_memory_out(entry: WorkingMemoryEntry) -> WorkingMemoryOut:

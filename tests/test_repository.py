@@ -179,6 +179,14 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertEqual(agent.settings.max_tokens, None)
         self.assertIsNone(agent.settings.context_strategy)
 
+    def test_new_agent_settings_match_what_new_agent_gets(self):
+        self.repo.update_default_settings({"model": TEST_MODEL_ID, "temperature": 0.4, "stream": False})
+        baseline = self.repo.new_agent_settings()
+        agent = self.repo.create_agent("Агент")
+        self.assertEqual(baseline, agent.settings)
+        self.assertEqual(baseline.temperature, 0.4)
+        self.assertFalse(baseline.stream)
+
     def test_agent_not_found(self):
         with self.assertRaises(NotFoundError):
             self.repo.get_agent("no-such-id")
@@ -305,7 +313,11 @@ class RepositoryTestCase(unittest.TestCase):
         with self.assertRaises(ProviderError):
             self.repo.send_message_blocking(chat.id, "Привет")
         messages = self.repo.list_messages(chat.id)
-        self.assertEqual(messages[-1].role, "error")
+        # Асинхронные запуски: вместо отдельного сообщения с ролью "error"
+        # черновик ответа сохраняется со статусом "failed" и текстом ошибки.
+        self.assertEqual(messages[-1].role, "assistant")
+        self.assertEqual(messages[-1].status, "failed")
+        self.assertTrue(messages[-1].error)
 
     def test_chat_stats_and_context_fill_ratio(self):
         # context_window=1200 (max_input_tokens=1000 + 200); context_fill_ratio

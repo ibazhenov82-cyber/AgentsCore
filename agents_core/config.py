@@ -167,16 +167,41 @@ class AgentConfig:
     MCP_ENABLED: bool = os.environ.get("MCP_ENABLED", "false").strip().lower() in ("1", "true", "yes")
     # Например "http://mcp:8001/mcp" (тот же адрес, что слушает mcp_server).
     MCP_SERVER_URL: str = os.environ.get("MCP_SERVER_URL", "").strip()
+    # Несколько MCP-серверов: "tools=http://localhost:8001/mcp,scheduler=http://localhost:8002/mcp".
+    # Если задано — используется вместо MCP_SERVER_URL.
+    MCP_SERVERS: str = os.environ.get("MCP_SERVERS", "").strip()
     # Заготовка под будущую аутентификацию к MCP-серверу — пока нигде не
     # используется (см. mcp_server/.env.example, тот же принцип).
     MCP_API_KEY: str = os.environ.get("MCP_API_KEY", "").strip()
-    # Таймаут запросов к MCP-серверу (секунды).
-    MCP_REQUEST_TIMEOUT: float = float(os.environ.get("MCP_REQUEST_TIMEOUT", "30") or "30")
+    # Таймаут запросов к MCP-серверу (секунды). С запасом: цепочка
+    # инструментов (поиск, загрузка страниц, ответ модели) идёт минуту и больше.
+    MCP_REQUEST_TIMEOUT: float = float(os.environ.get("MCP_REQUEST_TIMEOUT", "180") or "180")
+
+    # --- Асинхронные запуски (ТЗ «асинхронные ответы», раздел 2.4) ---------
+    # Сколько ответов модели выполняется одновременно (в разных чатах; в
+    # одном чате — всегда не больше одного).
+    RUN_WORKERS: int = int(os.environ.get("AGENT_RUN_WORKERS", "4") or "4")
+    # Предельное время одного запуска, секунды — затем он завершается с ошибкой.
+    RUN_TIMEOUT: float = float(os.environ.get("AGENT_RUN_TIMEOUT", "600") or "600")
+    # Сколько секунд лента событий завершённого запуска хранится в памяти.
+    RUN_EVENTS_TTL: float = float(os.environ.get("AGENT_RUN_EVENTS_TTL", "600") or "600")
+    # Сколько дней хранятся записи о завершённых запусках.
+    RUN_RETENTION_DAYS: int = int(os.environ.get("AGENT_RUN_RETENTION_DAYS", "30") or "30")
 
     @classmethod
     def is_deepseek_configured(cls) -> bool:
         return bool(cls.DEEPSEEK_API_KEY)
 
     @classmethod
+    def mcp_servers(cls) -> list:
+        """Список `(имя, адрес)` подключаемых MCP-серверов: из `MCP_SERVERS`,
+        иначе единственный `MCP_SERVER_URL` под именем "tools"."""
+        from .mcp_client import parse_mcp_servers
+
+        if cls.MCP_SERVERS:
+            return parse_mcp_servers(cls.MCP_SERVERS)
+        return [("tools", cls.MCP_SERVER_URL)] if cls.MCP_SERVER_URL else []
+
+    @classmethod
     def is_mcp_configured(cls) -> bool:
-        return cls.MCP_ENABLED and bool(cls.MCP_SERVER_URL)
+        return cls.MCP_ENABLED and bool(cls.mcp_servers())

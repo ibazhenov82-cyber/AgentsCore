@@ -322,10 +322,7 @@ class MemoryTypeGatingTests(unittest.TestCase):
     """Все пять типов памяти выключены по умолчанию для НОВЫХ агентов/чатов
     (пользователь включает нужные явно в настройках) — сами тумблеры
     (Settings.*_memory_enabled) управляют СРАЗУ тремя вещами: инъекцией в
-    промпт, содержимым memory-snapshot и tool-calling'ом. Обратная
-    совместимость для БАЗ, созданных до этого изменения (там
-    working/long-term по-прежнему включены после миграции), проверяется
-    отдельно в test_db_migration.py."""
+    промпт, содержимым memory-snapshot и tool-calling'ом."""
 
     def setUp(self) -> None:
         self.repo = make_repository()

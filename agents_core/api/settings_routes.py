@@ -3,8 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from ..repository import Repository
-from ..schemas import DefaultSettingsOut, DefaultSettingsPatch
-from .converters import default_settings_out
+from ..schemas import DefaultSettingsOut, DefaultSettingsPatch, SettingsOut
+from .converters import default_settings_out, settings_out
 from .deps import get_repository
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
@@ -18,6 +18,20 @@ router = APIRouter(prefix="/settings", tags=["Settings"])
 )
 def get_default_settings(repo: Repository = Depends(get_repository)) -> DefaultSettingsOut:
     return default_settings_out(repo.get_default_settings())
+
+
+@router.get(
+    "/default/agent",
+    response_model=SettingsOut,
+    summary="Настройки нового агента",
+    description=(
+        "Полные настройки, которые получит новый агент: настройки по умолчанию плюс встроенные "
+        "значения остальных полей. Приложение сравнивает с ними настройки агентов и показывает "
+        "в списке бейджи только для отличающихся."
+    ),
+)
+def get_new_agent_settings(repo: Repository = Depends(get_repository)) -> SettingsOut:
+    return settings_out(repo.new_agent_settings())
 
 
 @router.put(

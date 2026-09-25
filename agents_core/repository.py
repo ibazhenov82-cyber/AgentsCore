@@ -24,6 +24,7 @@ from .config import AgentConfig
 from .db import Database
 from .format_detect import detect_message_format
 from .invariant_checks import format_violation_warning, validate_response
+from .events import CancelToken, EventLog, RunCancelled
 from .mcp_client import MCPClient, MCPClientError
 from .models import (
     Agent,
@@ -72,7 +73,7 @@ _DEFAULT_SETTINGS_FIELD_NAMES = {f.name for f in dataclasses.fields(DefaultSetti
 #: финального текстового ответа). После достижения предела последний
 #: результат провайдера возвращается как есть, даже если в нём снова
 #: запрошены tool_calls.
-_MAX_TOOL_ITERATIONS = 4
+_MAX_TOOL_ITERATIONS = 6
 
 # ---------------------------------------------------------------------------
 # Встроенные функции памяти (доступны всем чатам с memory_tools_enabled=true,
@@ -360,13 +361,14 @@ class Repository:
         self._catalog = catalog
         self._locks: Dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
-        #: Клиент отдельного MCP-сервера (новое ТЗ, третий компонент) —
-        #: `None` по умолчанию (полностью опционально, обратная
-        #: совместимость: существующие вызовы `Repository(db, registry,
-        #: catalog)` продолжают работать без изменений и без сетевого
-        #: похода куда-либо за инструментами). См. `_settings_with_merged_tools`
+        #: Клиент MCP-серверов — `None`, если MCP не настроен (тогда
+        #: инструменты только локальные). См. `_settings_with_merged_tools`
         #: и `_execute_tool_call` — единственные два места, где он используется.
         self._mcp_client = mcp_client
+        #: Общая лента изменений (ТЗ «асинхронные ответы», раздел 2.6): новые/
+        #: изменённые/удалённые чаты, запуски, непрочитанные — клиент держит
+        #: одно SSE-соединение `GET /events` и обновляет главный экран сразу.
+        self.events = EventLog(max_events=1000, max_age_seconds=600)
 
     def _lock_for(self, chat_id: str) -> threading.Lock:
         with self._locks_guard:
@@ -416,9 +418,14 @@ class Repository:
             raise NotFoundError(f"no such agent: {agent_id}")
         return agent
 
+    def new_agent_settings(self) -> Settings:
+        """Полные настройки, которые получит новый агент: настройки по
+        умолчанию + встроенные значения остальных полей. База сравнения для
+        бейджей агента в списке (показываются только отличия)."""
+        return settings_from_defaults(self._db.get_default_settings())
+
     def create_agent(self, name: Optional[str], model: Optional[str] = None) -> Agent:
-        defaults = self._db.get_default_settings()
-        settings = settings_from_defaults(defaults)
+        settings = self.new_agent_settings()
         if model:
             settings.model = model
         # Имя по умолчанию — "Агент N", где N — порядковый номер (число уже
@@ -461,7 +468,10 @@ class Repository:
 
     def delete_agent(self, agent_id: str) -> None:
         self._require_agent(agent_id)
+        chats = self._db.list_chats(agent_id)
         self._db.delete_agent(agent_id)  # ON DELETE CASCADE удаляет чаты и их сообщения
+        for chat in chats:
+            self._publish_chat_event("chat_deleted", chat.id, agent_id)
 
     # ---- чаты -----------------------------------------------------------------
 
@@ -471,7 +481,9 @@ class Repository:
             raise NotFoundError(f"no such chat: {chat_id}")
         return chat
 
-    def create_chat(self, agent_id: str, title: Optional[str]) -> Chat:
+    def create_chat(self, agent_id: str, title: Optional[str], source: str = "app") -> Chat:
+        """`source` — кто создаёт чат: "app" (пользователь) | "scheduler"
+        (планировщик: «Запрос агенту»/«Задача агенту» в новый чат)."""
         agent = self._require_agent(agent_id)
         settings = dataclasses.replace(agent.settings)
         # Имя по умолчанию — "Чат N", где N — порядковый номер чата ВНУТРИ
@@ -481,7 +493,15 @@ class Repository:
         # копируется в новый чат ТОЛЬКО в момент создания — точно так же, как
         # Settings копируются из agent.settings, а не как живая ссылка;
         # дальше чат может выбрать другой профиль независимо от агента.
-        return self._db.create_chat(agent_id, resolved_title, settings, active_profile_id=agent.default_profile_id)
+        chat = self._db.create_chat(
+            agent_id, resolved_title, settings, active_profile_id=agent.default_profile_id, source=source,
+        )
+        self._publish_chat_event("chat_created", chat.id, agent_id)
+        return chat
+
+    def find_latest_chat_by_title(self, agent_id: str, title: str) -> Optional[Chat]:
+        self._require_agent(agent_id)
+        return self._db.find_latest_chat_by_title(agent_id, title)
 
     def get_chat(self, chat_id: str) -> Chat:
         return self._require_chat(chat_id)
@@ -494,7 +514,9 @@ class Repository:
         if not title or not title.strip():
             raise ValidationError("title must be a non-empty string")
         self._db.rename_chat(chat_id, title)
-        return self._require_chat(chat_id)
+        chat = self._require_chat(chat_id)
+        self._publish_chat_event("chat_updated", chat_id, chat.agent_id)
+        return chat
 
     def update_chat_settings(self, chat_id: str, payload: dict) -> Settings:
         chat = self._require_chat(chat_id)
@@ -503,15 +525,18 @@ class Repository:
         _validate_settings_payload(payload)
         updated = _apply_partial(chat.settings, payload, _SETTINGS_FIELD_NAMES)
         self._db.update_chat_settings(chat_id, updated)
+        self._publish_chat_event("chat_updated", chat_id, chat.agent_id)
         return updated
 
     def delete_chat(self, chat_id: str) -> None:
-        self._require_chat(chat_id)
+        chat = self._require_chat(chat_id)
         self._db.delete_chat(chat_id)
+        self._publish_chat_event("chat_deleted", chat_id, chat.agent_id)
 
     def copy_chat(self, chat_id: str, new_title: str) -> Chat:
         chat = self._require_chat(chat_id)
-        messages = self._db.list_messages(chat_id)
+        # Черновики идущего ответа не копируются — только завершённые сообщения.
+        messages = [m for m in self._db.list_messages(chat_id) if m.status != "streaming"]
         new_chat = self._db.create_chat(chat.agent_id, new_title or f"{chat.title} (копия)", dataclasses.replace(chat.settings))
         for m in messages:
             self._db.add_message(
@@ -519,12 +544,18 @@ class Repository:
                     id=0, chat_id=new_chat.id, role=m.role, content=m.content, created_at=m.created_at,
                     reasoning_content=m.reasoning_content, is_summary=m.is_summary, duration_ms=m.duration_ms,
                     total_tokens=m.total_tokens, prompt_tokens=m.prompt_tokens, completion_tokens=m.completion_tokens,
-                    format=m.format, branch=m.branch, facts=m.facts,
+                    format=m.format, branch=m.branch, facts=m.facts, status=m.status, error=m.error,
+                    tool_events=m.tool_events, task_events=m.task_events,
+                    is_task_manager_step=m.is_task_manager_step, source=m.source,
                 )
             )
         for b in self._db.list_branches(chat_id):
             self._db.create_branch(new_chat.id, b.name)
-        return new_chat
+        # Копия считается прочитанной целиком — пользователь сам её создал.
+        if messages:
+            self._db.set_last_read(new_chat.id, max(m.id for m in self._db.list_messages(new_chat.id)))
+        self._publish_chat_event("chat_created", new_chat.id, new_chat.agent_id)
+        return self._require_chat(new_chat.id)
 
     # ---- ветки диалога --------------------------------------------------------
 
@@ -708,14 +739,17 @@ class Repository:
     def delete_message(self, chat_id: str, message_id: int) -> None:
         self._require_chat(chat_id)
         self._db.delete_message(chat_id, message_id)
+        self._publish_unread(chat_id)
 
     def bulk_delete_messages(self, chat_id: str, message_ids: List[int]) -> None:
         self._require_chat(chat_id)
         self._db.bulk_delete_messages(chat_id, message_ids)
+        self._publish_unread(chat_id)
 
     def clear_messages(self, chat_id: str) -> None:
         self._require_chat(chat_id)
         self._db.clear_messages(chat_id)
+        self._publish_unread(chat_id)
 
     # ---- суммаризация -------------------------------------------------------
 
@@ -768,7 +802,7 @@ class Repository:
     def summarize_chat(self, chat_id: str) -> Message:
         chat = self._require_chat(chat_id)
         with self._lock_for(chat_id):
-            messages = self._db.list_messages(chat_id)
+            messages = [m for m in self._db.list_messages(chat_id) if m.status == "complete"]
             return self._perform_summarization(chat, messages)
 
     def _validate_autosummary_send_config(self, chat: Chat, mode: str) -> None:
@@ -1681,6 +1715,13 @@ class Repository:
                 deduped.append(tool)
         return dataclasses.replace(chat.settings, tools_json=json.dumps(deduped, ensure_ascii=False))
 
+    def list_mcp_tools(self) -> List[dict]:
+        """Инструменты всех подключённых MCP-серверов для интерфейса (см.
+        `mcp_client.MCPClient.list_tool_details`); пусто без MCP."""
+        if self._mcp_client is None:
+            return []
+        return self._mcp_client.list_tool_details()
+
     def _tools_sources_for(self, settings: Settings, chat: Optional[Chat] = None) -> List[str]:
         """Список активных ИСТОЧНИКОВ инструментов текущего чата/агента —
         только для интерфейса (новое ТЗ, `SettingsOut.tools_sources`), чтобы
@@ -1737,7 +1778,7 @@ class Repository:
 
     def _execute_tool_call(
         self, chat: Chat, agent: Agent, call: dict, events: Optional[List[dict]] = None, auto_pause: bool = True,
-        mcp_events: Optional[List[dict]] = None, allowed_mcp_names: Optional[set] = None,
+        allowed_mcp_names: Optional[set] = None,
     ) -> str:
         """Выполняет ОДИН запрошенный моделью вызов и возвращает JSON-текст —
         именно он уйдёт обратно провайдеру как содержимое tool-сообщения.
@@ -1763,14 +1804,6 @@ class Repository:
         между параллельными запросами разных чатов): `true` для обычного
         чата и кнопки "Продолжить" (шаг + пауза), `false` — только для кнопки
         "Выполнить" (см. `run_task_manager_step`).
-
-        `mcp_events` — отдельный от `events` аккумулятор (см.
-        `Message.mcp_events`): заполняется ТОЛЬКО когда вызов на самом деле
-        уходит на MCP-сервер (имя не найдено среди `_TOOL_HANDLERS`, но есть
-        в последнем успешном `list_tools()` клиента) — событиями
-        `{"type":"mcp_call","name","status":"started"|"finished","ok","error"}`.
-        Собственные инструменты (`_TOOL_HANDLERS`) в него не попадают — они
-        уже отражены (при необходимости) в `events`/`task_events`.
 
         `allowed_mcp_names` — вторая линия защиты для ограничения
         инструментов настройками чата (баг, найденный на практике: модель
@@ -1804,20 +1837,12 @@ class Repository:
         ):
             # Инструмент неизвестен локально, но известен MCP-серверу —
             # диспетчеризация туда (новое ТЗ, интеграция с MCP-сервером).
-            if mcp_events is not None:
-                mcp_events.append({"type": "mcp_call", "name": name, "status": "started", "ok": None, "error": None})
             try:
-                result = self._mcp_client.call_tool(name, arguments)
-                ok = not (isinstance(result, dict) and "error" in result)
-                if mcp_events is not None:
-                    mcp_events.append({
-                        "type": "mcp_call", "name": name, "status": "finished", "ok": ok,
-                        "error": result.get("error") if isinstance(result, dict) and not ok else None,
-                    })
+                result = self._mcp_client.call_tool(
+                    name, arguments, meta={"agentscore/chat_id": chat.id, "agentscore/agent_id": agent.id},
+                )
             except MCPClientError as exc:  # сетевой сбой самого MCP-сервера
                 result = {"error": str(exc)}
-                if mcp_events is not None:
-                    mcp_events.append({"type": "mcp_call", "name": name, "status": "finished", "ok": False, "error": str(exc)})
         else:
             result = {"error": f"unknown tool: {name!r}"}
         event = result.pop("_event", None) if isinstance(result, dict) else None
@@ -1828,7 +1853,6 @@ class Repository:
     def _run_tool_loop_blocking(
         self, provider, model_id: str, messages: List[ProviderMessage], settings: Settings,
         chat: Chat, agent: Agent, result: ChatResult, events: Optional[List[dict]] = None,
-        mcp_events: Optional[List[dict]] = None,
     ) -> ChatResult:
         iterations = 0
         allowed_mcp_names = self._offered_tool_names(settings)
@@ -1836,7 +1860,7 @@ class Repository:
             messages.append(ProviderMessage("assistant", result.content, tool_calls=result.tool_calls))
             for call in result.tool_calls:
                 tool_output = self._execute_tool_call(
-                    chat, agent, call, events=events, mcp_events=mcp_events, allowed_mcp_names=allowed_mcp_names,
+                    chat, agent, call, events=events, allowed_mcp_names=allowed_mcp_names,
                 )
                 fn_name = (call.get("function") or {}).get("name")
                 messages.append(ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name))
@@ -2025,6 +2049,7 @@ class Repository:
         lines = [
             f"[ЗАДАЧА] id: {task.id}",
             f"task: {task.title}",
+            *([f"description: {task.description}"] if task.description else []),
             f"state: {state.value}",
             f"step: {position}",
             f"total: {total}",
@@ -2199,6 +2224,409 @@ class Repository:
             return self._build_sliding_window_context(chat, agent, pool, text), {}, None
         return self._build_request_context(chat, agent, pool, text), {}, None
 
+    # ---- асинхронные запуски: подготовка и исполнители (ТЗ, этап 1) ----------
+    #
+    # Ответ модели больше не живёт внутри HTTP-запроса: `runs.RunManager`
+    # создаёт запуск и выполняет его в фоновом пуле, а здесь — сама работа.
+    # Подготовка (`prepare_*`) создаёт сообщение пользователя и ЧЕРНОВИК
+    # ответа ассистента (`status="streaming"`) синхронно, чтобы клиент сразу
+    # получил их в ответе на `POST /chats/{id}/runs`. Исполнитель
+    # (`execute_*`) — генератор событий (`status`/`delta`/`tool_call`/
+    # `task_event`/`message_saved`/`done`/`cancelled`/`error`) — дописывает
+    # черновик в итоговое сообщение. Прежние синхронные методы
+    # `send_message_blocking`/`stream_message`/`run_task_manager_step`
+    # остались тонкими обёртками над теми же исполнителями.
+    # ---------------------------------------------------------------------------
+
+    def _history_for_context(
+        self, chat_id: str, branch: Optional[int], before_id: Optional[int] = None,
+    ) -> List[Message]:
+        """История для контекста модели: нужная ветка, только завершённые
+        сообщения (`status == "complete"` — черновики, остановленные,
+        прерванные и неудавшиеся ответы модели не передаются, ТЗ 2.4) и
+        только сообщения ДО `before_id` (текущий запрос и его черновик
+        добавляются в контекст отдельно)."""
+        messages = self._filter_by_branch(self._db.list_messages(chat_id), branch)
+        return [m for m in messages if m.status == "complete" and (before_id is None or m.id < before_id)]
+
+    def _validate_send_flags(self, chat: Chat, get_facts: bool, sliding_window: bool, autosummary: str) -> None:
+        if get_facts:
+            self._validate_sticky_facts_config(chat)
+        if sliding_window:
+            self._validate_sliding_window_config(chat)
+        if autosummary != "off":
+            self._validate_autosummary_send_config(chat, autosummary)
+
+    def prepare_message_run(
+        self,
+        chat_id: str,
+        text: str,
+        get_facts: bool = False,
+        sliding_window: bool = False,
+        autosummary: str = "off",
+        branch: Optional[int] = None,
+        source: str = "app",
+        run_id: Optional[str] = None,
+    ) -> Tuple[Chat, Message, Message]:
+        """Проверяет параметры и создаёт сообщение пользователя и черновик
+        ответа. Все ошибки конфигурации (`ValidationError`) — здесь, до
+        создания запуска, чтобы клиент получил 400, а не неудавшийся запуск."""
+        chat = self._require_chat(chat_id)
+        self._require_agent(chat.agent_id)
+        if not text or not text.strip():
+            raise ValidationError("text must be a non-empty string")
+        self._validate_send_flags(chat, get_facts, sliding_window, autosummary)
+        now = int(time.time())
+        user_msg = self._db.add_message(Message(
+            id=0, chat_id=chat_id, role="user", content=text, created_at=now,
+            format=detect_message_format(text), branch=branch or 0, run_id=run_id, source=source,
+        ))
+        draft = self._db.add_message(Message(
+            id=0, chat_id=chat_id, role="assistant", content="", created_at=now,
+            branch=branch or 0, status="streaming", run_id=run_id,
+        ))
+        self._db.touch_chat(chat_id)
+        if source == "scheduler":
+            self._publish_unread(chat_id)
+        return chat, user_msg, draft
+
+    def validate_task_step(self, chat_id: str, task_id: str) -> Tuple[Chat, Task]:
+        chat = self._require_chat(chat_id)
+        self._require_agent(chat.agent_id)
+        task = self._require_task(task_id)
+        if task.chat_id != chat_id:
+            raise NotFoundError(f"task {task_id!r} does not belong to chat {chat_id!r}")
+        if not chat.settings.task_tracking_enabled:
+            raise ValidationError("task tracking is disabled for this chat")
+        if self._task_status(task) == "done":
+            raise ValidationError("task is already done; task manager is not applicable")
+        return chat, task
+
+    def prepare_task_step_draft(self, chat_id: str, run_id: Optional[str] = None) -> Message:
+        """Черновик сообщения одного шага Менеджера задач (у шага нет
+        сообщения пользователя — см. комментарий к разделу ниже)."""
+        draft = self._db.add_message(Message(
+            id=0, chat_id=chat_id, role="assistant", content="", created_at=int(time.time()),
+            branch=0, status="streaming", run_id=run_id, is_task_manager_step=True,
+        ))
+        self._db.touch_chat(chat_id)
+        return draft
+
+    # ---- общий цикл одного ответа модели --------------------------------------
+
+    _MEMORY_TOOLS = frozenset({"save_working_memory", "save_long_term_memory"})
+    _TASK_TOOLS = frozenset({"start_task", "apply_task_action"})
+
+    def _tool_source(self, name: str, allowed_mcp_names: Optional[set]) -> str:
+        """Откуда инструмент — для строки «Использую инструмент …» в клиенте."""
+        if name in self._MEMORY_TOOLS:
+            return "memory"
+        if name in self._TASK_TOOLS:
+            return "task"
+        if name in self._TOOL_HANDLERS:
+            return "skill"
+        if (
+            self._mcp_client is not None and self._mcp_client.has_cached_tool(name)
+            and (allowed_mcp_names is None or name in allowed_mcp_names)
+        ):
+            return "mcp"
+        return "unknown"
+
+    def _run_one_tool(
+        self, chat: Chat, agent: Agent, call: dict, acc: "_TurnAccumulator", auto_pause: bool,
+        allowed_mcp_names: set, provider_messages: List[ProviderMessage],
+    ) -> Iterator[dict]:
+        fn = call.get("function") or {}
+        fn_name = fn.get("name")
+        name = fn_name or ""
+        source = self._tool_source(name, allowed_mcp_names)
+        # Для MCP — подпись источника («GIT API», «Планировщик», имя внешнего
+        # сервера): клиент показывает её в строке «Использую инструмент …».
+        group = self._mcp_client.tool_group(name) if source == "mcp" else None
+        started_event = {
+            "type": "tool_call", "name": name, "source": source, "group": group,
+            "status": "started", "ok": None, "error": None,
+        }
+        acc.tool_events.append(started_event)
+        yield started_event
+        task_events_before = len(acc.task_events)
+        tool_output = self._execute_tool_call(
+            chat, agent, call, events=acc.task_events, auto_pause=auto_pause, allowed_mcp_names=allowed_mcp_names,
+        )
+        ok, error = True, None
+        try:
+            parsed = json.loads(tool_output)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "error" in parsed:
+            ok, error = False, str(parsed.get("error"))
+        finished_event = {
+            "type": "tool_call", "name": name, "source": source, "group": group,
+            "status": "finished", "ok": ok, "error": error,
+        }
+        acc.tool_events.append(finished_event)
+        yield finished_event
+        for task_event in acc.task_events[task_events_before:]:
+            yield {"type": "task_event", **task_event}
+        provider_messages.append(ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name))
+
+    def _model_turn(
+        self, provider, model_id: str, provider_messages: List[ProviderMessage], request_settings: Settings,
+        chat: Chat, agent: Agent, acc: "_TurnAccumulator", *, use_stream: bool, token: Optional[CancelToken],
+        status_text: str, auto_pause: bool = True,
+    ):
+        """Один ответ модели целиком: запрос (потоковый или обычный), цикл
+        вызова инструментов (до `_MAX_TOOL_ITERATIONS` раундов), итоговый
+        запрос без инструментов при исчерпании лимита
+        (`_finalize_after_tool_cap`), проверка инвариантов с одним
+        переспросом. Генератор событий; через `yield from` возвращает
+        `(final_result, final_content)`."""
+        allowed_mcp_names = self._offered_tool_names(request_settings)
+        iterations = 0
+        while True:
+            if token is not None:
+                token.raise_if_cancelled()
+            done_result: Optional[ChatResult] = None
+            if use_stream:
+                stream = provider.stream_chat(model_id, provider_messages, request_settings)
+                try:
+                    for delta in stream:
+                        if token is not None:
+                            token.raise_if_cancelled()
+                        if delta.done:
+                            done_result = delta.result
+                            continue
+                        if delta.content:
+                            acc.partial_content.append(delta.content)
+                        if delta.reasoning_content:
+                            acc.partial_reasoning.append(delta.reasoning_content)
+                        yield {"type": "delta", "content": delta.content, "reasoning_content": delta.reasoning_content}
+                finally:
+                    # Отмена посреди потока: закрываем генератор провайдера —
+                    # это закрывает и HTTP-соединение с моделью.
+                    close = getattr(stream, "close", None)
+                    if close is not None:
+                        close()
+            else:
+                done_result = provider.chat(model_id, provider_messages, request_settings)
+                if token is not None:
+                    token.raise_if_cancelled()
+            if done_result is None:
+                raise ProviderError("provider returned no result")
+            if done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
+                yield {"type": "status", "status": "Выполняется вызов инструментов"}
+                provider_messages.append(
+                    ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
+                )
+                for call in done_result.tool_calls:
+                    if token is not None:
+                        token.raise_if_cancelled()
+                    yield from self._run_one_tool(chat, agent, call, acc, auto_pause, allowed_mcp_names, provider_messages)
+                iterations += 1
+                yield {"type": "status", "status": status_text}
+                continue
+            final_result = done_result
+            break
+
+        # Лимит раундов исчерпан, а модель всё ещё хочет инструменты — один
+        # запрос без инструментов с просьбой подвести итог (реальный баг:
+        # раньше пользователь получал пустой ответ, см. `_finalize_after_tool_cap`).
+        if final_result.tool_calls:
+            yield {"type": "status", "status": "Формулирую итоговый ответ"}
+            final_result = self._finalize_after_tool_cap(
+                provider, model_id, provider_messages, request_settings, final_result,
+            )
+
+        # "Инварианты" — код-уровневая проверка + один переспрос; предупреждение
+        # выводится ПЕРЕД ответом (отдельными кусками текста для клиента).
+        final_result, violation_warning = self._validate_and_maybe_retry(
+            provider, model_id, provider_messages, request_settings, chat, agent, final_result,
+            events=acc.task_events,
+        )
+        if violation_warning:
+            yield {"type": "delta", "content": f"{violation_warning}\n\n", "reasoning_content": None}
+            yield {"type": "delta", "content": final_result.content, "reasoning_content": None}
+        final_content = f"{violation_warning}\n\n{final_result.content}" if violation_warning else final_result.content
+        return final_result, final_content
+
+    def _finalize_draft(
+        self, draft: Message, *, content: str, status: str, result: Optional[ChatResult] = None,
+        duration_ms: Optional[int] = None, acc: Optional["_TurnAccumulator"] = None, error: Optional[str] = None,
+    ) -> Message:
+        """Записывает итог в черновик (та же строка `messages`) и сообщает об
+        изменении непрочитанных в общую ленту."""
+        content = content or ""
+        fields: Dict[str, object] = {
+            "content": content, "status": status, "format": detect_message_format(content),
+            "created_at": int(time.time()), "error": error,
+        }
+        if result is not None:
+            fields.update(
+                reasoning_content=result.reasoning_content, total_tokens=result.usage.total_tokens,
+                prompt_tokens=result.usage.prompt_tokens, completion_tokens=result.usage.completion_tokens,
+            )
+        elif acc is not None and acc.partial_reasoning:
+            fields["reasoning_content"] = "".join(acc.partial_reasoning)
+        if duration_ms is not None:
+            fields["duration_ms"] = duration_ms
+        if acc is not None:
+            fields["task_events"] = json.dumps(acc.task_events, ensure_ascii=False) if acc.task_events else None
+            fields["tool_events"] = json.dumps(acc.tool_events, ensure_ascii=False) if acc.tool_events else None
+        self._db.update_message_fields(draft.id, **fields)
+        saved = self._db.get_message(draft.id)
+        self._publish_unread(draft.chat_id)
+        return saved
+
+    def _terminal_after_interrupt(
+        self, draft: Message, acc: "_TurnAccumulator", started: float, *, cancelled: Optional[RunCancelled] = None,
+        error: Optional[str] = None,
+    ) -> dict:
+        """Итоговое событие для остановленного/неудавшегося ответа: частичный
+        текст сохраняется, статус — cancelled или failed."""
+        duration_ms = int((time.monotonic() - started) * 1000)
+        partial = "".join(acc.partial_content)
+        if cancelled is not None and cancelled.reason != "timeout":
+            saved = self._finalize_draft(draft, content=partial, status="cancelled", acc=acc, duration_ms=duration_ms)
+            self._db.touch_chat(draft.chat_id)
+            return {"type": "cancelled", "message": saved}
+        if cancelled is not None:
+            error = "Превышено время выполнения запроса"
+        saved = self._finalize_draft(
+            draft, content=partial, status="failed", acc=acc, duration_ms=duration_ms, error=error,
+        )
+        self._db.touch_chat(draft.chat_id)
+        return {"type": "error", "message": error or "", "assistant_message": saved}
+
+    def execute_message(
+        self,
+        chat_id: str,
+        user_msg: Message,
+        draft: Message,
+        get_facts: bool = False,
+        sliding_window: bool = False,
+        autosummary: str = "off",
+        branch: Optional[int] = None,
+        use_stream: bool = True,
+        token: Optional[CancelToken] = None,
+    ) -> Iterator[dict]:
+        """Ответ на сообщение пользователя — генератор событий запуска.
+        Последнее событие — всегда `done`, `cancelled` или `error`."""
+        chat = self._require_chat(chat_id)
+        agent = self._require_agent(chat.agent_id)
+        text = user_msg.content
+        acc = _TurnAccumulator()
+        started = time.monotonic()
+        with self._lock_for(chat_id):
+            try:
+                messages = self._history_for_context(chat_id, branch, before_id=user_msg.id)
+                provider_messages, latest_facts, facts_boundary = self._resolve_send_context(
+                    chat, agent, messages, text, get_facts, sliding_window, autosummary
+                )
+                provider_name, model_id = _split_model(chat.settings.model)
+                provider = self._registry.get(provider_name)
+                request_settings = self._settings_with_merged_tools(chat)
+
+                status_text = "Выполняется запрос к модели"
+                yield {"type": "status", "status": status_text}
+                final_result, final_content = yield from self._model_turn(
+                    provider, model_id, provider_messages, request_settings, chat, agent, acc,
+                    use_stream=use_stream, token=token, status_text=status_text,
+                )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                # Токены НА ВХОД этого обмена (показываются под сообщением
+                # пользователя) известны только из usage ответа провайдера.
+                if final_result.usage.prompt_tokens is not None:
+                    self._db.update_message_prompt_tokens(user_msg.id, final_result.usage.prompt_tokens)
+                assistant_msg = self._finalize_draft(
+                    draft, content=final_content, status="complete", result=final_result,
+                    duration_ms=duration_ms, acc=acc,
+                )
+                yield {"type": "message_saved", "message": assistant_msg}
+
+                # Факты и автосуммаризация — ПОСЛЕ основного ответа.
+                if get_facts:
+                    yield {"type": "status", "status": "Обновление фактов"}
+                    dialogue = self._dialogue_since(messages, facts_boundary)
+                    updated_facts = self._extract_facts(chat, latest_facts, dialogue, text, final_result.content)
+                    facts_json = json.dumps(updated_facts, ensure_ascii=False)
+                    self._db.update_message_facts(assistant_msg.id, facts_json)
+                    assistant_msg = dataclasses.replace(assistant_msg, facts=facts_json)
+                if autosummary != "off" and self._autosummary_due(chat, messages, autosummary):
+                    yield {"type": "status", "status": "Выполняется суммаризация чата"}
+                    refreshed_user = self._db.get_message(user_msg.id) or user_msg
+                    self._summarize_after_send(chat, messages, refreshed_user, assistant_msg)
+                self._db.touch_chat(chat_id)
+                yield {"type": "done", "message": assistant_msg}
+            except RunCancelled as exc:
+                yield self._terminal_after_interrupt(draft, acc, started, cancelled=exc)
+            except ProviderError as exc:
+                yield self._terminal_after_interrupt(draft, acc, started, error=str(exc))
+
+    def execute_task_step(
+        self,
+        chat_id: str,
+        task_id: str,
+        draft: Message,
+        auto_pause: bool = True,
+        use_stream: bool = True,
+        token: Optional[CancelToken] = None,
+    ) -> Iterator[dict]:
+        """Один шаг Менеджера задач — генератор событий. Итоговое `done`
+        дополнительно несёт `should_continue` и `task_status` (см.
+        `run_task_manager_step`)."""
+        chat, task = self.validate_task_step(chat_id, task_id)
+        agent = self._require_agent(chat.agent_id)
+        current_status = self._task_status(task)
+        acc = _TurnAccumulator()
+        started = time.monotonic()
+        with self._lock_for(chat_id):
+            try:
+                max_steps = chat.settings.task_manager_max_steps
+                if max_steps > 0 and self._consecutive_task_manager_steps(chat_id, exclude_id=draft.id) >= max_steps:
+                    notice = (
+                        "Достигнут лимит автоматических шагов Менеджера задач подряд — нажмите "
+                        "«Продолжить», чтобы продолжить вручную."
+                    )
+                    saved = self._finalize_draft(draft, content=notice, status="complete")
+                    self._db.touch_chat(chat_id)
+                    yield {"type": "done", "message": saved, "should_continue": False, "task_status": current_status}
+                    return
+
+                messages = self._history_for_context(chat_id, None, before_id=draft.id)
+                continue_text = self._task_manager_continue_text(task)
+                provider_messages = self._build_request_context(chat, agent, messages, continue_text)
+                provider_name, model_id = _split_model(chat.settings.model)
+                provider = self._registry.get(provider_name)
+                request_settings = self._settings_with_merged_tools(chat)
+
+                status_text = "Менеджер задач продолжает работу"
+                yield {"type": "status", "status": status_text}
+                final_result, final_content = yield from self._model_turn(
+                    provider, model_id, provider_messages, request_settings, chat, agent, acc,
+                    use_stream=use_stream, token=token, status_text=status_text, auto_pause=auto_pause,
+                )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                saved = self._finalize_draft(
+                    draft, content=final_content, status="complete", result=final_result,
+                    duration_ms=duration_ms, acc=acc,
+                )
+                yield {"type": "message_saved", "message": saved}
+                self._db.touch_chat(chat_id)
+
+                refreshed_task = self._db.get_task(task_id)
+                new_status = self._task_status(refreshed_task) if refreshed_task is not None else current_status
+                advanced_this_task = any(
+                    e.get("task_id") == task_id and e.get("kind") == "advance" for e in acc.task_events
+                )
+                should_continue = new_status == "active" and advanced_this_task
+                yield {"type": "done", "message": saved, "should_continue": should_continue, "task_status": new_status}
+            except RunCancelled as exc:
+                yield self._terminal_after_interrupt(draft, acc, started, cancelled=exc)
+            except ProviderError as exc:
+                yield self._terminal_after_interrupt(draft, acc, started, error=str(exc))
+
+    # ---- синхронные варианты (без фонового пула; тесты и внутренние вызовы) ----
+
     def send_message_blocking(
         self,
         chat_id: str,
@@ -2208,98 +2636,18 @@ class Repository:
         autosummary: str = "off",
         branch: Optional[int] = None,
     ) -> Tuple[Message, Message]:
-        chat = self._require_chat(chat_id)
-        agent = self._require_agent(chat.agent_id)
-        with self._lock_for(chat_id):
-            all_messages = self._db.list_messages(chat_id)
-            messages = self._filter_by_branch(all_messages, branch)
-            if get_facts:
-                self._validate_sticky_facts_config(chat)
-            if sliding_window:
-                self._validate_sliding_window_config(chat)
-            if autosummary != "off":
-                self._validate_autosummary_send_config(chat, autosummary)
-            provider_messages, latest_facts, facts_boundary = self._resolve_send_context(
-                chat, agent, messages, text, get_facts, sliding_window, autosummary
-            )
-            provider_name, model_id = _split_model(chat.settings.model)
-            provider = self._registry.get(provider_name)
-            request_settings = self._settings_with_merged_tools(chat)
-
-            user_msg = self._db.add_message(
-                Message(
-                    id=0, chat_id=chat_id, role="user", content=text, created_at=int(time.time()),
-                    format=detect_message_format(text), branch=branch or 0,
-                )
-            )
-
-            task_events: List[dict] = []
-            mcp_events: List[dict] = []
-            started = time.monotonic()
-            try:
-                result = provider.chat(model_id, provider_messages, request_settings)
-                # Единый механизм tool-calling: если модель запросила вызов
-                # функций (памяти и/или скиллов активного профиля) — выполняем
-                # их и повторяем запрос, пока модель не ответит обычным
-                # текстом (или не будет достигнут предел итераций). Сам обмен
-                # "вызов -> результат" НЕ сохраняется как сообщения чата —
-                # в истории остаётся только финальный текстовый ответ (кроме
-                # событий задач — см. Message.task_events — и вызовов через
-                # MCP-сервер, см. Message.mcp_events).
-                result = self._run_tool_loop_blocking(
-                    provider, model_id, provider_messages, request_settings, chat, agent, result,
-                    events=task_events, mcp_events=mcp_events,
-                )
-                # "Инварианты" (новое ТЗ) — код-уровневая проверка + один
-                # переспрос модели при нарушении; текст предупреждения (если
-                # было нарушение) выводится ПЕРЕД ответом в интерфейсе чата —
-                # здесь это реализовано как префикс самого сохраняемого
-                # сообщения ассистента (см. `_validate_and_maybe_retry`).
-                result, violation_warning = self._validate_and_maybe_retry(
-                    provider, model_id, provider_messages, request_settings, chat, agent, result,
-                    events=task_events,
-                )
-            except ProviderError as exc:
-                self._db.add_message(
-                    Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=branch or 0)
-                )
-                self._db.touch_chat(chat_id)
-                raise
-            duration_ms = int((time.monotonic() - started) * 1000)
-            final_content = f"{violation_warning}\n\n{result.content}" if violation_warning else result.content
-
-            assistant_msg = self._db.add_message(
-                Message(
-                    id=0, chat_id=chat_id, role="assistant", content=final_content,
-                    created_at=int(time.time()), reasoning_content=result.reasoning_content,
-                    duration_ms=duration_ms, total_tokens=result.usage.total_tokens,
-                    prompt_tokens=result.usage.prompt_tokens, completion_tokens=result.usage.completion_tokens,
-                    format=detect_message_format(final_content), branch=branch or 0,
-                    task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
-                    mcp_events=json.dumps(mcp_events, ensure_ascii=False) if mcp_events else None,
-                )
-            )
-
-            # Токены НА ВХОД этого конкретного обмена (для отображения под
-            # сообщением ПОЛЬЗОВАТЕЛЯ) известны только сейчас, из usage ответа
-            # провайдера — пользовательское сообщение уже сохранено раньше,
-            # поэтому здесь проставляются постфактум.
-            if result.usage.prompt_tokens is not None:
-                self._db.update_message_prompt_tokens(user_msg.id, result.usage.prompt_tokens)
-                user_msg = dataclasses.replace(user_msg, prompt_tokens=result.usage.prompt_tokens)
-
-            if get_facts:
-                dialogue = self._dialogue_since(messages, facts_boundary)
-                updated_facts = self._extract_facts(chat, latest_facts, dialogue, text, result.content)
-                facts_json = json.dumps(updated_facts, ensure_ascii=False)
-                self._db.update_message_facts(assistant_msg.id, facts_json)
-                assistant_msg = dataclasses.replace(assistant_msg, facts=facts_json)
-
-            if autosummary != "off" and self._autosummary_due(chat, messages, autosummary):
-                self._summarize_after_send(chat, messages, user_msg, assistant_msg)
-
-            self._db.touch_chat(chat_id)
-            return user_msg, assistant_msg
+        """Синхронная отправка: ждёт ответа целиком. Сбой провайдера —
+        `ProviderError` (черновик ответа сохраняется со статусом "failed")."""
+        _, user_msg, draft = self.prepare_message_run(chat_id, text, get_facts, sliding_window, autosummary, branch)
+        final: Optional[Message] = None
+        for event in self.execute_message(
+            chat_id, user_msg, draft, get_facts, sliding_window, autosummary, branch, use_stream=False,
+        ):
+            if event["type"] == "done":
+                final = event["message"]
+            elif event["type"] == "error":
+                raise ProviderError(event.get("message") or "provider error")
+        return self._db.get_message(user_msg.id) or user_msg, final
 
     def stream_message(
         self,
@@ -2310,163 +2658,15 @@ class Repository:
         autosummary: str = "off",
         branch: Optional[int] = None,
     ) -> Iterator[dict]:
-        chat = self._require_chat(chat_id)
-        agent = self._require_agent(chat.agent_id)
-        lock = self._lock_for(chat_id)
-        lock.acquire()
-        try:
-            all_messages = self._db.list_messages(chat_id)
-            messages = self._filter_by_branch(all_messages, branch)
-            if get_facts:
-                self._validate_sticky_facts_config(chat)
-            if sliding_window:
-                self._validate_sliding_window_config(chat)
-            if autosummary != "off":
-                self._validate_autosummary_send_config(chat, autosummary)
-            provider_messages, latest_facts, facts_boundary = self._resolve_send_context(
-                chat, agent, messages, text, get_facts, sliding_window, autosummary
-            )
-            provider_name, model_id = _split_model(chat.settings.model)
-            provider = self._registry.get(provider_name)
-            request_settings = self._settings_with_merged_tools(chat)
-
-            user_msg = self._db.add_message(
-                Message(
-                    id=0, chat_id=chat_id, role="user", content=text, created_at=int(time.time()),
-                    format=detect_message_format(text), branch=branch or 0,
-                )
-            )
-
-            # Статус вызова для отображения в клиенте (замена нейтрального
-            # "Модель рассуждает…" на реальную фазу выполнения запроса).
-            yield {"type": "status", "status": "Выполняется запрос к модели"}
-
-            started = time.monotonic()
-            try:
-                # Единый механизм tool-calling в потоковом режиме: каждая
-                # "итерация" — один полный потоковый вызов провайдера; если
-                # финальный результат итерации несёт tool_calls, выполняем их,
-                # добавляем сообщения вызова/результата в контекст и запускаем
-                # СЛЕДУЮЩУЮ потоковую итерацию — клиент в этот момент видит
-                # промежуточный статус, а не разрыв соединения. Итоговое
-                # сообщение ассистента, сохраняемое в чат, — это только
-                # содержимое ПОСЛЕДНЕЙ итерации (той, что уже не запросила
-                # новых вызовов); сам обмен "вызов -> результат" в историю
-                # чата не попадает.
-                final_result: Optional[ChatResult] = None
-                task_events: List[dict] = []
-                mcp_events: List[dict] = []
-                iterations = 0
-                while True:
-                    done_result: Optional[ChatResult] = None
-                    for delta in provider.stream_chat(model_id, provider_messages, request_settings):
-                        if delta.done:
-                            done_result = delta.result
-                        else:
-                            yield {"type": "delta", "content": delta.content, "reasoning_content": delta.reasoning_content}
-                    if done_result is not None and done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
-                        yield {"type": "status", "status": "Выполняется вызов инструментов"}
-                        provider_messages.append(
-                            ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
-                        )
-                        for call in done_result.tool_calls:
-                            mcp_events_before = len(mcp_events)
-                            tool_output = self._execute_tool_call(
-                                chat, agent, call, events=task_events, mcp_events=mcp_events,
-                                allowed_mcp_names=self._offered_tool_names(request_settings),
-                            )
-                            # Новые события MCP (см. Message.mcp_events) уходят в поток СРАЗУ
-                            # (started/finished этого конкретного вызова), а не только постфактум
-                            # в сохранённом сообщении — клиент показывает "Инструмент: <name>" по
-                            # ходу генерации, не дожидаясь конца ответа.
-                            for mcp_event in mcp_events[mcp_events_before:]:
-                                yield mcp_event
-                            fn_name = (call.get("function") or {}).get("name")
-                            provider_messages.append(
-                                ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
-                            )
-                        iterations += 1
-                        yield {"type": "status", "status": "Выполняется запрос к модели"}
-                        continue
-                    final_result = done_result
-                    break
-
-                # Реальный баг, найденный на практике: если `tool_calls` у
-                # `final_result` всё ещё непуст — цикл выше оборвался по
-                # `_MAX_TOOL_ITERATIONS`, а не потому что модель закончила
-                # сама, и `final_result.content` в этом случае часто пуст
-                # (см. `_finalize_after_tool_cap`) — без этого шага
-                # пользователь получал бы пустое сообщение вместо ответа.
-                if final_result is not None and final_result.tool_calls:
-                    yield {"type": "status", "status": "Формулирую итоговый ответ"}
-                    final_result = self._finalize_after_tool_cap(
-                        provider, model_id, provider_messages, request_settings, final_result,
-                    )
-
-                # "Инварианты" (новое ТЗ) — та же код-уровневая проверка +
-                # переспрос, что и в `send_message_blocking` (см.
-                # `_validate_and_maybe_retry`); переспрос делается ОДНИМ
-                # блокирующим вызовом (не повторным стримом) ради простоты —
-                # это редкий путь (только при нарушении), в отличие от
-                # основного, всегда потокового, ответа. Предупреждение
-                # выводится ПЕРЕД ответом: отдельным `delta`-событием до
-                # того, как в поток уйдёт (пере-сгенерированный) текст ответа.
-                final_result, violation_warning = self._validate_and_maybe_retry(
-                    provider, model_id, provider_messages, request_settings, chat, agent, final_result,
-                    events=task_events,
-                )
-                if violation_warning:
-                    yield {"type": "delta", "content": f"{violation_warning}\n\n", "reasoning_content": None}
-                    yield {"type": "delta", "content": final_result.content, "reasoning_content": None}
-                final_content = f"{violation_warning}\n\n{final_result.content}" if violation_warning else final_result.content
-
-                duration_ms = int((time.monotonic() - started) * 1000)
-                if final_result.usage.prompt_tokens is not None:
-                    self._db.update_message_prompt_tokens(user_msg.id, final_result.usage.prompt_tokens)
-                assistant_msg = self._db.add_message(
-                    Message(
-                        id=0, chat_id=chat_id, role="assistant", content=final_content,
-                        created_at=int(time.time()), reasoning_content=final_result.reasoning_content,
-                        duration_ms=duration_ms, total_tokens=final_result.usage.total_tokens,
-                        prompt_tokens=final_result.usage.prompt_tokens,
-                        completion_tokens=final_result.usage.completion_tokens,
-                        format=detect_message_format(final_content), branch=branch or 0,
-                        task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
-                        mcp_events=json.dumps(mcp_events, ensure_ascii=False) if mcp_events else None,
-                    )
-                )
-                # Обновление фактов — ПОСЛЕ основного ответа модели и
-                # ТОЛЬКО теперь, когда потоковая генерация полностью
-                # завершена (см. Доработка: раньше get_facts был вовсе
-                # недоступен в потоковом режиме). Статус отдельным
-                # событием — извлечение может занять заметное время, а
-                # клиент к этому моменту уже показал весь текст ответа.
-                if get_facts:
-                    yield {"type": "status", "status": "Обновление фактов"}
-                    dialogue = self._dialogue_since(messages, facts_boundary)
-                    updated_facts = self._extract_facts(
-                        chat, latest_facts, dialogue, text, final_result.content
-                    )
-                    facts_json = json.dumps(updated_facts, ensure_ascii=False)
-                    self._db.update_message_facts(assistant_msg.id, facts_json)
-                    assistant_msg = dataclasses.replace(assistant_msg, facts=facts_json)
-                # Автосуммаризация — тоже ПОСЛЕ основного ответа, как и
-                # обновление фактов выше; статус отдаётся отдельным
-                # событием, но только если суммаризация действительно
-                # потребовалась (а не при каждой отправке с этим флагом).
-                if autosummary != "off" and self._autosummary_due(chat, messages, autosummary):
-                    yield {"type": "status", "status": "Выполняется суммаризация чата"}
-                    self._summarize_after_send(chat, messages, user_msg, assistant_msg)
-                self._db.touch_chat(chat_id)
-                yield {"type": "done", "message": assistant_msg}
-            except ProviderError as exc:
-                self._db.add_message(
-                    Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=branch or 0)
-                )
-                self._db.touch_chat(chat_id)
-                yield {"type": "error", "message": str(exc)}
-        finally:
-            lock.release()
+        """Потоковая отправка синхронно, в текущем потоке: те же события,
+        что и в ленте запуска (`status`/`delta`/`tool_call`/`task_event`/
+        `done`/`error`/`cancelled`), но без номеров. Клиенты работают через
+        `runs.RunManager`."""
+        _, user_msg, draft = self.prepare_message_run(chat_id, text, get_facts, sliding_window, autosummary, branch)
+        for event in self.execute_message(
+            chat_id, user_msg, draft, get_facts, sliding_window, autosummary, branch, use_stream=True,
+        ):
+            yield event
 
     # ---- "Менеджер задач" (обновление "Дня 13") ------------------------------
     #
@@ -2498,16 +2698,19 @@ class Repository:
             "Если этап пройден — продвинь его вызовом apply_task_action, как обычно."
         )
 
-    def _consecutive_task_manager_steps(self, chat_id: str) -> int:
+    def _consecutive_task_manager_steps(self, chat_id: str, exclude_id: Optional[int] = None) -> int:
         """Подряд идущие сообщения ассистента с `is_task_manager_step=True`
         считая с конца истории чата, до первого сообщения другого рода
         (обычный ответ на реальное сообщение пользователя, ошибка и т.п.) —
         используется как защита от зацикливания (см.
         `Settings.task_manager_max_steps`). Считается на уровне ЧАТА в
         целом, а не отдельной задачи — упрощение: в рамках одного чата
-        обычно ведётся не более одной активной задачи одновременно."""
+        обычно ведётся не более одной активной задачи одновременно.
+        `exclude_id` — черновик текущего шага, он в счёт не входит."""
         count = 0
         for m in reversed(self._db.list_messages(chat_id)):
+            if exclude_id is not None and m.id == exclude_id:
+                continue
             if m.role == "assistant" and m.is_task_manager_step:
                 count += 1
                 continue
@@ -2515,151 +2718,81 @@ class Repository:
         return count
 
     def run_task_manager_step(self, chat_id: str, task_id: str, auto_pause: bool = True) -> Iterator[dict]:
-        """Один автономный шаг "Менеджера задач" — тот же формат событий,
-        что и `stream_message` (`status`/`delta`/`done`/`error`), но `done`
-        дополнительно несёт `should_continue` (клиент вызывает этот метод
-        ещё раз, если true) и `task_status` (актуальный статус задачи после
-        шага). Требует `task_tracking_enabled=true` и статус задачи ЛЮБОЙ,
-        кроме "done" — иначе `ValidationError`.
+        """Один автономный шаг "Менеджера задач" — синхронно, теми же
+        событиями, что и лента запуска (`done` несёт
+        `should_continue` и `task_status`). Требует `task_tracking_enabled=true`
+        и статус задачи ЛЮБОЙ, кроме "done" — иначе `ValidationError`.
 
-        `auto_pause` (редизайн "Менеджера задач", кнопки "Продолжить"/
-        "Выполнить" — замечание пользователя): `true` (по умолчанию, кнопка
-        "Продолжить") — задача МОЖЕТ быть на паузе прямо сейчас (это
-        нормально: "Продолжить" одним действием снимает паузу И продвигает
-        этап, т.к. допустимость перехода определяется `can_transition` и не
-        зависит от статуса паузы), но после того как модель продвинет её
-        вызовом `apply_task_action` (kind="advance"), шаг сам поставит её на
-        паузу заново — `should_continue` в этом случае приходит `false`,
-        клиент вызывает эндпоинт ещё раз только по новому нажатию
-        пользователя. `false` (кнопка "Выполнить") — пауза не вставляется
-        автоматически, `should_continue=true` до состояния done (или пока
-        модель не остановится сама) — клиент вызывает эндпоинт в цикле;
-        пользователь может прервать цикл в любой момент отдельным вызовом
-        ручного действия "Пауза" (см. `apply_manual_task_action`)."""
+        `auto_pause`: `true` (кнопка "Продолжить") — после продвижения этапа
+        шаг сам ставит задачу на паузу, `should_continue=false`; `false`
+        (кнопка "Выполнить") — пауза не вставляется, `should_continue=true`
+        до состояния done. Серверный цикл шагов «до конца» — в
+        `runs.RunManager.start_task_run` (запуск `task_run`)."""
+        self.validate_task_step(chat_id, task_id)
+        draft = self.prepare_task_step_draft(chat_id)
+        yield from self.execute_task_step(chat_id, task_id, draft, auto_pause=auto_pause, use_stream=True)
+
+    def create_task_direct(
+        self, chat_id: str, title: str, description: str = "", source: str = "app",
+    ) -> Tuple[dict, Message]:
+        """Создание задачи напрямую, без участия модели (ТЗ, раздел 2.3 —
+        нужно планировщику: вид задачи «Задача агенту»). В ленту чата
+        добавляется сообщение-запрос «Задача: …» от имени `source`, чтобы
+        пользователь видел, откуда задача взялась; модель видит название и
+        описание в блоке [ЗАДАЧА]. Задача создаётся не на паузе — её можно
+        сразу выполнять запуском Менеджера задач."""
         chat = self._require_chat(chat_id)
-        agent = self._require_agent(chat.agent_id)
-        task = self._require_task(task_id)
-        if task.chat_id != chat_id:
-            raise NotFoundError(f"task {task_id!r} does not belong to chat {chat_id!r}")
         if not chat.settings.task_tracking_enabled:
-            raise ValidationError("task tracking is disabled for this chat")
-        current_status = self._task_status(task)
-        if current_status == "done":
-            raise ValidationError("task is already done; task manager is not applicable")
+            raise PreconditionFailedError("В чате выключены задачи (task_tracking_enabled)")
+        title = (title or "").strip()
+        if not title:
+            raise ValidationError("title must be a non-empty string")
+        description = (description or "").strip()
+        task = self._db.create_task(chat_id, title, plan=[], description=description)
+        text = f"Задача: {title}" + (f"\n\n{description}" if description else "")
+        message = self._db.add_message(Message(
+            id=0, chat_id=chat_id, role="user", content=text, created_at=int(time.time()),
+            format=detect_message_format(text), branch=0, source=source,
+        ))
+        self._db.touch_chat(chat_id)
+        if source == "scheduler":
+            self._publish_unread(chat_id)
+        return self._task_summary(task, chat.title), message
 
-        lock = self._lock_for(chat_id)
-        lock.acquire()
-        try:
-            max_steps = chat.settings.task_manager_max_steps
-            if max_steps > 0 and self._consecutive_task_manager_steps(chat_id) >= max_steps:
-                notice = (
-                    "Достигнут лимит автоматических шагов Менеджера задач подряд — нажмите "
-                    "«Продолжить», чтобы продолжить вручную."
-                )
-                assistant_msg = self._db.add_message(Message(
-                    id=0, chat_id=chat_id, role="assistant", content=notice,
-                    created_at=int(time.time()), format="text", branch=0,
-                    is_task_manager_step=True,
-                ))
-                self._db.touch_chat(chat_id)
-                yield {"type": "done", "message": assistant_msg, "should_continue": False, "task_status": current_status}
-                return
+    # ---- непрочитанные и общая лента изменений (ТЗ, раздел 2.6) --------------
 
-            all_messages = self._db.list_messages(chat_id)
-            messages = self._filter_by_branch(all_messages, None)
-            continue_text = self._task_manager_continue_text(task)
-            provider_messages = self._build_request_context(chat, agent, messages, continue_text)
-            provider_name, model_id = _split_model(chat.settings.model)
-            provider = self._registry.get(provider_name)
-            request_settings = self._settings_with_merged_tools(chat)
+    def chat_activity(self, chat_ids: Optional[List[str]] = None) -> Dict[str, dict]:
+        return self._db.chat_activity(chat_ids)
 
-            yield {"type": "status", "status": "Менеджер задач продолжает работу"}
+    def _activity_for(self, chat_id: str) -> dict:
+        return self._db.chat_activity([chat_id]).get(chat_id) or {
+            "unread_count": 0, "first_unread_message_id": None, "last_message_at": None, "preview": None,
+        }
 
-            started = time.monotonic()
-            try:
-                final_result: Optional[ChatResult] = None
-                task_events: List[dict] = []
-                mcp_events: List[dict] = []
-                iterations = 0
-                while True:
-                    done_result: Optional[ChatResult] = None
-                    for delta in provider.stream_chat(model_id, provider_messages, request_settings):
-                        if delta.done:
-                            done_result = delta.result
-                        else:
-                            yield {"type": "delta", "content": delta.content, "reasoning_content": delta.reasoning_content}
-                    if done_result is not None and done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
-                        yield {"type": "status", "status": "Выполняется вызов инструментов"}
-                        provider_messages.append(
-                            ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
-                        )
-                        for call in done_result.tool_calls:
-                            mcp_events_before = len(mcp_events)
-                            tool_output = self._execute_tool_call(
-                                chat, agent, call, events=task_events, auto_pause=auto_pause, mcp_events=mcp_events,
-                                allowed_mcp_names=self._offered_tool_names(request_settings),
-                            )
-                            for mcp_event in mcp_events[mcp_events_before:]:
-                                yield mcp_event
-                            fn_name = (call.get("function") or {}).get("name")
-                            provider_messages.append(
-                                ProviderMessage("tool", tool_output, tool_call_id=call.get("id"), name=fn_name)
-                            )
-                        iterations += 1
-                        yield {"type": "status", "status": "Менеджер задач продолжает работу"}
-                        continue
-                    final_result = done_result
-                    break
+    def _publish_unread(self, chat_id: str) -> None:
+        self.events.publish({"type": "unread_changed", "chat_id": chat_id, **self._activity_for(chat_id)})
 
-                # См. аналогичное исправление и комментарий в `stream_message`
-                # выше и в `_finalize_after_tool_cap` — тот же баг актуален и
-                # для потокового продолжения Менеджера задач.
-                if final_result is not None and final_result.tool_calls:
-                    yield {"type": "status", "status": "Формулирую итоговый ответ"}
-                    final_result = self._finalize_after_tool_cap(
-                        provider, model_id, provider_messages, request_settings, final_result,
-                    )
+    def _publish_chat_event(self, kind: str, chat_id: str, agent_id: Optional[str] = None) -> None:
+        event = {"type": kind, "chat_id": chat_id}
+        if agent_id is not None:
+            event["agent_id"] = agent_id
+        self.events.publish(event)
 
-                # "Инварианты" (новое ТЗ) — код-уровневая проверка + один
-                # переспрос модели при нарушении, тот же путь, что и в
-                # `stream_message` (см. `_validate_and_maybe_retry`).
-                # Предупреждение выводится ПЕРЕД ответом: отдельным
-                # `delta`-событием до (пере-сгенерированного) текста ответа.
-                final_result, violation_warning = self._validate_and_maybe_retry(
-                    provider, model_id, provider_messages, request_settings, chat, agent, final_result,
-                    events=task_events,
-                )
-                if violation_warning:
-                    yield {"type": "delta", "content": f"{violation_warning}\n\n", "reasoning_content": None}
-                    yield {"type": "delta", "content": final_result.content, "reasoning_content": None}
-                final_content = f"{violation_warning}\n\n{final_result.content}" if violation_warning else final_result.content
+    def mark_chat_read(self, chat_id: str, message_id: int) -> dict:
+        """Отметка «прочитано до сообщения `message_id`» — только вперёд."""
+        self._require_chat(chat_id)
+        self._db.set_last_read(chat_id, message_id)
+        self._publish_unread(chat_id)
+        return self._activity_for(chat_id)
 
-                duration_ms = int((time.monotonic() - started) * 1000)
-                assistant_msg = self._db.add_message(Message(
-                    id=0, chat_id=chat_id, role="assistant", content=final_content,
-                    created_at=int(time.time()), reasoning_content=final_result.reasoning_content,
-                    duration_ms=duration_ms, total_tokens=final_result.usage.total_tokens,
-                    prompt_tokens=final_result.usage.prompt_tokens,
-                    completion_tokens=final_result.usage.completion_tokens,
-                    format=detect_message_format(final_content), branch=0,
-                    task_events=json.dumps(task_events, ensure_ascii=False) if task_events else None,
-                    mcp_events=json.dumps(mcp_events, ensure_ascii=False) if mcp_events else None,
-                    is_task_manager_step=True,
-                ))
-                self._db.touch_chat(chat_id)
 
-                refreshed_task = self._db.get_task(task_id)
-                new_status = self._task_status(refreshed_task) if refreshed_task is not None else current_status
-                advanced_this_task = any(
-                    e.get("task_id") == task_id and e.get("kind") == "advance" for e in task_events
-                )
-                should_continue = new_status == "active" and advanced_this_task
-                yield {"type": "done", "message": assistant_msg, "should_continue": should_continue, "task_status": new_status}
-            except ProviderError as exc:
-                self._db.add_message(
-                    Message(id=0, chat_id=chat_id, role="error", content=str(exc), created_at=int(time.time()), branch=0)
-                )
-                self._db.touch_chat(chat_id)
-                yield {"type": "error", "message": str(exc)}
-        finally:
-            lock.release()
+class _TurnAccumulator:
+    """Накопитель одного ответа: события задач и всех инструментов (уходят
+    в итоговое сообщение) и частичный текст (сохраняется, если ответ
+    остановлен или завершился ошибкой)."""
+
+    def __init__(self) -> None:
+        self.task_events: List[dict] = []
+        self.tool_events: List[dict] = []
+        self.partial_content: List[str] = []
+        self.partial_reasoning: List[str] = []

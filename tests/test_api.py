@@ -31,24 +31,28 @@ if FASTAPI_AVAILABLE:
 class ApiTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = make_repository()
-        app = create_app_with_repository(self.repo)
-        self.client = TestClient(app)
+        self.app = create_app_with_repository(self.repo)
+        self.client = TestClient(self.app)
 
     def tearDown(self) -> None:
+        self.app.state.run_manager.shutdown(wait=True)
         try:
             os.unlink(self.repo._db_path_for_cleanup)  # type: ignore[attr-defined]
         except OSError:
             pass
 
+    def _send(self, chat_id: str, text: str, **extra):
+        """Отправить сообщение запуском и дождаться его завершения."""
+        resp = self.client.post(f"/chats/{chat_id}/runs", json={"text": text, **extra})
+        if resp.status_code == 202:
+            self.app.state.run_manager.wait(resp.json()["run"]["id"], 5)
+        return resp
+
     def test_health(self):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertEqual(body["status"], "ok")
-        # Версия в /health — способ убедиться, что запущен задеплоенный код,
-        # а не старая версия сервиса (см. неоднократные жалобы на
-        # "настройки не сохраняются" из-за недезплоенного сервера).
-        self.assertTrue(body["version"])
+        self.assertEqual(body, {"status": "ok"})
 
     def test_validation_error_returns_error_key_not_detail(self):
         # Без обработчика RequestValidationError FastAPI по умолчанию
@@ -101,10 +105,10 @@ class ApiTestCase(unittest.TestCase):
         resp = self.client.put(f"/chats/{chat['id']}/settings", json={"model": "ollama:qwen3:0.6b"})
         self.assertEqual(resp.status_code, 400)
 
-        resp = self.client.post(f"/chats/{chat['id']}/messages", json={"text": "Привет"})
-        self.assertEqual(resp.status_code, 200)
-        body = resp.json()
-        self.assertEqual(body["assistant_message"]["content"], "echo: Привет")
+        resp = self._send(chat["id"], "Привет")
+        self.assertEqual(resp.status_code, 202)
+        messages = self.client.get(f"/chats/{chat['id']}/messages").json()
+        self.assertEqual(messages[-1]["content"], "echo: Привет")
 
         resp = self.client.get("/agents")
         self.assertEqual(resp.status_code, 200)
@@ -122,8 +126,8 @@ class ApiTestCase(unittest.TestCase):
     def test_message_bulk_delete_and_summarize(self):
         agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
         chat = self.client.post(f"/agents/{agent['id']}/chat", json={"title": "C1"}).json()
-        self.client.post(f"/chats/{chat['id']}/messages", json={"text": "1"})
-        self.client.post(f"/chats/{chat['id']}/messages", json={"text": "2"})
+        self._send(chat["id"], "1")
+        self._send(chat["id"], "2")
 
         messages = self.client.get(f"/chats/{chat['id']}/messages").json()
         ids = [m["id"] for m in messages[:2]]
@@ -134,6 +138,14 @@ class ApiTestCase(unittest.TestCase):
         resp = self.client.post(f"/chats/{chat['id']}/summarize")
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["is_summary"])
+
+    def test_new_agent_settings_endpoint(self):
+        self.client.put("/settings/default", json={"temperature": 0.3, "model": TEST_MODEL_ID})
+        resp = self.client.get("/settings/default/agent")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["temperature"], 0.3)
+        self.assertEqual(body["autosummary"], "off")
 
     def test_unknown_settings_field_is_400(self):
         agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
@@ -180,9 +192,9 @@ class ApiTestCase(unittest.TestCase):
     def test_chat_detail_branch_query_param_rescopes_stats(self):
         agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
         chat = self.client.post(f"/agents/{agent['id']}/chat", json={"title": "C1"}).json()
-        self.client.post(f"/chats/{chat['id']}/messages", json={"text": "root"})
+        self._send(chat["id"], "root")
         branch = self.client.post(f"/chats/{chat['id']}/branches", json={"name": "Alt"}).json()
-        self.client.post(f"/chats/{chat['id']}/messages", json={"text": "branch-msg", "branch": branch["number"]})
+        self._send(chat["id"], "branch-msg", branch=branch["number"])
 
         main_only = self.client.get(f"/chats/{chat['id']}", params={"branch": 0}).json()
         with_branch = self.client.get(f"/chats/{chat['id']}", params={"branch": branch["number"]}).json()
@@ -191,7 +203,7 @@ class ApiTestCase(unittest.TestCase):
     def test_get_facts_without_sticky_facts_strategy_is_400(self):
         agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
         chat = self.client.post(f"/agents/{agent['id']}/chat", json={"title": "C1"}).json()
-        resp = self.client.post(f"/chats/{chat['id']}/messages", json={"text": "Привет", "get_facts": True})
+        resp = self._send(chat["id"], "Привет", get_facts=True)
         self.assertEqual(resp.status_code, 400)
 
     def test_memory_snapshot_endpoint_returns_expected_shape(self):
@@ -276,6 +288,78 @@ class ApiTestCase(unittest.TestCase):
         self.assertIsNone(resp.json()["default_profile_id"])
         chat_after = self.client.get(f"/chats/{chat['id']}").json()
         self.assertEqual(chat_after["active_profile_id"], profile["id"])
+
+
+@unittest.skipUnless(FASTAPI_AVAILABLE, "fastapi не установлен в этом окружении")
+class RunsApiTests(unittest.TestCase):
+    """Асинхронные запуски, непрочитанные и общая лента по HTTP (ТЗ
+    «асинхронные ответы», этап 1)."""
+
+    def setUp(self) -> None:
+        import json as _json
+
+        self.json = _json
+        self.repo = make_repository()
+        self.app = create_app_with_repository(self.repo)
+        self.client = TestClient(self.app)
+        agent = self.client.post("/agent", json={"name": "A", "model": TEST_MODEL_ID}).json()
+        self.chat = self.client.post(f"/agents/{agent['id']}/chat", json={"title": "C"}).json()
+
+    def tearDown(self) -> None:
+        self.app.state.run_manager.shutdown(wait=True)
+        try:
+            os.unlink(self.repo._db_path_for_cleanup)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+    def _events(self, resp) -> list:
+        return [self.json.loads(line[len("data:"):].strip()) for line in resp.text.splitlines() if line.startswith("data:")]
+
+    def test_create_run_returns_draft_and_events_stream_completes(self):
+        resp = self.client.post(f"/chats/{self.chat['id']}/runs", json={"text": "Привет", "client_request_id": "x1"})
+        self.assertEqual(resp.status_code, 202, resp.text)
+        body = resp.json()
+        self.assertEqual(body["assistant_message"]["status"], "streaming")
+        run_id = body["run"]["id"]
+        self.app.state.run_manager.wait(run_id, 5)
+        events = self._events(self.client.get(f"/runs/{run_id}/events?after=0"))
+        self.assertEqual(events[0]["type"], "run_started")
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["message"]["content"], "echo: Привет")
+        snapshot = self.client.get(f"/runs/{run_id}").json()
+        self.assertEqual(snapshot["run"]["status"], "succeeded")
+        self.assertEqual(snapshot["snapshot_seq"], events[-1]["seq"])
+        # Повтор с тем же client_request_id — тот же запуск.
+        again = self.client.post(f"/chats/{self.chat['id']}/runs", json={"text": "Привет", "client_request_id": "x1"})
+        self.assertEqual(again.json()["run"]["id"], run_id)
+
+    def test_unread_count_and_mark_read(self):
+        run_id = self.client.post(f"/chats/{self.chat['id']}/runs", json={"text": "Привет"}).json()["run"]["id"]
+        self.app.state.run_manager.wait(run_id, 5)
+        chat = self.client.get(f"/chats/{self.chat['id']}").json()
+        self.assertEqual(chat["unread_count"], 1)
+        self.assertEqual(chat["preview"], "echo: Привет")
+        resp = self.client.post(f"/chats/{self.chat['id']}/read", json={"message_id": chat["first_unread_message_id"]})
+        self.assertEqual(resp.json()["unread_count"], 0)
+
+    def test_unknown_run_is_404_and_stale_cursor_is_410(self):
+        self.assertEqual(self.client.get("/runs/nope").status_code, 404)
+        cursor = self.client.get("/events/cursor").json()["cursor"]
+        self.assertEqual(self.client.get(f"/events?after={cursor + 1000}").status_code, 410)
+
+    def test_create_task_requires_tracking_then_runs(self):
+        resp = self.client.post(f"/chats/{self.chat['id']}/tasks", json={"title": "Задача"})
+        self.assertEqual(resp.status_code, 409)
+        self.client.put(f"/chats/{self.chat['id']}/settings", json={"task_tracking_enabled": True})
+        resp = self.client.post(
+            f"/chats/{self.chat['id']}/tasks",
+            json={"title": "Задача", "description": "Описание", "run": {"auto_pause": True}},
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+        body = resp.json()
+        self.assertEqual(body["message"]["content"], "Задача: Задача\n\nОписание")
+        self.assertEqual(body["run"]["kind"], "task_step")
+        self.assertIn(self.app.state.run_manager.wait(body["run"]["id"], 5).status, ("succeeded", "failed"))
 
 
 if __name__ == "__main__":

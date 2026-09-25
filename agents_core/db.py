@@ -11,9 +11,9 @@ agents_core.db
 была видна в одном месте и чтобы числовые колонки сохраняли affinity
 (REAL/INTEGER), а не подменялись TEXT из-за неявного приведения типов.
 
-`_ensure_column()` — простая защитная миграция: если сервис обновили поверх
-базы, созданной предыдущей версией (без новых колонок), недостающие колонки
-добавляются через `ALTER TABLE ... ADD COLUMN` при старте, без потери данных.
+Миграций нет: продукт в разработке, схема меняется вместе с кодом. После
+изменения схемы базу удаляют и создают заново (`CREATE TABLE IF NOT EXISTS`
+при старте). Перенос данных появится вместе с первой эксплуатируемой версией.
 """
 
 from __future__ import annotations
@@ -35,12 +35,12 @@ from .models import (
     Message,
     ModelInfo,
     Profile,
+    Run,
     Settings,
     Task,
     TaskTransitionLog,
     WorkingMemoryEntry,
 )
-from .task_state_machine import TaskState as TaskStateEnum
 
 # Колонки настроек (одинаковы для agents и chats) и их SQL-типы.
 _SETTINGS_COLUMNS = [
@@ -102,14 +102,19 @@ _DEFAULT_STATE_MACHINE_RULE_INVARIANT_TITLES = [
     "Нельзя делать финал без валидации",
 ]
 
-_MESSAGE_EXTRA_COLUMNS = [
-    ("format", "TEXT NOT NULL DEFAULT 'text'"),
-    ("branch", "INTEGER NOT NULL DEFAULT 0"),
-    ("facts", "TEXT"),
-    ("task_events", "TEXT"),
-    ("is_task_manager_step", "INTEGER NOT NULL DEFAULT 0"),
-    ("mcp_events", "TEXT"),
-]
+#: Поля сообщения, которые можно обновлять у черновика/финального ответа
+#: (`Database.update_message_fields`) — белый список, т.к. имена колонок
+#: подставляются в SQL.
+_MESSAGE_UPDATABLE_FIELDS = (
+    "content", "reasoning_content", "duration_ms", "total_tokens", "prompt_tokens", "completion_tokens",
+    "format", "facts", "task_events", "status", "tool_events", "error", "created_at",
+)
+
+#: Поля запуска, которые можно обновлять (`Database.update_run`).
+_RUN_UPDATABLE_FIELDS = (
+    "status", "current_status", "assistant_message_id", "user_message_id", "last_seq", "error",
+    "started_at", "finished_at", "task_id",
+)
 
 
 def _settings_to_row(settings: Settings) -> Dict[str, Any]:
@@ -151,7 +156,6 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
 
 
 def _row_to_settings(row: sqlite3.Row) -> Settings:
-    keys = row.keys()
     return Settings(
         model=row["model"],
         system_prompt=row["system_prompt"],
@@ -166,47 +170,23 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         stop_sequences=json.loads(row["stop_sequences"]) if row["stop_sequences"] else [],
         tool_choice=row["tool_choice"],
         tools_json=row["tools_json"] or "",
-        memory_tools_enabled=bool(row["memory_tools_enabled"]) if "memory_tools_enabled" in keys else False,
-        # ВАЖНО: это НЕ дефолт для новых агентов (тот теперь False — см.
-        # `Settings.working_memory_enabled`/`long_term_memory_enabled`) — это
-        # обратная совместимость ТОЛЬКО для строк, созданных ДО появления этих
-        # колонок: после ALTER TABLE такая строка первое время хранит NULL, а
-        # не 0/1, и здесь мы явно отличаем "значения нет" (мигрированная старая
-        # строка → True, не потерять то, что уже было включено) от "явно
-        # выключено" (0, в т.ч. для только что созданных агентов/чатов).
-        working_memory_enabled=(
-            bool(row["working_memory_enabled"])
-            if "working_memory_enabled" in keys and row["working_memory_enabled"] is not None
-            else True
-        ),
-        long_term_memory_enabled=(
-            bool(row["long_term_memory_enabled"])
-            if "long_term_memory_enabled" in keys and row["long_term_memory_enabled"] is not None
-            else True
-        ),
-        episodic_memory_enabled=bool(row["episodic_memory_enabled"]) if "episodic_memory_enabled" in keys and row["episodic_memory_enabled"] is not None else False,
-        semantic_memory_enabled=bool(row["semantic_memory_enabled"]) if "semantic_memory_enabled" in keys and row["semantic_memory_enabled"] is not None else False,
-        procedural_memory_enabled=bool(row["procedural_memory_enabled"]) if "procedural_memory_enabled" in keys and row["procedural_memory_enabled"] is not None else False,
-        # Новая фича — как и остальные новые типы памяти выше, по умолчанию
-        # ВЫКЛЮЧЕНА для строк, созданных до появления этой колонки (не было
-        # смысла включать задним числом то, чего раньше не существовало).
-        task_tracking_enabled=bool(row["task_tracking_enabled"]) if "task_tracking_enabled" in keys and row["task_tracking_enabled"] is not None else False,
-        # "Менеджер задач" — лимит шагов; для строк, созданных до появления
-        # этой колонки, используется встроенный дефолт (20), а не 0/выключено.
-        task_manager_max_steps=(
-            row["task_manager_max_steps"]
-            if "task_manager_max_steps" in keys and row["task_manager_max_steps"] is not None
-            else Settings.__dataclass_fields__["task_manager_max_steps"].default
-        ),
+        memory_tools_enabled=bool(row["memory_tools_enabled"]),
+        working_memory_enabled=bool(row["working_memory_enabled"]),
+        long_term_memory_enabled=bool(row["long_term_memory_enabled"]),
+        episodic_memory_enabled=bool(row["episodic_memory_enabled"]),
+        semantic_memory_enabled=bool(row["semantic_memory_enabled"]),
+        procedural_memory_enabled=bool(row["procedural_memory_enabled"]),
+        task_tracking_enabled=bool(row["task_tracking_enabled"]),
+        task_manager_max_steps=row["task_manager_max_steps"],
         summary_prompt=row["summary_prompt"],
-        summary_system_prompt=(row["summary_system_prompt"] if "summary_system_prompt" in keys else None)
+        summary_system_prompt=row["summary_system_prompt"]
         or Settings.__dataclass_fields__["summary_system_prompt"].default,
         autosummary=row["autosummary"] or "off",
         autosummary_by_messages=row["autosummary_by_messages"],
         autosummary_by_tokens=row["autosummary_by_tokens"],
-        context_strategy=row["context_strategy"] if "context_strategy" in keys else None,
-        context_strategy_limit=row["context_strategy_limit"] if "context_strategy_limit" in keys else None,
-        extraction_system_prompt=(row["extraction_system_prompt"] if "extraction_system_prompt" in keys else None)
+        context_strategy=row["context_strategy"],
+        context_strategy_limit=row["context_strategy_limit"],
+        extraction_system_prompt=row["extraction_system_prompt"]
         or Settings.__dataclass_fields__["extraction_system_prompt"].default,
         include_usage_in_stream=bool(row["include_usage_in_stream"]),
         logprobs=bool(row["logprobs"]),
@@ -232,7 +212,6 @@ def _default_settings_to_row(settings: DefaultSettings) -> Dict[str, Any]:
 
 
 def _row_to_default_settings(row: sqlite3.Row) -> DefaultSettings:
-    keys = row.keys()
     return DefaultSettings(
         model=row["model"],
         system_prompt=row["system_prompt"],
@@ -243,7 +222,7 @@ def _row_to_default_settings(row: sqlite3.Row) -> DefaultSettings:
         thinking_enabled=bool(row["thinking_enabled"]),
         reasoning_effort=row["reasoning_effort"],
         summary_prompt=row["summary_prompt"],
-        summary_system_prompt=(row["summary_system_prompt"] if "summary_system_prompt" in keys else None)
+        summary_system_prompt=row["summary_system_prompt"]
         or DefaultSettings.__dataclass_fields__["summary_system_prompt"].default,
         include_usage_in_stream=bool(row["include_usage_in_stream"]),
     )
@@ -256,26 +235,50 @@ class Database:
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path)
+        # Асинхронные запуски пишут в базу из нескольких рабочих потоков
+        # одновременно (черновики ответов разных чатов) — ждём освобождения
+        # блокировки, а не падаем сразу с "database is locked".
+        conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
 
-    def _ensure_column(self, conn: sqlite3.Connection, table: str, name: str, sql_type: str) -> None:
-        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-        if name not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
-
     def _init_schema(self) -> None:
         settings_cols_sql = ",\n".join(f"{name} {sql_type}" for name, sql_type in _SETTINGS_COLUMNS)
         default_settings_cols_sql = ",\n".join(f"{name} {sql_type}" for name, sql_type in _DEFAULT_SETTINGS_COLUMNS)
         with self._connect() as conn:
+            # WAL — читатели не блокируют писателя и наоборот (параллельные
+            # запуски в разных чатах + SSE-подписки, читающие черновики).
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(
                 f"""
+                CREATE TABLE IF NOT EXISTS runs (
+                    id TEXT PRIMARY KEY,
+                    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'app',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    current_status TEXT,
+                    request_json TEXT NOT NULL DEFAULT '{{}}',
+                    client_request_id TEXT,
+                    user_message_id INTEGER,
+                    assistant_message_id INTEGER,
+                    task_id TEXT,
+                    last_seq INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at INTEGER NOT NULL,
+                    started_at INTEGER,
+                    finished_at INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS idx_runs_chat_id ON runs(chat_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_client_request
+                    ON runs(chat_id, client_request_id) WHERE client_request_id IS NOT NULL;
+
                 CREATE TABLE IF NOT EXISTS default_settings (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     {default_settings_cols_sql}
@@ -287,6 +290,7 @@ class Database:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     default_profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL,
+                    invariant_ids TEXT,
                     {settings_cols_sql}
                 );
 
@@ -297,6 +301,9 @@ class Database:
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
                     active_profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL,
+                    invariant_ids TEXT,
+                    last_read_message_id INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'app',
                     {settings_cols_sql}
                 );
 
@@ -317,7 +324,11 @@ class Database:
                     facts TEXT,
                     task_events TEXT,
                     is_task_manager_step INTEGER NOT NULL DEFAULT 0,
-                    mcp_events TEXT
+                    status TEXT NOT NULL DEFAULT 'complete',
+                    run_id TEXT,
+                    tool_events TEXT,
+                    error TEXT,
+                    source TEXT NOT NULL DEFAULT 'app'
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_branches (
@@ -400,6 +411,7 @@ class Database:
                     id TEXT PRIMARY KEY,
                     chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
                     title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
                     state TEXT NOT NULL DEFAULT 'planning',
                     paused INTEGER NOT NULL DEFAULT 0,
                     plan TEXT NOT NULL DEFAULT '[]',
@@ -429,203 +441,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_task_transition_log_task_id ON task_transition_log(task_id);
                 """
             )
-            # Защитная миграция: если база создана предыдущей версией сервиса
-            # (до появления новых настроек/полей сообщения), добавляем
-            # недостающие колонки, не трогая уже накопленные данные.
-            for table in ("agents", "chats"):
-                for name, sql_type in _SETTINGS_COLUMNS:
-                    self._ensure_column(conn, table, name, sql_type)
-            for name, sql_type in _DEFAULT_SETTINGS_COLUMNS:
-                self._ensure_column(conn, "default_settings", name, sql_type)
-            for name, sql_type in _MESSAGE_EXTRA_COLUMNS:
-                self._ensure_column(conn, "messages", name, sql_type)
-            self._ensure_column(conn, "chats", "active_profile_id", "TEXT")
-            self._ensure_column(conn, "agents", "default_profile_id", "TEXT")
-            # "День 14" — набор id инвариантов, выбранных для агента/чата из
-            # общего справочника (см. `Invariant`), хранится как JSON-массив
-            # строк в одной колонке — по аналогии с `stop_sequences` в
-            # Settings, а не отдельной таблицей связей (множественный выбор
-            # без порядка и без дополнительных атрибутов самой связи не
-            # оправдывает отдельную M2M-таблицу).
-            self._ensure_column(conn, "agents", "invariant_ids", "TEXT")
-            self._ensure_column(conn, "chats", "invariant_ids", "TEXT")
-            self._migrate_profiles_to_global_catalog(conn)
-            self._migrate_task_catalog_to_code(conn)
             self._seed_task_state_machine_rule_invariants(conn)
-
-    def _migrate_profiles_to_global_catalog(self, conn: sqlite3.Connection) -> None:
-        """Раньше `profiles` были привязаны к ОДНОМУ агенту (`agent_id NOT
-        NULL REFERENCES agents(id) ON DELETE CASCADE`) — по замечанию
-        пользователя профили теперь общий справочник для ВСЕХ агентов
-        (выбираются в настройках любого агента/чата), поэтому убираем эту
-        привязку из схемы. SQLite не умеет ALTER TABLE DROP COLUMN/CONSTRAINT
-        для такого случая, поэтому пересобираем таблицу.
-
-        Порядок операций важен: если переименовать САМУ `profiles` (напр. в
-        `profiles_old`) при включённых внешних ключах, SQLite перезапишет
-        текст FK-определения в `chats.active_profile_id` на новое имя — и он
-        останется указывать на `profiles_old` даже после того, как мы создадим
-        новую таблицу `profiles` и удалим `profiles_old` (проверено вручную:
-        JOIN после такой последовательности молча возвращает NULL). Поэтому
-        вместо переименования исходной таблицы создаём НОВУЮ под временным
-        именем, переносим данные, удаляем СТАРУЮ `profiles`, и только потом
-        переименовываем новую в `profiles` — на этом шаге чужие FK ни на что
-        не указывают, переписывать нечего."""
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
-        if "agent_id" not in cols:
-            return  # уже мигрировано (или свежая база, сразу созданная по новой схеме)
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.executescript(
-            """
-            CREATE TABLE profiles__migrating_new (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                style TEXT,
-                format TEXT,
-                constraints TEXT,
-                skills_json TEXT NOT NULL DEFAULT '',
-                orchestration_prompt TEXT,
-                is_default INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            INSERT INTO profiles__migrating_new (
-                id, name, style, format, constraints, skills_json,
-                orchestration_prompt, is_default, created_at, updated_at
-            )
-            SELECT id, name, style, format, constraints, skills_json,
-                   orchestration_prompt, is_default, created_at, updated_at
-            FROM profiles;
-            DROP INDEX IF EXISTS idx_profiles_agent_id;
-            DROP TABLE profiles;
-            ALTER TABLE profiles__migrating_new RENAME TO profiles;
-            """
-        )
-        conn.execute("PRAGMA foreign_keys = ON")
-
-    def _migrate_task_catalog_to_code(self, conn: sqlite3.Connection) -> None:
-        """"Работу с задачами требуется переделать" (новое ТЗ) — раньше
-        состояния/действия/машины состояний были справочниками в БД
-        (task_states/task_actions/task_state_machines/task_machine_states/
-        task_transitions), а `tasks` ссылались на них (`machine_id`,
-        `current_state_id`). Теперь машина состояний в коде (см.
-        `task_state_machine.py`), а `tasks` хранят состояние строкой и явные
-        `plan`/`done_steps` (см. `models.Task`). Если обнаружена база,
-        развёрнутая ДО этого изменения, — переносим существующие задачи и
-        историю переходов на новую схему по лучшим усилиям (состояние — по
-        `system_name` старого справочника, с откатом на "planning", если имя
-        не совпадает ни с одним новым состоянием; статус паузы — по kind
-        последнего перехода из истории), а затем удаляем старые справочники
-        целиком. Явного действия "Отклонить" в новой модели нет — задачи,
-        ранее отклонённые (kind=DECLINE), переносятся с тем состоянием, в
-        которое их перевело это действие, с пометкой об этом в примечании
-        последнего перехода. Идемпотентно: если старых справочников уже нет
-        (свежая база или уже мигрировано), ничего не делает."""
-        tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        if "task_states" not in tables and "task_actions" not in tables and "task_state_machines" not in tables:
-            return
-        conn.execute("PRAGMA foreign_keys = OFF")
-        try:
-            tasks_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()} if "tasks" in tables else set()
-            if "machine_id" in tasks_cols:
-                state_names = {
-                    r["id"]: r["system_name"] for r in conn.execute("SELECT id, system_name FROM task_states").fetchall()
-                } if "task_states" in tables else {}
-                action_kinds = {
-                    r["id"]: (r["kind"] or "NORMAL") for r in conn.execute("SELECT id, kind FROM task_actions").fetchall()
-                } if "task_actions" in tables else {}
-                valid_states = {s.value for s in TaskStateEnum}
-
-                def _resolve_state(state_id: Optional[str]) -> str:
-                    name = state_names.get(state_id) if state_id else None
-                    return name if name in valid_states else TaskStateEnum.PLANNING.value
-
-                old_tasks = conn.execute(
-                    "SELECT id, chat_id, title, current_state_id, current_step, created_at, updated_at FROM tasks"
-                ).fetchall()
-                logs_by_task: Dict[str, List[sqlite3.Row]] = {}
-                if "task_transition_log" in tables:
-                    for row in conn.execute(
-                        "SELECT task_id, action_id, from_state_id, to_state_id, applied_by, note, created_at "
-                        "FROM task_transition_log ORDER BY task_id, created_at ASC, id ASC"
-                    ).fetchall():
-                        logs_by_task.setdefault(row["task_id"], []).append(row)
-
-                conn.executescript(
-                    """
-                    CREATE TABLE tasks__migrating_new (
-                        id TEXT PRIMARY KEY,
-                        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-                        title TEXT NOT NULL,
-                        state TEXT NOT NULL DEFAULT 'planning',
-                        paused INTEGER NOT NULL DEFAULT 0,
-                        plan TEXT NOT NULL DEFAULT '[]',
-                        done_steps TEXT NOT NULL DEFAULT '[]',
-                        current_step TEXT,
-                        created_at INTEGER NOT NULL,
-                        updated_at INTEGER NOT NULL
-                    );
-                    CREATE TABLE task_transition_log__migrating_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                        from_state TEXT NOT NULL,
-                        to_state TEXT NOT NULL,
-                        kind TEXT NOT NULL DEFAULT 'advance',
-                        applied_by TEXT NOT NULL DEFAULT 'agent',
-                        note TEXT,
-                        created_at INTEGER NOT NULL
-                    );
-                    """
-                )
-                kind_map = {"NORMAL": "advance", "PAUSE": "pause", "RESUME": "advance", "DECLINE": "advance"}
-                for old in old_tasks:
-                    logs = logs_by_task.get(old["id"], [])
-                    paused = bool(logs) and action_kinds.get(logs[-1]["action_id"], "NORMAL") == "PAUSE"
-                    conn.execute(
-                        "INSERT INTO tasks__migrating_new "
-                        "(id, chat_id, title, state, paused, plan, done_steps, current_step, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, '[]', '[]', ?, ?, ?)",
-                        (old["id"], old["chat_id"], old["title"], _resolve_state(old["current_state_id"]),
-                         int(paused), old["current_step"], old["created_at"], old["updated_at"]),
-                    )
-                    for log in logs:
-                        kind = action_kinds.get(log["action_id"], "NORMAL")
-                        note = log["note"]
-                        if kind == "DECLINE":
-                            note = ((note + " ") if note else "") + (
-                                "(перенесено при переходе на новую модель задач: "
-                                "раньше здесь было действие «Отклонить», которого больше нет)"
-                            )
-                        conn.execute(
-                            "INSERT INTO task_transition_log__migrating_new "
-                            "(task_id, from_state, to_state, kind, applied_by, note, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (old["id"], _resolve_state(log["from_state_id"]), _resolve_state(log["to_state_id"]),
-                             kind_map.get(kind, "advance"), log["applied_by"], note, log["created_at"]),
-                        )
-                conn.executescript(
-                    """
-                    DROP TABLE IF EXISTS task_transition_log;
-                    DROP TABLE tasks;
-                    ALTER TABLE tasks__migrating_new RENAME TO tasks;
-                    ALTER TABLE task_transition_log__migrating_new RENAME TO task_transition_log;
-                    CREATE INDEX IF NOT EXISTS idx_tasks_chat_id ON tasks(chat_id);
-                    CREATE INDEX IF NOT EXISTS idx_task_transition_log_task_id ON task_transition_log(task_id);
-                    """
-                )
-            # Старые общие справочники (состояния/действия/машины/их состав)
-            # больше не нужны ни в каком виде — машина состояний теперь в коде.
-            conn.executescript(
-                """
-                DROP TABLE IF EXISTS task_machine_states;
-                DROP TABLE IF EXISTS task_transitions;
-                DROP TABLE IF EXISTS task_state_machines;
-                DROP TABLE IF EXISTS task_actions;
-                DROP TABLE IF EXISTS task_states;
-                """
-            )
-        finally:
-            conn.execute("PRAGMA foreign_keys = ON")
 
     def _seed_task_state_machine_rule_invariants(self, conn: sqlite3.Connection) -> None:
         """"Работу с задачами требуется переделать" (новое ТЗ, п.5) — пять
@@ -691,20 +507,9 @@ class Database:
         return Agent(id=agent_id, name=name, created_at=now, updated_at=now, settings=settings)
 
     @staticmethod
-    def _agent_default_profile_id(row: sqlite3.Row) -> Optional[str]:
-        # Обратная совместимость: строки, созданные до появления этой
-        # колонки, не имеют её вовсе (см. _ensure_column) — просто "профиль
-        # по умолчанию не задан", а не ошибка.
-        return row["default_profile_id"] if "default_profile_id" in row.keys() else None
-
-    @staticmethod
     def _row_invariant_ids(row: sqlite3.Row) -> List[str]:
-        # Обратная совместимость: строки, созданные до появления этой
-        # колонки (или до первого выбора инвариантов), не имеют значения —
-        # "инварианты не выбраны", а не ошибка.
-        if "invariant_ids" not in row.keys() or not row["invariant_ids"]:
-            return []
-        return json.loads(row["invariant_ids"])
+        # NULL — инварианты ещё не выбирались.
+        return json.loads(row["invariant_ids"]) if row["invariant_ids"] else []
 
     def get_agent(self, agent_id: str) -> Optional[Agent]:
         with self._connect() as conn:
@@ -714,7 +519,7 @@ class Database:
             return Agent(
                 id=row["id"], name=row["name"], created_at=row["created_at"],
                 updated_at=row["updated_at"], settings=_row_to_settings(row),
-                default_profile_id=self._agent_default_profile_id(row),
+                default_profile_id=row["default_profile_id"],
                 invariant_ids=self._row_invariant_ids(row),
             )
 
@@ -724,7 +529,7 @@ class Database:
             return [
                 Agent(id=r["id"], name=r["name"], created_at=r["created_at"],
                       updated_at=r["updated_at"], settings=_row_to_settings(r),
-                      default_profile_id=self._agent_default_profile_id(r),
+                      default_profile_id=r["default_profile_id"],
                       invariant_ids=self._row_invariant_ids(r))
                 for r in rows
             ]
@@ -771,32 +576,35 @@ class Database:
 
     def create_chat(
         self, agent_id: str, title: str, settings: Settings, active_profile_id: Optional[str] = None,
+        source: str = "app",
     ) -> Chat:
         chat_id = str(uuid.uuid4())
         now = int(time.time())
         row = _settings_to_row(settings)
         with self._connect() as conn:
-            columns = ["id", "agent_id", "title", "created_at", "updated_at", "active_profile_id"] + list(row.keys())
-            values = [chat_id, agent_id, title, now, now, active_profile_id] + list(row.values())
+            columns = ["id", "agent_id", "title", "created_at", "updated_at", "active_profile_id", "source"] + list(row.keys())
+            values = [chat_id, agent_id, title, now, now, active_profile_id, source] + list(row.values())
             placeholders = ", ".join("?" for _ in columns)
             conn.execute(f"INSERT INTO chats ({', '.join(columns)}) VALUES ({placeholders})", values)
         return Chat(
             id=chat_id, agent_id=agent_id, title=title, created_at=now, updated_at=now, settings=settings,
-            active_profile_id=active_profile_id,
+            active_profile_id=active_profile_id, source=source,
+        )
+
+    def _row_to_chat(self, r: sqlite3.Row) -> Chat:
+        return Chat(
+            id=r["id"], agent_id=r["agent_id"], title=r["title"], created_at=r["created_at"],
+            updated_at=r["updated_at"], settings=_row_to_settings(r),
+            active_profile_id=r["active_profile_id"],
+            invariant_ids=self._row_invariant_ids(r),
+            last_read_message_id=r["last_read_message_id"],
+            source=r["source"],
         )
 
     def get_chat(self, chat_id: str) -> Optional[Chat]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
-            if row is None:
-                return None
-            return Chat(
-                id=row["id"], agent_id=row["agent_id"], title=row["title"],
-                created_at=row["created_at"], updated_at=row["updated_at"],
-                settings=_row_to_settings(row),
-                active_profile_id=row["active_profile_id"] if "active_profile_id" in row.keys() else None,
-                invariant_ids=self._row_invariant_ids(row),
-            )
+            return self._row_to_chat(row) if row is not None else None
 
     def list_chats(self, agent_id: Optional[str] = None) -> List[Chat]:
         with self._connect() as conn:
@@ -806,13 +614,72 @@ class Database:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM chats ORDER BY updated_at DESC").fetchall()
-            return [
-                Chat(id=r["id"], agent_id=r["agent_id"], title=r["title"], created_at=r["created_at"],
-                     updated_at=r["updated_at"], settings=_row_to_settings(r),
-                     active_profile_id=r["active_profile_id"] if "active_profile_id" in r.keys() else None,
-                     invariant_ids=self._row_invariant_ids(r))
-                for r in rows
-            ]
+            return [self._row_to_chat(r) for r in rows]
+
+    def find_latest_chat_by_title(self, agent_id: str, title: str) -> Optional[Chat]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chats WHERE agent_id = ? AND title = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (agent_id, title),
+            ).fetchone()
+            return self._row_to_chat(row) if row is not None else None
+
+    def set_last_read(self, chat_id: str, message_id: int) -> int:
+        """Сдвигает отметку прочтения только ВПЕРЁД; возвращает итоговое значение."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE chats SET last_read_message_id = MAX(COALESCE(last_read_message_id, 0), ?) WHERE id = ?",
+                (int(message_id), chat_id),
+            )
+            row = conn.execute("SELECT last_read_message_id FROM chats WHERE id = ?", (chat_id,)).fetchone()
+            return int(row["last_read_message_id"] or 0) if row is not None else 0
+
+    def chat_activity(self, chat_ids: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """Непрочитанные и последнее сообщение по чатам (ТЗ, раздел 2.6):
+        `{chat_id: {"unread_count", "first_unread_message_id", "last_message_at", "preview"}}`.
+        Непрочитанное — сообщение новее `chats.last_read_message_id`, если это
+        ответ ассистента в финальном статусе или запрос от планировщика."""
+        final = ", ".join(f"'{s}'" for s in ("complete", "cancelled", "interrupted", "failed"))
+        where_chats = ""
+        params: List[Any] = []
+        if chat_ids is not None:
+            if not chat_ids:
+                return {}
+            where_chats = f" AND m.chat_id IN ({', '.join('?' for _ in chat_ids)})"
+            params = list(chat_ids)
+        result: Dict[str, Dict[str, Any]] = {}
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT m.chat_id AS chat_id, COUNT(*) AS cnt, MIN(m.id) AS first_id
+                    FROM messages m JOIN chats c ON c.id = m.chat_id
+                    WHERE m.id > COALESCE(c.last_read_message_id, 0)
+                      AND ((m.role = 'assistant' AND m.status IN ({final}))
+                           OR (m.role = 'user' AND m.source = 'scheduler'))
+                      {where_chats}
+                    GROUP BY m.chat_id""",
+                params,
+            ).fetchall()
+            for r in rows:
+                result.setdefault(r["chat_id"], {})
+                result[r["chat_id"]].update(unread_count=int(r["cnt"]), first_unread_message_id=int(r["first_id"]))
+            rows = conn.execute(
+                f"""SELECT m.chat_id AS chat_id, m.content AS content, m.created_at AS created_at
+                    FROM messages m
+                    WHERE m.id = (SELECT MAX(m2.id) FROM messages m2
+                                  WHERE m2.chat_id = m.chat_id AND m2.status != 'streaming'
+                                    AND m2.role IN ('user', 'assistant'))
+                      {where_chats}""",
+                params,
+            ).fetchall()
+            for r in rows:
+                result.setdefault(r["chat_id"], {})
+                result[r["chat_id"]].update(last_message_at=int(r["created_at"]), preview=(r["content"] or "")[:120])
+        for info in result.values():
+            info.setdefault("unread_count", 0)
+            info.setdefault("first_unread_message_id", None)
+            info.setdefault("last_message_at", None)
+            info.setdefault("preview", None)
+        return result
 
     def set_chat_active_profile(self, chat_id: str, profile_id: Optional[str]) -> None:
         with self._connect() as conn:
@@ -900,19 +767,45 @@ class Database:
                 """INSERT INTO messages
                    (chat_id, role, content, created_at, reasoning_content, is_summary,
                     duration_ms, total_tokens, prompt_tokens, completion_tokens,
-                    format, branch, facts, task_events, is_task_manager_step, mcp_events)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    format, branch, facts, task_events, is_task_manager_step,
+                    status, run_id, tool_events, error, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.chat_id, message.role, message.content, message.created_at,
                     message.reasoning_content, int(message.is_summary),
                     message.duration_ms, message.total_tokens,
                     message.prompt_tokens, message.completion_tokens,
                     message.format, message.branch, message.facts, message.task_events,
-                    int(message.is_task_manager_step), message.mcp_events,
+                    int(message.is_task_manager_step),
+                    message.status, message.run_id, message.tool_events, message.error, message.source,
                 ),
             )
             message.id = cur.lastrowid
         return message
+
+    def get_message(self, message_id: int) -> Optional[Message]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
+            return self._row_to_message(row) if row is not None else None
+
+    def update_message_fields(self, message_id: int, **fields: Any) -> None:
+        """Частичное обновление сообщения — черновик ответа дописывается по
+        ходу запуска, финальный ответ записывается в ту же строку."""
+        unknown = set(fields) - set(_MESSAGE_UPDATABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"cannot update message fields: {sorted(unknown)}")
+        if not fields:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE messages SET {assignments} WHERE id = ?", list(fields.values()) + [message_id])
+
+    def mark_streaming_messages_interrupted(self) -> int:
+        """После перезапуска сервиса: черновики, которые уже никто не
+        допишет, получают статус "interrupted" (частичный текст остаётся)."""
+        with self._connect() as conn:
+            cur = conn.execute("UPDATE messages SET status = 'interrupted' WHERE status = 'streaming'")
+            return cur.rowcount
 
     def update_message_facts(self, message_id: int, facts_json: Optional[str]) -> None:
         with self._connect() as conn:
@@ -928,19 +821,22 @@ class Database:
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> Message:
-        keys = row.keys()
         return Message(
             id=row["id"], chat_id=row["chat_id"], role=row["role"], content=row["content"],
             created_at=row["created_at"], reasoning_content=row["reasoning_content"],
             is_summary=bool(row["is_summary"]), duration_ms=row["duration_ms"],
             total_tokens=row["total_tokens"], prompt_tokens=row["prompt_tokens"],
             completion_tokens=row["completion_tokens"],
-            format=(row["format"] if "format" in keys else None) or "text",
-            branch=(row["branch"] if "branch" in keys else None) or 0,
-            facts=row["facts"] if "facts" in keys else None,
-            task_events=row["task_events"] if "task_events" in keys else None,
-            is_task_manager_step=bool(row["is_task_manager_step"]) if "is_task_manager_step" in keys and row["is_task_manager_step"] is not None else False,
-            mcp_events=row["mcp_events"] if "mcp_events" in keys else None,
+            format=row["format"],
+            branch=row["branch"],
+            facts=row["facts"],
+            task_events=row["task_events"],
+            is_task_manager_step=bool(row["is_task_manager_step"]),
+            status=row["status"],
+            run_id=row["run_id"],
+            tool_events=row["tool_events"],
+            error=row["error"],
+            source=row["source"],
         )
 
     def list_messages(self, chat_id: str) -> List[Message]:
@@ -1265,19 +1161,25 @@ class Database:
             done_steps=json.loads(row["done_steps"]) if row["done_steps"] else [],
             current_step=row["current_step"],
             created_at=row["created_at"], updated_at=row["updated_at"],
+            description=row["description"],
         )
 
-    def create_task(self, chat_id: str, title: str, plan: Optional[List[str]] = None) -> Task:
+    def create_task(
+        self, chat_id: str, title: str, plan: Optional[List[str]] = None, description: str = "",
+    ) -> Task:
         task_id = str(uuid.uuid4())
         now = int(time.time())
         plan = plan or []
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO tasks (id, chat_id, title, state, paused, plan, done_steps, current_step, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'planning', 0, ?, '[]', NULL, ?, ?)",
-                (task_id, chat_id, title, json.dumps(plan, ensure_ascii=False), now, now),
+                "INSERT INTO tasks (id, chat_id, title, state, paused, plan, done_steps, current_step, created_at, updated_at, description) "
+                "VALUES (?, ?, ?, 'planning', 0, ?, '[]', NULL, ?, ?, ?)",
+                (task_id, chat_id, title, json.dumps(plan, ensure_ascii=False), now, now, description or ""),
             )
-        return Task(id=task_id, chat_id=chat_id, title=title, state="planning", plan=plan, created_at=now, updated_at=now)
+        return Task(
+            id=task_id, chat_id=chat_id, title=title, state="planning", plan=plan, created_at=now, updated_at=now,
+            description=description or "",
+        )
 
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._connect() as conn:
@@ -1404,3 +1306,106 @@ class Database:
                 conn.execute("INSERT INTO task_machine_settings (id, invariant_ids) VALUES (1, ?)", (payload,))
             else:
                 conn.execute("UPDATE task_machine_settings SET invariant_ids = ? WHERE id = 1", (payload,))
+
+    # ---- асинхронные запуски (ТЗ, раздел 2.1) ---------------------------------
+
+    @staticmethod
+    def _row_to_run(row: sqlite3.Row) -> Run:
+        return Run(
+            id=row["id"], chat_id=row["chat_id"], kind=row["kind"], source=row["source"] or "app",
+            status=row["status"], current_status=row["current_status"], request_json=row["request_json"] or "{}",
+            client_request_id=row["client_request_id"], user_message_id=row["user_message_id"],
+            assistant_message_id=row["assistant_message_id"], task_id=row["task_id"],
+            last_seq=int(row["last_seq"] or 0), error=row["error"], created_at=row["created_at"],
+            started_at=row["started_at"], finished_at=row["finished_at"],
+        )
+
+    def create_run(self, run: Run) -> Run:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO runs (id, chat_id, kind, source, status, current_status, request_json,
+                   client_request_id, user_message_id, assistant_message_id, task_id, last_seq, error,
+                   created_at, started_at, finished_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run.id, run.chat_id, run.kind, run.source, run.status, run.current_status, run.request_json,
+                    run.client_request_id, run.user_message_id, run.assistant_message_id, run.task_id,
+                    run.last_seq, run.error, run.created_at, run.started_at, run.finished_at,
+                ),
+            )
+        return run
+
+    def get_run(self, run_id: str) -> Optional[Run]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            return self._row_to_run(row) if row is not None else None
+
+    def find_run_by_client_request(self, chat_id: str, client_request_id: str) -> Optional[Run]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE chat_id = ? AND client_request_id = ?", (chat_id, client_request_id),
+            ).fetchone()
+            return self._row_to_run(row) if row is not None else None
+
+    def active_run_for_chat(self, chat_id: str) -> Optional[Run]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE chat_id = ? AND status IN ('queued', 'running') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (chat_id,),
+            ).fetchone()
+            return self._row_to_run(row) if row is not None else None
+
+    def list_active_runs(self) -> List[Run]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM runs WHERE status IN ('queued', 'running') ORDER BY created_at ASC"
+            ).fetchall()
+            return [self._row_to_run(r) for r in rows]
+
+    def update_run(self, run_id: str, **fields: Any) -> None:
+        unknown = set(fields) - set(_RUN_UPDATABLE_FIELDS)
+        if unknown:
+            raise ValueError(f"cannot update run fields: {sorted(unknown)}")
+        if not fields:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE runs SET {assignments} WHERE id = ?", list(fields.values()) + [run_id])
+
+    def mark_unfinished_runs_interrupted(self) -> List[Run]:
+        """После перезапуска сервиса (ТЗ, раздел 2.4): незавершённые запуски
+        и их черновики получают статус "interrupted"."""
+        now = int(time.time())
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM runs WHERE status IN ('queued', 'running')").fetchall()
+            conn.execute(
+                "UPDATE runs SET status = 'interrupted', finished_at = ?, current_status = NULL "
+                "WHERE status IN ('queued', 'running')",
+                (now,),
+            )
+            conn.execute("UPDATE messages SET status = 'interrupted' WHERE status = 'streaming'")
+        return [self._row_to_run(r) for r in rows]
+
+    def delete_runs_older_than(self, cutoff: int) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM runs WHERE status NOT IN ('queued', 'running') AND created_at < ?", (cutoff,),
+            )
+            return cur.rowcount
+
+    def update_draft_and_run(self, message_id: int, message_fields: Dict[str, Any], run_id: str, run_fields: Dict[str, Any]) -> None:
+        """Черновик ответа и номер события, по которому он актуален, — одной
+        транзакцией (снимок `GET /runs/{id}` всегда согласован с `snapshot_seq`)."""
+        bad = (set(message_fields) - set(_MESSAGE_UPDATABLE_FIELDS)) | (set(run_fields) - set(_RUN_UPDATABLE_FIELDS))
+        if bad:
+            raise ValueError(f"cannot update fields: {sorted(bad)}")
+        with self._connect() as conn:
+            if message_fields:
+                assignments = ", ".join(f"{k} = ?" for k in message_fields)
+                conn.execute(
+                    f"UPDATE messages SET {assignments} WHERE id = ?", list(message_fields.values()) + [message_id],
+                )
+            if run_fields:
+                assignments = ", ".join(f"{k} = ?" for k in run_fields)
+                conn.execute(f"UPDATE runs SET {assignments} WHERE id = ?", list(run_fields.values()) + [run_id])

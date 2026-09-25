@@ -9,6 +9,7 @@ agents_core.main` запускает именно то, что возвраща�
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request
@@ -18,8 +19,9 @@ from fastapi.responses import JSONResponse
 from ..catalog import ModelCatalog
 from ..config import AgentConfig
 from ..db import Database
+from ..events import EventsGone
 from ..logging_setup import configure_logging
-from ..mcp_client import MCPClient
+from ..mcp_client import build_mcp_client
 from ..providers import ProviderError, ProviderRegistry
 from ..repository import (
     NotConfiguredError,
@@ -28,7 +30,8 @@ from ..repository import (
     Repository,
     ValidationError,
 )
-from . import agents, chats, health, invariants, memory, messages, models_routes, settings_routes, tasks
+from ..runs import RunConflictError, RunManager
+from . import agents, chats, health, invariants, mcp_tools, memory, messages, models_routes, runs, settings_routes, tasks
 from .logging_middleware import AccessLogMiddleware
 
 DESCRIPTION = """
@@ -63,26 +66,40 @@ def create_app(config: type = AgentConfig, enable_mcp: Optional[bool] = None) ->
     registry = ProviderRegistry(config)
     catalog = ModelCatalog(db, registry, config)
     catalog.load_or_discover()
-    mcp_enabled = config.is_mcp_configured() if enable_mcp is None else (enable_mcp and bool(config.MCP_SERVER_URL))
+    servers = config.mcp_servers()
+    mcp_enabled = config.is_mcp_configured() if enable_mcp is None else (enable_mcp and bool(servers))
     mcp_client = (
-        MCPClient(config.MCP_SERVER_URL, api_key=config.MCP_API_KEY or None, timeout=config.MCP_REQUEST_TIMEOUT)
+        build_mcp_client(servers, api_key=config.MCP_API_KEY or None, timeout=config.MCP_REQUEST_TIMEOUT)
         if mcp_enabled else None
     )
     repo = Repository(db, registry, catalog, mcp_client=mcp_client)
     return create_app_with_repository(repo)
 
 
-def create_app_with_repository(repo: Repository) -> FastAPI:
+def create_app_with_repository(repo: Repository, run_manager: Optional[RunManager] = None) -> FastAPI:
     """Сборка приложения вокруг уже готового `Repository` — используется
     `create_app()`, а также тестами API (с репозиторием на фиктивном
     провайдере, без обращения к настоящим DeepSeek/Ollama)."""
     configure_logging(level=AgentConfig.LOG_LEVEL, log_file=AgentConfig.LOG_FILE, body_limit=AgentConfig.LOG_BODY_LIMIT)
+    manager = run_manager or RunManager(repo)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Асинхронные запуски (ТЗ, 2.4): запуски, прерванные прошлым
+        # остановом сервиса, помечаются "interrupted" при старте.
+        manager.recover()
+        try:
+            yield
+        finally:
+            manager.shutdown(wait=False)
+
     app = FastAPI(
         title="AgentsCore",
         description=DESCRIPTION,
-        version="1.1.0",
+        lifespan=lifespan,
     )
     app.state.repo = repo
+    app.state.run_manager = manager
 
     # Логируем каждый REST-запрос (метод, путь, параметры, тело, итоговый
     # статус, время выполнения) — см. `agents_core.logging_middleware`.
@@ -102,6 +119,16 @@ def create_app_with_repository(repo: Repository) -> FastAPI:
     app.include_router(memory.router)
     app.include_router(invariants.router)
     app.include_router(tasks.router)
+    app.include_router(runs.router)
+    app.include_router(mcp_tools.router)
+
+    @app.exception_handler(RunConflictError)
+    def _run_conflict(request: Request, exc: RunConflictError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"error": str(exc), "active_run_id": exc.active_run_id})
+
+    @app.exception_handler(EventsGone)
+    def _events_gone(request: Request, exc: EventsGone) -> JSONResponse:
+        return JSONResponse(status_code=410, content={"error": str(exc)})
 
     @app.exception_handler(NotFoundError)
     def _not_found(request: Request, exc: NotFoundError) -> JSONResponse:

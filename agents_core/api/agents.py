@@ -111,5 +111,5 @@ def set_agent_default_profile(agent_id: str, payload: ActiveProfileSetRequest, r
     description="Настройки чата копируются из текущих настроек агента; модель и провайдер после этого фиксированы для чата.",
 )
 def create_chat(agent_id: str, payload: ChatCreate, repo: Repository = Depends(get_repository)) -> ChatOut:
-    chat = repo.create_chat(agent_id, payload.title)
+    chat = repo.create_chat(agent_id, payload.title, source=payload.source)
     return chat_out(chat, repo.chat_stats(chat), repo)

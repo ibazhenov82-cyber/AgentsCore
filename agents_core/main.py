@@ -27,11 +27,11 @@ def main() -> None:
     # (см. MCPClient/normalize_mcp_base_url), а не сырое значение из .env,
     # чтобы при диагностике не приходилось гадать, откуда взялся 404.
     mcp_status = (
-        f"подключён к {normalize_mcp_base_url(AgentConfig.MCP_SERVER_URL)}"
+        ", ".join(f"{name} — {normalize_mcp_base_url(url)}" for name, url in AgentConfig.mcp_servers())
         if AgentConfig.is_mcp_configured()
         else "выключен"
     )
-    print(f"[agents_core] MCP-сервер: {mcp_status}", file=sys.stderr)
+    print(f"[agents_core] MCP-серверы: {mcp_status}", file=sys.stderr)
     print(f"[agents_core] Swagger UI: http://{AgentConfig.HOST}:{AgentConfig.PORT}/docs", file=sys.stderr)
     uvicorn.run(app, host=AgentConfig.HOST, port=AgentConfig.PORT)
 

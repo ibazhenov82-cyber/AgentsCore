@@ -14,4 +14,4 @@ router = APIRouter(tags=["Health"])
     description="Лёгкий ping — подтверждает, что AgentsCore запущен и отвечает на запросы.",
 )
 def health() -> HealthOut:
-    return HealthOut(status="ok", version="1.1.0")
+    return HealthOut(status="ok")
