@@ -14,9 +14,19 @@ import uvicorn
 
 from .api.app import create_app
 from .config import AgentConfig
-from .mcp_client import normalize_mcp_base_url
+from .mcp_client import McpServerSpec, normalize_mcp_base_url
 
 app = create_app()
+
+
+def _describe_server(server) -> str:
+    """Строка сервера для лога запуска; значения заголовков не печатаются."""
+    if isinstance(server, McpServerSpec):
+        label = f"{server.name} ({server.title})" if server.title else server.name
+        headers = f", заголовки: {', '.join(server.headers)}" if server.headers else ""
+        return f"{label} — {server.url}{headers}"
+    name, url = server
+    return f"{name} — {normalize_mcp_base_url(url)}"
 
 
 def main() -> None:
@@ -27,7 +37,7 @@ def main() -> None:
     # (см. MCPClient/normalize_mcp_base_url), а не сырое значение из .env,
     # чтобы при диагностике не приходилось гадать, откуда взялся 404.
     mcp_status = (
-        ", ".join(f"{name} — {normalize_mcp_base_url(url)}" for name, url in AgentConfig.mcp_servers())
+        ", ".join(_describe_server(server) for server in AgentConfig.mcp_servers())
         if AgentConfig.is_mcp_configured()
         else "выключен"
     )

@@ -295,6 +295,78 @@ MCP_API_KEY=            # пусто — аутентификация ещё н�
 продукта — «GIT API», «Локальный GIT», «HTTP-запросы», у планировщика —
 «Планировщик»), иначе — короткое имя сервера из `MCP_SERVERS`.
 
+### Внешние MCP-серверы (пример — GitHub MCP)
+
+Сторонний MCP-сервер подключается файлом описания серверов
+`MCP_SERVERS_FILE` (JSON; пример — `mcp_servers.example.json`). Если файл
+задан, он заменяет `MCP_SERVERS`/`MCP_SERVER_URL` — перечислите в нём и
+серверы продукта:
+
+```json
+{
+  "tools":     {"url": "http://localhost:8001/mcp", "initialize": false},
+  "scheduler": {"url": "http://localhost:8002/mcp", "initialize": false},
+  "github": {
+    "url": "https://api.githubcopilot.com/mcp/",
+    "title": "GitHub",
+    "headers": {
+      "Authorization": "Bearer ${GITHUB_MCP_TOKEN}",
+      "X-MCP-Toolsets": "repos,issues,pull_requests",
+      "X-MCP-Readonly": "true"
+    }
+  }
+}
+```
+
+- `url` — адрес MCP-эндпоинта **как есть** (`/mcp` не дописывается).
+- `headers` — свои заголовки сервера; `${ПЕРЕМЕННАЯ}` подставляется из
+  окружения (или `.env`), так что секреты не лежат в самом файле. Общий
+  `MCP_API_KEY` серверам из файла не отправляется.
+- `title` — подпись в интерфейсе: в списке выбора инструментов и в строке
+  «Использую инструмент GitHub list_commits …» (если сервер сам не сообщил
+  группу инструмента). Без `title` — имя сервера.
+- `initialize` (по умолчанию `true`) — рукопожатие по спецификации Streamable
+  HTTP: `initialize` → `notifications/initialized`, затем заголовки
+  `Mcp-Session-Id` и `MCP-Protocol-Version` в каждом запросе; если сервер
+  забыл сессию (404), рукопожатие повторяется. Серверам продукта оно не
+  нужно (`false`). Ответы принимаются и JSON, и потоком SSE.
+
+**GitHub MCP** ([github/github-mcp-server](https://github.com/github/github-mcp-server)):
+
+1. Создайте fine-grained personal access token только на нужные репозитории,
+   с правами на чтение (Contents, Issues, Pull requests, Metadata — read-only),
+   и положите его в `GITHUB_MCP_TOKEN` (`.env` AgentsCore). Там же:
+   `MCP_ENABLED=true`, `MCP_SERVERS_FILE=mcp_servers.json` (скопируйте
+   `mcp_servers.example.json`).
+2. Удалённый сервер GitHub — `https://api.githubcopilot.com/mcp/`, как в
+   примере. Набор инструментов — заголовок `X-MCP-Toolsets` (группы `repos`,
+   `issues`, `pull_requests`, `actions`, …), только чтение —
+   `X-MCP-Readonly: true`. Условия доступа к удалённому серверу смотрите в
+   документации GitHub.
+3. Либо свой экземпляр: Docker-образ `ghcr.io/github/github-mcp-server` в
+   HTTP-режиме (`github-mcp-server http`, по умолчанию порт 8082) — тогда в
+   `url` его адрес, токен и `X-MCP-*` — теми же заголовками. Точный путь
+   эндпоинта и параметры запуска — в `docs/streamable-http.md` репозитория.
+4. Перезапустите AgentsCore: в логе запуска будет `github (GitHub) —
+   <адрес>, заголовки: Authorization, X-MCP-Toolsets, X-MCP-Readonly`
+   (значения не печатаются).
+5. В приложении: настройки агента/чата → «Список функций» → «Выбрать из
+   доступных» → раздел «GitHub». Отмечайте только нужные инструменты: модель
+   видит и может вызвать ровно их. Если имя инструмента совпадает с
+   инструментом другого сервера, у обоих появляется префикс сервера
+   (`github__list_commits`).
+
+Ограничения: задачи планировщика «Инструмент MCP» работают только с
+MCP-сервером продукта — инструменты GitHub по расписанию вызываются через
+«Запрос агенту» в чат, где они выбраны. `run_pipeline` MCP-сервера продукта
+вызывает только инструменты своего сервера.
+
+**Какие инструменты разрешены в чате.** При каждом вызове MCP-инструмента
+AgentsCore передаёт в `_meta` список MCP-инструментов этого сервера,
+выбранных в чате (`agentscore/allowed_tools`, без префикса сервера). Сервер
+продукта не даёт вызвать через `run_pipeline` и `save_tool_result`
+инструмент, не выбранный в чате.
+
 Пока `MCP_ENABLED=false` (по умолчанию) либо не задан ни один сервер —
 сервис ведёт себя ровно как без этой главы: ничего не подключается, ничего
 не меняется в поведении чата.

@@ -170,6 +170,10 @@ class AgentConfig:
     # Несколько MCP-серверов: "tools=http://localhost:8001/mcp,scheduler=http://localhost:8002/mcp".
     # Если задано — используется вместо MCP_SERVER_URL.
     MCP_SERVERS: str = os.environ.get("MCP_SERVERS", "").strip()
+    # Файл описания MCP-серверов (JSON) — для внешних серверов (например,
+    # GitHub MCP): адрес как есть, свои заголовки с ${ПЕРЕМЕННЫМИ}, подпись.
+    # Если задан — используется вместо MCP_SERVERS и MCP_SERVER_URL.
+    MCP_SERVERS_FILE: str = os.environ.get("MCP_SERVERS_FILE", "").strip()
     # Заготовка под будущую аутентификацию к MCP-серверу — пока нигде не
     # используется (см. mcp_server/.env.example, тот же принцип).
     MCP_API_KEY: str = os.environ.get("MCP_API_KEY", "").strip()
@@ -196,8 +200,10 @@ class AgentConfig:
     def mcp_servers(cls) -> list:
         """Список `(имя, адрес)` подключаемых MCP-серверов: из `MCP_SERVERS`,
         иначе единственный `MCP_SERVER_URL` под именем "tools"."""
-        from .mcp_client import parse_mcp_servers
+        from .mcp_client import load_mcp_servers_file, parse_mcp_servers
 
+        if cls.MCP_SERVERS_FILE:
+            return load_mcp_servers_file(cls.MCP_SERVERS_FILE)
         if cls.MCP_SERVERS:
             return parse_mcp_servers(cls.MCP_SERVERS)
         return [("tools", cls.MCP_SERVER_URL)] if cls.MCP_SERVER_URL else []

@@ -1837,10 +1837,16 @@ class Repository:
         ):
             # Инструмент неизвестен локально, но известен MCP-серверу —
             # диспетчеризация туда (новое ТЗ, интеграция с MCP-сервером).
-            try:
-                result = self._mcp_client.call_tool(
-                    name, arguments, meta={"agentscore/chat_id": chat.id, "agentscore/agent_id": agent.id},
+            meta = {"agentscore/chat_id": chat.id, "agentscore/agent_id": agent.id}
+            if allowed_mcp_names is not None:
+                # Какие MCP-инструменты разрешены в этом чате: сервер не даёт
+                # вызвать остальные косвенно (цепочка run_pipeline,
+                # save_tool_result).
+                meta["agentscore/allowed_tools"] = sorted(
+                    n for n in allowed_mcp_names if self._mcp_client.has_cached_tool(n)
                 )
+            try:
+                result = self._mcp_client.call_tool(name, arguments, meta=meta)
             except MCPClientError as exc:  # сетевой сбой самого MCP-сервера
                 result = {"error": str(exc)}
         else:
