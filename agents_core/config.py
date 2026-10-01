@@ -181,6 +181,15 @@ class AgentConfig:
     # инструментов (поиск, загрузка страниц, ответ модели) идёт минуту и больше.
     MCP_REQUEST_TIMEOUT: float = float(os.environ.get("MCP_REQUEST_TIMEOUT", "180") or "180")
 
+    # --- Базы знаний (RAG) ------------------------------------------------------
+    # Адрес сервиса баз знаний (knowledge_service). Пусто — RAG недоступен:
+    # отправка сообщения в чат с включённым «Использовать RAG» вернёт ошибку.
+    KNOWLEDGE_SERVICE_URL: str = os.environ.get("KNOWLEDGE_SERVICE_URL", "http://localhost:8003").strip().rstrip("/")
+    # Ключ API сервиса баз знаний (KNOWLEDGE_API_KEY на его стороне), если задан.
+    KNOWLEDGE_SERVICE_API_KEY: str = os.environ.get("KNOWLEDGE_SERVICE_API_KEY", "").strip()
+    # Таймаут поиска (секунды): эмбеддинг вопроса + поиск по индексу.
+    KNOWLEDGE_SERVICE_TIMEOUT: float = float(os.environ.get("KNOWLEDGE_SERVICE_TIMEOUT", "30") or "30")
+
     # --- Асинхронные запуски (ТЗ «асинхронные ответы», раздел 2.4) ---------
     # Сколько ответов модели выполняется одновременно (в разных чатах; в
     # одном чате — всегда не больше одного).

@@ -25,6 +25,10 @@ from .db import Database
 from .format_detect import detect_message_format
 from .invariant_checks import format_violation_warning, validate_response
 from .events import CancelToken, EventLog, RunCancelled
+from .knowledge import (
+    RAG_STATUS_NOT_FOUND, RAG_STATUS_OK, RAG_STATUS_UNAVAILABLE, KnowledgeClient, KnowledgeServiceError, RagOutcome,
+    augmented_question, citations, rag_instruction, search_query, select_sources,
+)
 from .mcp_client import MCPClient, MCPClientError
 from .models import (
     Agent,
@@ -354,9 +358,12 @@ def _format_messages_block(messages: List[Message]) -> str:
 class Repository:
     def __init__(
         self, db: Database, registry: ProviderRegistry, catalog: ModelCatalog,
-        mcp_client: Optional[MCPClient] = None,
+        mcp_client: Optional[MCPClient] = None, knowledge_client: Optional[KnowledgeClient] = None,
     ):
         self._db = db
+        #: Клиент сервиса баз знаний — `None`, если RAG не настроен
+        #: (`KNOWLEDGE_SERVICE_URL` пуст). См. `_prepare_rag`.
+        self._knowledge = knowledge_client
         self._registry = registry
         self._catalog = catalog
         self._locks: Dict[str, threading.Lock] = {}
@@ -2255,6 +2262,41 @@ class Repository:
         messages = self._filter_by_branch(self._db.list_messages(chat_id), branch)
         return [m for m in messages if m.status == "complete" and (before_id is None or m.id < before_id)]
 
+    def _validate_rag_config(self, chat: Chat) -> None:
+        if not chat.settings.rag_enabled:
+            return
+        if self._knowledge is None:
+            raise ValidationError("RAG недоступен: не задан адрес сервиса баз знаний (KNOWLEDGE_SERVICE_URL)")
+        if not chat.settings.collection_ids:
+            raise ValidationError("Включено «Использовать RAG», но не выбраны базы знаний")
+
+    def _prepare_rag(
+        self, chat: Chat, history: List[Message], text: str, provider_messages: List[ProviderMessage],
+    ) -> RagOutcome:
+        """Поиск фрагментов и сборка запроса: перед последним сообщением
+        (вопросом) — инструкция RAG, сам вопрос заменяется на «Контекст +
+        вопрос». В историю чата уходит исходный вопрос, фрагменты — только в
+        `Message.rag` ответа. Недоступность сервиса не прерывает ответ: модель
+        отвечает без базы знаний и предупреждает об этом."""
+        settings = chat.settings
+        previous = next((m.content for m in reversed(history) if m.role == "user" and not m.is_summary), None)
+        query = search_query(text, previous)
+        outcome = RagOutcome(query=query, status=RAG_STATUS_OK, only_from_kb=settings.rag_only_from_kb)
+        try:
+            found = self._knowledge.retrieve(query, list(settings.collection_ids), settings.rag_top_k,
+                                             settings.rag_score_threshold)
+            outcome.sources = select_sources(found["results"], settings.rag_context_tokens)
+            if not outcome.sources:
+                outcome.status = RAG_STATUS_NOT_FOUND
+        except KnowledgeServiceError as exc:
+            outcome.status, outcome.error = RAG_STATUS_UNAVAILABLE, str(exc)
+        question = provider_messages[-1]
+        provider_messages[-1:] = [
+            ProviderMessage("system", rag_instruction(outcome)),
+            ProviderMessage(question.role, augmented_question(question.content, outcome)),
+        ]
+        return outcome
+
     def _validate_send_flags(self, chat: Chat, get_facts: bool, sliding_window: bool, autosummary: str) -> None:
         if get_facts:
             self._validate_sticky_facts_config(chat)
@@ -2282,6 +2324,7 @@ class Repository:
         if not text or not text.strip():
             raise ValidationError("text must be a non-empty string")
         self._validate_send_flags(chat, get_facts, sliding_window, autosummary)
+        self._validate_rag_config(chat)
         now = int(time.time())
         user_msg = self._db.add_message(Message(
             id=0, chat_id=chat_id, role="user", content=text, created_at=now,
@@ -2478,6 +2521,8 @@ class Repository:
         if acc is not None:
             fields["task_events"] = json.dumps(acc.task_events, ensure_ascii=False) if acc.task_events else None
             fields["tool_events"] = json.dumps(acc.tool_events, ensure_ascii=False) if acc.tool_events else None
+            if acc.rag is not None:
+                fields["rag"] = json.dumps(acc.rag, ensure_ascii=False)
         self._db.update_message_fields(draft.id, **fields)
         saved = self._db.get_message(draft.id)
         self._publish_unread(draft.chat_id)
@@ -2532,12 +2577,24 @@ class Repository:
                 provider = self._registry.get(provider_name)
                 request_settings = self._settings_with_merged_tools(chat)
 
+                rag: Optional[RagOutcome] = None
+                if chat.settings.rag_enabled:
+                    yield {"type": "status", "status": "Поиск в базе знаний"}
+                    rag = self._prepare_rag(chat, messages, text, provider_messages)
+                    acc.rag = rag.to_dict()
+                    yield {"type": "rag_context", "rag": acc.rag}
+                    if token is not None:
+                        token.raise_if_cancelled()
+
                 status_text = "Выполняется запрос к модели"
                 yield {"type": "status", "status": status_text}
                 final_result, final_content = yield from self._model_turn(
                     provider, model_id, provider_messages, request_settings, chat, agent, acc,
                     use_stream=use_stream, token=token, status_text=status_text,
                 )
+                if rag is not None:
+                    rag.cited = citations(final_content, len(rag.sources))
+                    acc.rag = rag.to_dict()
                 duration_ms = int((time.monotonic() - started) * 1000)
                 # Токены НА ВХОД этого обмена (показываются под сообщением
                 # пользователя) известны только из usage ответа провайдера.
@@ -2802,3 +2859,5 @@ class _TurnAccumulator:
         self.tool_events: List[dict] = []
         self.partial_content: List[str] = []
         self.partial_reasoning: List[str] = []
+        #: Итог RAG (`RagOutcome.to_dict()`), если он был в этом ответе.
+        self.rag: Optional[dict] = None

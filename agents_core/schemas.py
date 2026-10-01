@@ -100,6 +100,13 @@ class SettingsOut(BaseModel):
     frequency_penalty: Optional[float] = Field(None, ge=-2, le=2)
     presence_penalty: Optional[float] = Field(None, ge=-2, le=2)
 
+    rag_enabled: bool = Field(False, description="«Использовать RAG»: перед запросом к модели искать фрагменты в базах знаний")
+    collection_ids: List[str] = Field(default_factory=list, description="Базы знаний (коллекции knowledge_service)")
+    rag_top_k: int = Field(5, ge=1, le=20, description="Сколько фрагментов передавать модели")
+    rag_score_threshold: float = Field(0.3, ge=0, le=1, description="Минимальное косинусное сходство фрагмента")
+    rag_only_from_kb: bool = Field(True, description="Отвечать только по базе знаний, без общих знаний модели")
+    rag_context_tokens: int = Field(4000, ge=200, le=100000, description="Бюджет контекста для фрагментов (оценка в токенах)")
+
     tools_sources: List[str] = Field(
         default_factory=list,
         description=(
@@ -169,8 +176,14 @@ class SettingsPatch(BaseModel):
     logprobs: Optional[bool] = None
     frequency_penalty: Optional[float] = Field(None, ge=-2, le=2)
     presence_penalty: Optional[float] = Field(None, ge=-2, le=2)
+    rag_enabled: Optional[bool] = None
+    collection_ids: Optional[List[str]] = None
+    rag_top_k: Optional[int] = Field(None, ge=1, le=20)
+    rag_score_threshold: Optional[float] = Field(None, ge=0, le=1)
+    rag_only_from_kb: Optional[bool] = None
+    rag_context_tokens: Optional[int] = Field(None, ge=200, le=100000)
 
-    model_config = ConfigDict(json_schema_extra={"example": {"temperature": 0.7, "max_tokens": 2048}})
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {"temperature": 0.7, "max_tokens": 2048}})
 
     def to_payload(self) -> dict:
         return self.model_dump(exclude_unset=True)
@@ -306,6 +319,16 @@ class MessageOut(BaseModel):
     )
     error: Optional[str] = Field(None, description="Текст ошибки для status='failed'")
     source: str = Field("app", description="Кто отправил сообщение пользователя: 'app' | 'scheduler'")
+    rag: Optional[str] = Field(
+        None,
+        description=(
+            "RAG-ответ (при «Использовать RAG»): JSON {\"used\", \"query\", \"status\": \"ok|not_found|unavailable\", "
+            "\"error\", \"only_from_kb\", \"sources\": [{\"n\", \"chunk_id\", \"score\", \"text\", \"section\", \"page\", "
+            "\"document_id\", \"title\", \"source\", \"source_type\", \"doc_date\", \"doc_version\", \"collection_id\", "
+            "\"collection_name\"}], \"cited\": [n...], \"confirmed\"} — источники формирует сервис, а не модель; "
+            "confirmed=false — в ответе нет ссылок на фрагменты («не подтверждён базой знаний»)"
+        ),
+    )
 
 _SLIDING_WINDOW_DESCRIPTION = (
     "Запросить обрезку контекста стратегией Sliding Window. Требует "

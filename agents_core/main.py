@@ -42,6 +42,7 @@ def main() -> None:
         else "выключен"
     )
     print(f"[agents_core] MCP-серверы: {mcp_status}", file=sys.stderr)
+    print(f"[agents_core] Базы знаний (RAG): {AgentConfig.KNOWLEDGE_SERVICE_URL or 'выключены'}", file=sys.stderr)
     print(f"[agents_core] Swagger UI: http://{AgentConfig.HOST}:{AgentConfig.PORT}/docs", file=sys.stderr)
     uvicorn.run(app, host=AgentConfig.HOST, port=AgentConfig.PORT)
 

@@ -322,6 +322,20 @@ class Settings:
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
 
+    #: «Использовать RAG»: перед запросом к модели ищутся фрагменты в
+    #: выбранных базах знаний (`collection_ids`, коллекции knowledge_service)
+    #: и подставляются в запрос; ответ сопровождается источниками.
+    rag_enabled: bool = False
+    collection_ids: List[str] = field(default_factory=list)
+    #: Сколько фрагментов передавать модели.
+    rag_top_k: int = 5
+    #: Минимальное косинусное сходство; ниже — «ничего не найдено».
+    rag_score_threshold: float = 0.3
+    #: Отвечать только по базе знаний, без дополнения общими знаниями.
+    rag_only_from_kb: bool = True
+    #: Бюджет контекста для фрагментов (оценка в токенах).
+    rag_context_tokens: int = 4000
+
 
 def settings_from_defaults(defaults: DefaultSettings) -> Settings:
     """Строит полные настройки нового агента: поля, присутствующие в
@@ -386,6 +400,12 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "context_strategy", "title": "Стратегия", "group": "Стратегии управления контекстом"},
     {"sys_name": "context_strategy_limit", "title": "Предел числа сообщений", "group": "Стратегии управления контекстом"},
     {"sys_name": "extraction_system_prompt", "title": "Системный prompt для извлечения фактов", "group": "Стратегии управления контекстом"},
+    {"sys_name": "rag_enabled", "title": "Использовать RAG", "group": "База знаний"},
+    {"sys_name": "collection_ids", "title": "Базы знаний", "group": "База знаний"},
+    {"sys_name": "rag_top_k", "title": "Количество фрагментов", "group": "База знаний"},
+    {"sys_name": "rag_score_threshold", "title": "Порог сходства", "group": "База знаний"},
+    {"sys_name": "rag_only_from_kb", "title": "Отвечать только по базе знаний", "group": "База знаний"},
+    {"sys_name": "rag_context_tokens", "title": "Бюджет контекста для фрагментов (токены)", "group": "База знаний"},
     {"sys_name": "include_usage_in_stream", "title": "Показывать токены при потоковых ответах", "group": "Дополнительно"},
     {"sys_name": "logprobs", "title": "Показывать вероятности появления токенов", "group": "Дополнительно"},
     {"sys_name": "frequency_penalty", "title": "Штраф за частоту", "group": "Дополнительно"},
@@ -512,6 +532,12 @@ class Message:
     tool_events: Optional[str] = None
     #: Текст ошибки для `status == "failed"`.
     error: Optional[str] = None
+    #: RAG (ответ ассистента при «Использовать RAG»): JSON {"used", "query",
+    #: "status": "ok|not_found|unavailable", "error", "only_from_kb",
+    #: "sources": [{"n", "chunk_id", "score", "text", "section", "page",
+    #: "document_id", "title", "source", "source_type", "doc_date", "doc_version",
+    #: "collection_id", "collection_name"}], "cited": [n...], "confirmed"}.
+    rag: Optional[str] = None
     #: Кто отправил сообщение пользователя: "app" | "scheduler". Запросы
     #: планировщика считаются непрочитанными (пользователь их не писал).
     source: str = "app"

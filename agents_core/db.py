@@ -77,6 +77,12 @@ _SETTINGS_COLUMNS = [
     ("logprobs", "INTEGER"),
     ("frequency_penalty", "REAL"),
     ("presence_penalty", "REAL"),
+    ("rag_enabled", "INTEGER"),
+    ("collection_ids", "TEXT"),  # JSON-массив идентификаторов коллекций
+    ("rag_top_k", "INTEGER"),
+    ("rag_score_threshold", "REAL"),
+    ("rag_only_from_kb", "INTEGER"),
+    ("rag_context_tokens", "INTEGER"),
 ]
 
 _DEFAULT_SETTINGS_COLUMNS = [
@@ -107,7 +113,7 @@ _DEFAULT_STATE_MACHINE_RULE_INVARIANT_TITLES = [
 #: подставляются в SQL.
 _MESSAGE_UPDATABLE_FIELDS = (
     "content", "reasoning_content", "duration_ms", "total_tokens", "prompt_tokens", "completion_tokens",
-    "format", "facts", "task_events", "status", "tool_events", "error", "created_at",
+    "format", "facts", "task_events", "status", "tool_events", "error", "created_at", "rag",
 )
 
 #: Поля запуска, которые можно обновлять (`Database.update_run`).
@@ -152,6 +158,12 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "logprobs": int(settings.logprobs),
         "frequency_penalty": settings.frequency_penalty,
         "presence_penalty": settings.presence_penalty,
+        "rag_enabled": int(settings.rag_enabled),
+        "collection_ids": json.dumps(settings.collection_ids, ensure_ascii=False),
+        "rag_top_k": settings.rag_top_k,
+        "rag_score_threshold": settings.rag_score_threshold,
+        "rag_only_from_kb": int(settings.rag_only_from_kb),
+        "rag_context_tokens": settings.rag_context_tokens,
     }
 
 
@@ -192,6 +204,14 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         logprobs=bool(row["logprobs"]),
         frequency_penalty=row["frequency_penalty"],
         presence_penalty=row["presence_penalty"],
+        rag_enabled=bool(row["rag_enabled"]),
+        collection_ids=json.loads(row["collection_ids"]) if row["collection_ids"] else [],
+        rag_top_k=row["rag_top_k"] if row["rag_top_k"] is not None else Settings.rag_top_k,
+        rag_score_threshold=(row["rag_score_threshold"] if row["rag_score_threshold"] is not None
+                             else Settings.rag_score_threshold),
+        rag_only_from_kb=bool(row["rag_only_from_kb"]) if row["rag_only_from_kb"] is not None else True,
+        rag_context_tokens=(row["rag_context_tokens"] if row["rag_context_tokens"] is not None
+                            else Settings.rag_context_tokens),
     )
 
 
@@ -328,7 +348,8 @@ class Database:
                     run_id TEXT,
                     tool_events TEXT,
                     error TEXT,
-                    source TEXT NOT NULL DEFAULT 'app'
+                    source TEXT NOT NULL DEFAULT 'app',
+                    rag TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_branches (
@@ -768,8 +789,8 @@ class Database:
                    (chat_id, role, content, created_at, reasoning_content, is_summary,
                     duration_ms, total_tokens, prompt_tokens, completion_tokens,
                     format, branch, facts, task_events, is_task_manager_step,
-                    status, run_id, tool_events, error, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, run_id, tool_events, error, source, rag)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.chat_id, message.role, message.content, message.created_at,
                     message.reasoning_content, int(message.is_summary),
@@ -778,6 +799,7 @@ class Database:
                     message.format, message.branch, message.facts, message.task_events,
                     int(message.is_task_manager_step),
                     message.status, message.run_id, message.tool_events, message.error, message.source,
+                    message.rag,
                 ),
             )
             message.id = cur.lastrowid
@@ -837,6 +859,7 @@ class Database:
             tool_events=row["tool_events"],
             error=row["error"],
             source=row["source"],
+            rag=row["rag"],
         )
 
     def list_messages(self, chat_id: str) -> List[Message]:

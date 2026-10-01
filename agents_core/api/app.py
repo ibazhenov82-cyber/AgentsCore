@@ -22,6 +22,7 @@ from ..db import Database
 from ..events import EventsGone
 from ..logging_setup import configure_logging
 from ..mcp_client import build_mcp_client
+from ..knowledge import KnowledgeClient
 from ..providers import ProviderError, ProviderRegistry
 from ..repository import (
     NotConfiguredError,
@@ -72,7 +73,12 @@ def create_app(config: type = AgentConfig, enable_mcp: Optional[bool] = None) ->
         build_mcp_client(servers, api_key=config.MCP_API_KEY or None, timeout=config.MCP_REQUEST_TIMEOUT)
         if mcp_enabled else None
     )
-    repo = Repository(db, registry, catalog, mcp_client=mcp_client)
+    knowledge_client = (
+        KnowledgeClient(config.KNOWLEDGE_SERVICE_URL, config.KNOWLEDGE_SERVICE_API_KEY or None,
+                        config.KNOWLEDGE_SERVICE_TIMEOUT)
+        if config.KNOWLEDGE_SERVICE_URL else None
+    )
+    repo = Repository(db, registry, catalog, mcp_client=mcp_client, knowledge_client=knowledge_client)
     return create_app_with_repository(repo)
 
 
@@ -163,6 +169,9 @@ def create_app_with_repository(repo: Repository, run_manager: Optional[RunManage
             f"{'.'.join(str(p) for p in err.get('loc', []) if p != 'body')}: {err.get('msg', '')}"
             for err in exc.errors()
         )
-        return JSONResponse(status_code=422, content={"error": details or "некорректный запрос"})
+        # Неизвестное поле в теле (например, в настройках) — 400, как и
+        # остальные ошибки проверки параметров сервисом.
+        status = 400 if any(err.get("type") == "extra_forbidden" for err in exc.errors()) else 422
+        return JSONResponse(status_code=status, content={"error": details or "некорректный запрос"})
 
     return app
