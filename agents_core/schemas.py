@@ -106,6 +106,12 @@ class SettingsOut(BaseModel):
     rag_score_threshold: float = Field(0.3, ge=0, le=1, description="Минимальное косинусное сходство фрагмента")
     rag_only_from_kb: bool = Field(True, description="Отвечать только по базе знаний, без общих знаний модели")
     rag_context_tokens: int = Field(4000, ge=200, le=100000, description="Бюджет контекста для фрагментов (оценка в токенах)")
+    rag_candidate_k: int = Field(20, ge=1, le=200, description="Кандидатов до фильтрации (этап 1 поиска); rag_top_k — после")
+    rag_rerank: str = Field("none", description="Реранкинг: 'none' | 'heuristic' («Эвристика (без LLM)») | 'model' («Модель-реранкер»)")
+    rag_rerank_model: str = Field("", description="Модель-реранкер «провайдер/модель» из GET /api/v1/rerank-models сервиса баз знаний; '' — по умолчанию")
+    rag_rerank_threshold: float = Field(0.3, ge=0, le=1, description="Порог отсечения после реранкинга (0..1)")
+    rag_query_rewrite: str = Field("follow_up", description="Переписывание запроса: 'off' | 'follow_up' («Дополнять уточняющие») | 'llm' («Моделью до поиска»)")
+    rag_rewrite_model: str = Field("", description="Модель переписывания 'provider:model'; '' — модель агента")
 
     tools_sources: List[str] = Field(
         default_factory=list,
@@ -114,7 +120,8 @@ class SettingsOut(BaseModel):
             "источники инструментов реально дают эффект в этом чате/агенте прямо сейчас: 'own' "
             "(свой JSON в tools_json), 'memory' (save_working_memory/save_long_term_memory), "
             "'task' (start_task/apply_task_action), 'skills' (скиллы активного профиля чата — "
-            "только для чата, не для агента), 'mcp' (инструменты подключённого MCP-сервера). "
+            "только для чата, не для агента), 'mcp' (инструменты подключённого MCP-сервера), "
+            "'agents_core' (встроенные инструменты группы «Доступ к agents core», например read_chat). "
             "Пустой список — ни один источник сейчас ничего не добавляет к tools_json запроса."
         ),
     )
@@ -182,6 +189,12 @@ class SettingsPatch(BaseModel):
     rag_score_threshold: Optional[float] = Field(None, ge=0, le=1)
     rag_only_from_kb: Optional[bool] = None
     rag_context_tokens: Optional[int] = Field(None, ge=200, le=100000)
+    rag_candidate_k: Optional[int] = Field(None, ge=1, le=200)
+    rag_rerank: Optional[str] = None
+    rag_rerank_model: Optional[str] = None
+    rag_rerank_threshold: Optional[float] = Field(None, ge=0, le=1)
+    rag_query_rewrite: Optional[str] = None
+    rag_rewrite_model: Optional[str] = None
 
     model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {"temperature": 0.7, "max_tokens": 2048}})
 
@@ -318,7 +331,7 @@ class MessageOut(BaseModel):
         ),
     )
     error: Optional[str] = Field(None, description="Текст ошибки для status='failed'")
-    source: str = Field("app", description="Кто отправил сообщение пользователя: 'app' | 'scheduler'")
+    source: str = Field("app", description="Кто отправил сообщение пользователя: 'app' | 'scheduler' | 'test_dialog' (вопрос тестового диалога)")
     rag: Optional[str] = Field(
         None,
         description=(
@@ -650,6 +663,61 @@ class InvariantOut(BaseModel):
     updated_at: int
 
 
+class TestDialogOut(BaseModel):
+    id: str
+    name: str
+    questions: List[str]
+    question_count: int
+    created_at: int
+    updated_at: int
+
+
+class TestDialogCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200, examples=["Регламенты: 10 вопросов"])
+    questions: List[str] = Field(
+        ..., description="Вопросы по порядку; пустые и повторяющиеся (без учёта регистра и знаков в конце) — 400",
+        examples=[["Сколько дней даётся на ревью кода?", "А для срочных исправлений?"]],
+    )
+
+
+class TestDialogPatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    questions: Optional[List[str]] = None
+
+    def to_payload(self) -> dict:
+        return self.model_dump(exclude_unset=True)
+
+
+class TestDialogImportRequest(BaseModel):
+    text: str = Field(..., description="Содержимое текстового файла: каждая непустая строка — вопрос")
+    existing: List[str] = Field(
+        default_factory=list, description="Вопросы, уже записанные в редакторе — с ними тоже сверяются дубликаты",
+    )
+
+
+class TestDialogImportDuplicate(BaseModel):
+    line: int = Field(..., description="Номер строки в файле")
+    question: str
+    reason: str = Field(..., description="'file' — повтор внутри файла; 'existing' — уже есть в тестовом диалоге")
+    duplicate_of: str = Field(..., description="Вопрос, с которым совпал")
+
+
+class TestDialogImportOut(BaseModel):
+    added: List[str] = Field(..., description="Новые вопросы в порядке файла")
+    duplicates: List[TestDialogImportDuplicate]
+    lines: int = Field(..., description="Непустых строк в файле")
+    skipped_too_long: List[int] = Field(default_factory=list, description="Строки длиннее 4000 символов")
+
+
+class TestDialogRunRequest(BaseModel):
+    get_facts: bool = False
+    sliding_window: bool = False
+    autosummary: str = "off"
+    branch: Optional[int] = None
+    client_request_id: Optional[str] = Field(None, max_length=200)
+    source: str = Field("app", description="'app' | 'scheduler'")
+
+
 class InvariantCreate(BaseModel):
     title: str = Field(..., min_length=1, examples=["Только Clean Architecture"])
     rule_text: str = Field(..., min_length=1, examples=["В этом проекте используется Clean Architecture, слой presentation не обращается к data напрямую"])
@@ -839,9 +907,19 @@ class ErrorOut(BaseModel):
 # Асинхронные запуски, непрочитанные, создание задачи (ТЗ, этап 1)
 # ---------------------------------------------------------------------------
 
+class TestDialogProgressOut(BaseModel):
+    id: str
+    name: str
+    step: int = Field(..., description="Номер текущего вопроса (с 1)")
+    total: int = Field(..., description="Всего вопросов")
+
+
 class RunBriefOut(BaseModel):
     id: str
-    kind: str = Field(..., description="'message' | 'task_step' | 'task_run'")
+    kind: str = Field(..., description="'message' | 'task_step' | 'task_run' | 'test_dialog'")
+    test_dialog: Optional[TestDialogProgressOut] = Field(
+        None, description="Для `kind='test_dialog'`: какой тестовый диалог и на каком вопросе",
+    )
     status: str = Field(..., description="'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted'")
     current_status: Optional[str] = Field(None, description="Текущая фаза для интерфейса")
 
@@ -944,7 +1022,8 @@ class McpToolOut(BaseModel):
     group: str = Field(
         ...,
         description="Подпись источника для интерфейса: группа из `_meta[\"agentscore/group\"]` инструмента "
-        "(«GIT API», «Локальный GIT», «Планировщик»), иначе — имя сервера из MCP_SERVERS",
+        "(«GIT API», «Локальный GIT», «Планировщик»), иначе — имя сервера из MCP_SERVERS; "
+        "встроенные инструменты AgentsCore — «Доступ к agents core» (server='agents_core')",
     )
     title: str = Field("", description="Краткое русское описание")
     description: str = ""

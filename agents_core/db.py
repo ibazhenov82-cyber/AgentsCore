@@ -31,6 +31,7 @@ from .models import (
     Chat,
     DefaultSettings,
     Invariant,
+    TestDialog,
     LongTermMemoryEntry,
     Message,
     ModelInfo,
@@ -83,6 +84,12 @@ _SETTINGS_COLUMNS = [
     ("rag_score_threshold", "REAL"),
     ("rag_only_from_kb", "INTEGER"),
     ("rag_context_tokens", "INTEGER"),
+    ("rag_candidate_k", "INTEGER"),
+    ("rag_rerank", "TEXT"),
+    ("rag_rerank_model", "TEXT"),
+    ("rag_rerank_threshold", "REAL"),
+    ("rag_query_rewrite", "TEXT"),
+    ("rag_rewrite_model", "TEXT"),
 ]
 
 _DEFAULT_SETTINGS_COLUMNS = [
@@ -119,7 +126,7 @@ _MESSAGE_UPDATABLE_FIELDS = (
 #: Поля запуска, которые можно обновлять (`Database.update_run`).
 _RUN_UPDATABLE_FIELDS = (
     "status", "current_status", "assistant_message_id", "user_message_id", "last_seq", "error",
-    "started_at", "finished_at", "task_id",
+    "started_at", "finished_at", "task_id", "request_json",
 )
 
 
@@ -164,6 +171,12 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "rag_score_threshold": settings.rag_score_threshold,
         "rag_only_from_kb": int(settings.rag_only_from_kb),
         "rag_context_tokens": settings.rag_context_tokens,
+        "rag_candidate_k": settings.rag_candidate_k,
+        "rag_rerank": settings.rag_rerank,
+        "rag_rerank_model": settings.rag_rerank_model,
+        "rag_rerank_threshold": settings.rag_rerank_threshold,
+        "rag_query_rewrite": settings.rag_query_rewrite,
+        "rag_rewrite_model": settings.rag_rewrite_model,
     }
 
 
@@ -212,6 +225,13 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         rag_only_from_kb=bool(row["rag_only_from_kb"]) if row["rag_only_from_kb"] is not None else True,
         rag_context_tokens=(row["rag_context_tokens"] if row["rag_context_tokens"] is not None
                             else Settings.rag_context_tokens),
+        rag_candidate_k=row["rag_candidate_k"] if row["rag_candidate_k"] is not None else Settings.rag_candidate_k,
+        rag_rerank=row["rag_rerank"] or Settings.rag_rerank,
+        rag_rerank_model=row["rag_rerank_model"] or "",
+        rag_rerank_threshold=(row["rag_rerank_threshold"] if row["rag_rerank_threshold"] is not None
+                              else Settings.rag_rerank_threshold),
+        rag_query_rewrite=row["rag_query_rewrite"] or Settings.rag_query_rewrite,
+        rag_rewrite_model=row["rag_rewrite_model"] or "",
     )
 
 
@@ -248,6 +268,32 @@ def _row_to_default_settings(row: sqlite3.Row) -> DefaultSettings:
     )
 
 
+class SchemaMismatchError(RuntimeError):
+    """Файл базы создан прежней версией сервиса: миграций нет, базу нужно пересоздать."""
+
+
+def _table_columns(conn: sqlite3.Connection) -> Dict[str, List[str]]:
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    return {t: [r[1] for r in conn.execute(f"PRAGMA table_info({t})")] for t in tables}
+
+
+def schema_differences(conn: sqlite3.Connection, schema: str) -> List[str]:
+    """Расхождения схемы файла с текущей схемой: «таблица: нет колонок …»."""
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.executescript(schema)
+        expected = _table_columns(reference)
+    finally:
+        reference.close()
+    actual = _table_columns(conn)
+    problems = []
+    for table, columns in expected.items():
+        missing = [c for c in columns if c not in actual.get(table, columns)]
+        if missing:
+            problems.append(f"{table}: нет колонок {', '.join(missing)}")
+    return problems
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -275,7 +321,7 @@ class Database:
             # WAL — читатели не блокируют писателя и наоборот (параллельные
             # запуски в разных чатах + SSE-подписки, читающие черновики).
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.executescript(
+            schema = (
                 f"""
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
@@ -399,6 +445,14 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS test_dialogs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    questions TEXT NOT NULL DEFAULT '[]',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS working_memory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
@@ -462,6 +516,16 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_task_transition_log_task_id ON task_transition_log(task_id);
                 """
             )
+            conn.executescript(schema)
+            problems = schema_differences(conn, schema)
+            if problems:
+                # Без проверки сервис стартует, а падает на первом запросе с
+                # «no such column» — лучше сразу и с понятной подсказкой.
+                raise SchemaMismatchError(
+                    f"база {self.path} создана прежней версией AgentsCore ({'; '.join(problems)}). "
+                    "Миграций нет: остановите сервис, удалите файл базы (и файлы -wal, -shm рядом) "
+                    "и запустите сервис заново."
+                )
             self._seed_task_state_machine_rule_invariants(conn)
 
     def _seed_task_state_machine_rule_invariants(self, conn: sqlite3.Connection) -> None:
@@ -1170,6 +1234,55 @@ class Database:
                         "UPDATE task_machine_settings SET invariant_ids = ? WHERE id = 1",
                         (json.dumps(ids, ensure_ascii=False),),
                     )
+
+    # ---- тестовые диалоги (общий справочник) --------------------------------
+
+    @staticmethod
+    def _row_to_test_dialog(row: sqlite3.Row) -> TestDialog:
+        return TestDialog(
+            id=row["id"], name=row["name"], questions=json.loads(row["questions"]) if row["questions"] else [],
+            created_at=row["created_at"], updated_at=row["updated_at"],
+        )
+
+    def create_test_dialog(self, name: str, questions: List[str]) -> TestDialog:
+        dialog_id = str(uuid.uuid4())
+        now = int(time.time())
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO test_dialogs (id, name, questions, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (dialog_id, name, json.dumps(questions, ensure_ascii=False), now, now),
+            )
+        return TestDialog(id=dialog_id, name=name, questions=list(questions), created_at=now, updated_at=now)
+
+    def get_test_dialog(self, dialog_id: str) -> Optional[TestDialog]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM test_dialogs WHERE id = ?", (dialog_id,)).fetchone()
+            return self._row_to_test_dialog(row) if row is not None else None
+
+    def list_test_dialogs(self) -> List[TestDialog]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM test_dialogs ORDER BY name COLLATE NOCASE, created_at").fetchall()
+            return [self._row_to_test_dialog(r) for r in rows]
+
+    def update_test_dialog(self, dialog_id: str, name: Optional[str] = None,
+                           questions: Optional[List[str]] = None) -> None:
+        fields: Dict[str, Any] = {}
+        if name is not None:
+            fields["name"] = name
+        if questions is not None:
+            fields["questions"] = json.dumps(questions, ensure_ascii=False)
+        if not fields:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE test_dialogs SET {assignments}, updated_at = ? WHERE id = ?",
+                list(fields.values()) + [int(time.time()), dialog_id],
+            )
+
+    def delete_test_dialog(self, dialog_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM test_dialogs WHERE id = ?", (dialog_id,))
 
     # ---- задачи (tasks, область видимости — чат) -----------------------------
     # Машина состояний — в коде (`task_state_machine.py`), см. модуль-докстринг

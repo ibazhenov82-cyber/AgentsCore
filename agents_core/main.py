@@ -14,9 +14,13 @@ import uvicorn
 
 from .api.app import create_app
 from .config import AgentConfig
+from .db import SchemaMismatchError
 from .mcp_client import McpServerSpec, normalize_mcp_base_url
 
-app = create_app()
+try:
+    app = create_app()
+except SchemaMismatchError as exc:
+    raise SystemExit(f"[agents_core] Ошибка: {exc}") from None
 
 
 def _describe_server(server) -> str:

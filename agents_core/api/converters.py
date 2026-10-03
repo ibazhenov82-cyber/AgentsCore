@@ -4,6 +4,7 @@ Pydantic-модели ответов (`agents_core.schemas`)."""
 from __future__ import annotations
 
 import dataclasses
+import json
 
 from ..models import Agent, Branch, Chat, Invariant, LongTermMemoryEntry, Message, ModelInfo, Profile, Run, WorkingMemoryEntry
 from ..schemas import (
@@ -28,6 +29,8 @@ from ..schemas import (
     TaskStateInfoOut,
     TaskStateMachineInfoOut,
     TaskSummaryOut,
+    TestDialogOut,
+    TestDialogProgressOut,
     WorkingMemoryOut,
 )
 
@@ -91,11 +94,33 @@ def chat_out(chat: Chat, stats: dict, repo=None) -> ChatOut:
 
 
 def run_brief_out(run: Run) -> RunBriefOut:
-    return RunBriefOut(id=run.id, kind=run.kind, status=run.status, current_status=run.current_status)
+    return RunBriefOut(id=run.id, kind=run.kind, status=run.status, current_status=run.current_status,
+                       test_dialog=_test_dialog_progress(run))
+
+
+def _test_dialog_progress(run: Run):
+    if run.kind != "test_dialog":
+        return None
+    try:
+        request = json.loads(run.request_json or "{}")
+        return TestDialogProgressOut(
+            id=request["test_dialog_id"], name=request.get("name", ""), step=int(request.get("step", 1)),
+            total=int(request.get("total", 0)),
+        )
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def test_dialog_out(dialog) -> TestDialogOut:
+    return TestDialogOut(
+        id=dialog.id, name=dialog.name, questions=list(dialog.questions), question_count=len(dialog.questions),
+        created_at=dialog.created_at, updated_at=dialog.updated_at,
+    )
 
 
 def run_out(run: Run) -> RunOut:
     return RunOut(
+        test_dialog=_test_dialog_progress(run),
         id=run.id, kind=run.kind, status=run.status, current_status=run.current_status, chat_id=run.chat_id,
         source=run.source, task_id=run.task_id, client_request_id=run.client_request_id,
         user_message_id=run.user_message_id, assistant_message_id=run.assistant_message_id,

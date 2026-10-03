@@ -32,7 +32,7 @@ from ..repository import (
     ValidationError,
 )
 from ..runs import RunConflictError, RunManager
-from . import agents, chats, health, invariants, mcp_tools, memory, messages, models_routes, runs, settings_routes, tasks
+from . import agents, chats, health, invariants, mcp_tools, memory, messages, models_routes, runs, settings_routes, tasks, test_dialogs
 from .logging_middleware import AccessLogMiddleware
 
 DESCRIPTION = """
@@ -124,6 +124,7 @@ def create_app_with_repository(repo: Repository, run_manager: Optional[RunManage
     app.include_router(messages.router)
     app.include_router(memory.router)
     app.include_router(invariants.router)
+    app.include_router(test_dialogs.router)
     app.include_router(tasks.router)
     app.include_router(runs.router)
     app.include_router(mcp_tools.router)

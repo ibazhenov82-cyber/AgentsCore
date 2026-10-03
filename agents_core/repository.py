@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -26,8 +27,9 @@ from .format_detect import detect_message_format
 from .invariant_checks import format_violation_warning, validate_response
 from .events import CancelToken, EventLog, RunCancelled
 from .knowledge import (
-    RAG_STATUS_NOT_FOUND, RAG_STATUS_OK, RAG_STATUS_UNAVAILABLE, KnowledgeClient, KnowledgeServiceError, RagOutcome,
-    augmented_question, citations, rag_instruction, search_query, select_sources,
+    RAG_STATUS_NOT_FOUND, RAG_STATUS_OK, RAG_STATUS_UNAVAILABLE, REWRITE_INSTRUCTION, RERANK_MODES, REWRITE_MODES,
+    KnowledgeClient, KnowledgeServiceError, RagOutcome, augmented_question, citations, clean_rewritten,
+    rag_instruction, rewrite_request_text, search_query, select_sources,
 )
 from .mcp_client import MCPClient, MCPClientError
 from .models import (
@@ -50,6 +52,7 @@ from .models import (
     Profile,
     Settings,
     Task,
+    TestDialog,
     TASK_APPLIED_BY_OPTIONS,
     TaskTransitionLog,
     WorkingMemoryEntry,
@@ -68,6 +71,10 @@ from .task_state_machine import (
     parse_task_state,
 )
 from .tokens import estimate_messages_tokens
+from . import builtin_tools
+from . import test_dialogs as test_dialog_rules
+
+_logger = logging.getLogger("agents_core.repository")
 
 _SETTINGS_FIELD_NAMES = {f.name for f in dataclasses.fields(Settings)}
 _DEFAULT_SETTINGS_FIELD_NAMES = {f.name for f in dataclasses.fields(DefaultSettings)}
@@ -278,6 +285,12 @@ def _validate_settings_payload(payload: dict) -> None:
         value = payload["context_strategy"]
         if value is not None and value not in CONTEXT_STRATEGY_OPTIONS:
             raise ValidationError(f"invalid context_strategy: {value!r}")
+    if "rag_rerank" in payload and payload["rag_rerank"] not in RERANK_MODES:
+        raise ValidationError(f"rag_rerank: ожидается одно из {sorted(RERANK_MODES)}")
+    if "rag_query_rewrite" in payload and payload["rag_query_rewrite"] not in REWRITE_MODES:
+        raise ValidationError(f"rag_query_rewrite: ожидается одно из {sorted(REWRITE_MODES)}")
+    if payload.get("rag_rewrite_model"):
+        _split_model(payload["rag_rewrite_model"])
     if "context_strategy_limit" in payload:
         value = payload["context_strategy_limit"]
         if value is not None and value <= 2:
@@ -1225,6 +1238,66 @@ class Repository:
         self._db.set_chat_invariants(chat_id, deduped)
         return self._require_chat(chat_id)
 
+    # ---- тестовые диалоги (общий справочник) --------------------------------
+
+    def _require_test_dialog(self, dialog_id: str) -> TestDialog:
+        dialog = self._db.get_test_dialog(dialog_id)
+        if dialog is None:
+            raise NotFoundError(f"тестовый диалог {dialog_id} не найден")
+        return dialog
+
+    def list_test_dialogs(self) -> List[TestDialog]:
+        return self._db.list_test_dialogs()
+
+    def get_test_dialog(self, dialog_id: str) -> TestDialog:
+        return self._require_test_dialog(dialog_id)
+
+    def _clean_test_dialog_name(self, name: Optional[str], exclude_id: Optional[str] = None) -> str:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            raise ValidationError("name: нужно наименование тестового диалога")
+        if len(cleaned) > test_dialog_rules.MAX_NAME_CHARS:
+            raise ValidationError(f"name: не длиннее {test_dialog_rules.MAX_NAME_CHARS} символов")
+        for other in self._db.list_test_dialogs():
+            if other.id != exclude_id and other.name.casefold() == cleaned.casefold():
+                raise ValidationError(f"name: тестовый диалог «{cleaned}» уже есть")
+        return cleaned
+
+    @staticmethod
+    def _clean_test_dialog_questions(questions: List[str]) -> List[str]:
+        try:
+            return test_dialog_rules.validate_questions(list(questions))
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from None
+
+    def create_test_dialog(self, name: str, questions: List[str]) -> TestDialog:
+        return self._db.create_test_dialog(
+            self._clean_test_dialog_name(name), self._clean_test_dialog_questions(questions),
+        )
+
+    def update_test_dialog(self, dialog_id: str, payload: dict) -> TestDialog:
+        self._require_test_dialog(dialog_id)
+        unknown = set(payload) - {"name", "questions"}
+        if unknown:
+            raise ValidationError(f"unknown test dialog field(s): {', '.join(sorted(unknown))}")
+        name = self._clean_test_dialog_name(payload["name"], exclude_id=dialog_id) if "name" in payload else None
+        questions = (self._clean_test_dialog_questions(payload["questions"] or [])
+                     if "questions" in payload else None)
+        self._db.update_test_dialog(dialog_id, name=name, questions=questions)
+        return self._require_test_dialog(dialog_id)
+
+    def delete_test_dialog(self, dialog_id: str) -> None:
+        self._require_test_dialog(dialog_id)
+        self._db.delete_test_dialog(dialog_id)
+
+    @staticmethod
+    def parse_test_dialog_questions(text: str, existing: Optional[List[str]] = None) -> dict:
+        """Импорт вопросов из текстового файла: строка = вопрос, дубликаты (в
+        файле и среди уже записанных вопросов) пропускаются и перечисляются."""
+        if text is None or not text.strip():
+            raise ValidationError("text: файл пустой")
+        return test_dialog_rules.parse_questions(text, existing or [])
+
     # ---- машина состояний задач (read-only, задана в коде) -------------------
     # "Работу с задачами требуется переделать" (новое ТЗ) — каталог
     # состояний/переходов больше не в БД, см. `task_state_machine.py`; здесь
@@ -1723,11 +1796,13 @@ class Repository:
         return dataclasses.replace(chat.settings, tools_json=json.dumps(deduped, ensure_ascii=False))
 
     def list_mcp_tools(self) -> List[dict]:
-        """Инструменты всех подключённых MCP-серверов для интерфейса (см.
-        `mcp_client.MCPClient.list_tool_details`); пусто без MCP."""
-        if self._mcp_client is None:
-            return []
-        return self._mcp_client.list_tool_details()
+        """Инструменты для выбора в настройках: всех подключённых MCP-серверов
+        (см. `mcp_client.MCPClient.list_tool_details`) и встроенные инструменты
+        группы «Доступ к agents core» (`builtin_tools`) — для пользователя они
+        выглядят так же, как инструменты MCP."""
+        mcp_tools = self._mcp_client.list_tool_details() if self._mcp_client is not None else []
+        mcp_tools = [t for t in mcp_tools if not builtin_tools.is_builtin(t["name"])]
+        return mcp_tools + builtin_tools.tool_details()
 
     def _tools_sources_for(self, settings: Settings, chat: Optional[Chat] = None) -> List[str]:
         """Список активных ИСТОЧНИКОВ инструментов текущего чата/агента —
@@ -1758,10 +1833,13 @@ class Repository:
         # `_settings_with_merged_tools`) — источник "mcp" активен, только если
         # среди выбранных в `tools_json` есть хотя бы один инструмент,
         # известный MCP-серверу.
+        offered = self._offered_tool_names(settings)
         if self._mcp_client is not None and any(
-            self._mcp_client.has_cached_tool(name) for name in self._offered_tool_names(settings)
+            self._mcp_client.has_cached_tool(name) and not builtin_tools.is_builtin(name) for name in offered
         ):
             sources.append("mcp")
+        if any(builtin_tools.is_builtin(name) for name in offered):
+            sources.append("agents_core")
         return sources
 
     @staticmethod
@@ -1836,6 +1914,13 @@ class Repository:
             try:
                 result = handler(self, chat, agent, arguments, auto_pause, events)
             except Exception as exc:  # сбой одного скилла не должен ронять весь запрос
+                result = {"error": str(exc)}
+        elif builtin_tools.is_builtin(name) and (allowed_mcp_names is None or name in allowed_mcp_names):
+            # Встроенный инструмент «Доступ к agents core» — выполняется здесь,
+            # без MCP; доступен, только если выбран в настройках (tools_json).
+            try:
+                result = builtin_tools.execute(self, chat, name, arguments)
+            except Exception as exc:  # noqa: BLE001
                 result = {"error": str(exc)}
         elif (
             self._mcp_client is not None
@@ -2270,8 +2355,51 @@ class Repository:
         if not chat.settings.collection_ids:
             raise ValidationError("Включено «Использовать RAG», но не выбраны базы знаний")
 
+    def _rewrite_query(self, chat: Chat, history: List[Message], text: str) -> Tuple[str, dict]:
+        """Поисковый запрос по настройке «Переписывание запроса»:
+        «Нет» — вопрос как есть; «Дополнять уточняющие» — короткий вопрос
+        склеивается с предыдущим вопросом пользователя; «Моделью до поиска» —
+        модель (модель переписывания или модель агента) по последним репликам
+        диалога формулирует самостоятельный поисковый запрос. Ошибка модели не
+        прерывает ответ — поиск идёт по исходному вопросу."""
+        mode = chat.settings.rag_query_rewrite
+        info: dict = {"mode": mode, "rewritten": False, "model": None, "error": None, "tokens": None}
+        if mode == "off":
+            return text.strip(), info
+        if mode != "llm":
+            previous = next((m.content for m in reversed(history) if m.role == "user" and not m.is_summary), None)
+            query = search_query(text, previous)
+            info["rewritten"] = query != text.strip()
+            return query, info
+        model = chat.settings.rag_rewrite_model or chat.settings.model
+        info["model"] = model
+        try:
+            if self._catalog.get(model) is None:
+                raise ProviderError(f"модель переписывания {model!r} не найдена в каталоге")
+            provider_name, model_id = _split_model(model)
+            provider = self._registry.get(provider_name)
+            request_settings = dataclasses.replace(
+                chat.settings, model=model, temperature=0.0, top_p=1.0, max_tokens=150, thinking_enabled=False,
+                reasoning_effort=None, json_mode=False, stop_sequences=[], tools_json="", tool_choice="auto",
+                logprobs=False, frequency_penalty=None, presence_penalty=None,
+            )
+            result = provider.chat(model_id, [
+                ProviderMessage("system", REWRITE_INSTRUCTION),
+                ProviderMessage("user", rewrite_request_text(history, text)),
+            ], request_settings)
+            info["tokens"] = result.usage.total_tokens if result.usage else None
+            query = clean_rewritten(result.content)
+            if not query:
+                raise ProviderError("модель вернула пустой или слишком длинный запрос")
+        except (ProviderError, ValidationError) as exc:
+            info["error"] = f"переписать не удалось: {exc}"
+            return text.strip(), info
+        info["rewritten"] = query != text.strip()
+        return query, info
+
     def _prepare_rag(
         self, chat: Chat, history: List[Message], text: str, provider_messages: List[ProviderMessage],
+        query: Optional[str] = None, rewrite: Optional[dict] = None,
     ) -> RagOutcome:
         """Поиск фрагментов и сборка запроса: перед последним сообщением
         (вопросом) — инструкция RAG, сам вопрос заменяется на «Контекст +
@@ -2279,17 +2407,37 @@ class Repository:
         `Message.rag` ответа. Недоступность сервиса не прерывает ответ: модель
         отвечает без базы знаний и предупреждает об этом."""
         settings = chat.settings
-        previous = next((m.content for m in reversed(history) if m.role == "user" and not m.is_summary), None)
-        query = search_query(text, previous)
-        outcome = RagOutcome(query=query, status=RAG_STATUS_OK, only_from_kb=settings.rag_only_from_kb)
+        if query is None:
+            query, rewrite = self._rewrite_query(chat, history, text)
+        candidate_k = max(settings.rag_candidate_k, settings.rag_top_k)
+        outcome = RagOutcome(
+            query=query, status=RAG_STATUS_OK, only_from_kb=settings.rag_only_from_kb, original_query=text.strip(),
+            rewrite=rewrite or {}, params={
+                "candidate_k": candidate_k, "top_k": settings.rag_top_k,
+                "score_threshold": settings.rag_score_threshold, "rerank": settings.rag_rerank,
+                "rerank_threshold": settings.rag_rerank_threshold if settings.rag_rerank != "none" else None,
+            },
+        )
         try:
-            found = self._knowledge.retrieve(query, list(settings.collection_ids), settings.rag_top_k,
-                                             settings.rag_score_threshold)
+            found = self._knowledge.retrieve(
+                query, list(settings.collection_ids), settings.rag_top_k, settings.rag_score_threshold,
+                candidate_k=candidate_k, rerank=settings.rag_rerank, rerank_model=settings.rag_rerank_model or None,
+                rerank_threshold=settings.rag_rerank_threshold,
+            )
+            outcome.stages = found.get("stages") or {}
+            outcome.missing_collections = list(found.get("missing_collections") or [])
+            if outcome.missing_collections:
+                _logger.warning("Чат %s: базы знаний не найдены в knowledge_service: %s",
+                                chat.id, ", ".join(outcome.missing_collections))
+            outcome.rerank = found.get("rerank") or {}
             outcome.sources = select_sources(found["results"], settings.rag_context_tokens)
             if not outcome.sources:
                 outcome.status = RAG_STATUS_NOT_FOUND
         except KnowledgeServiceError as exc:
             outcome.status, outcome.error = RAG_STATUS_UNAVAILABLE, str(exc)
+            # Причина видна под ответом и в логе: без неё «База знаний недоступна»
+            # не отличить от сетевой ошибки, удалённой базы или сбоя эмбеддингов.
+            _logger.warning("Чат %s: поиск в базе знаний не удался: %s", chat.id, exc)
         question = provider_messages[-1]
         provider_messages[-1:] = [
             ProviderMessage("system", rag_instruction(outcome)),
@@ -2374,6 +2522,8 @@ class Repository:
             return "task"
         if name in self._TOOL_HANDLERS:
             return "skill"
+        if builtin_tools.is_builtin(name):
+            return "agents_core"
         if (
             self._mcp_client is not None and self._mcp_client.has_cached_tool(name)
             and (allowed_mcp_names is None or name in allowed_mcp_names)
@@ -2391,7 +2541,8 @@ class Repository:
         source = self._tool_source(name, allowed_mcp_names)
         # Для MCP — подпись источника («GIT API», «Планировщик», имя внешнего
         # сервера): клиент показывает её в строке «Использую инструмент …».
-        group = self._mcp_client.tool_group(name) if source == "mcp" else None
+        group = (self._mcp_client.tool_group(name) if source == "mcp"
+                 else builtin_tools.GROUP_AGENTS_CORE if source == "agents_core" else None)
         started_event = {
             "type": "tool_call", "name": name, "source": source, "group": group,
             "status": "started", "ok": None, "error": None,
@@ -2579,8 +2730,13 @@ class Repository:
 
                 rag: Optional[RagOutcome] = None
                 if chat.settings.rag_enabled:
+                    if chat.settings.rag_query_rewrite == "llm":
+                        yield {"type": "status", "status": "Переписываю запрос"}
+                    search_text, rewrite_info = self._rewrite_query(chat, messages, text)
+                    if token is not None:
+                        token.raise_if_cancelled()
                     yield {"type": "status", "status": "Поиск в базе знаний"}
-                    rag = self._prepare_rag(chat, messages, text, provider_messages)
+                    rag = self._prepare_rag(chat, messages, text, provider_messages, search_text, rewrite_info)
                     acc.rag = rag.to_dict()
                     yield {"type": "rag_context", "rag": acc.rag}
                     if token is not None:

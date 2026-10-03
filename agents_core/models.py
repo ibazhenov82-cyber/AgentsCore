@@ -335,6 +335,18 @@ class Settings:
     rag_only_from_kb: bool = True
     #: Бюджет контекста для фрагментов (оценка в токенах).
     rag_context_tokens: int = 4000
+    #: Кандидатов до фильтрации (этап 1 поиска); `rag_top_k` — после.
+    rag_candidate_k: int = 20
+    #: Реранкинг (этап 2, выполняет knowledge_service): "none" | "heuristic" | "model".
+    rag_rerank: str = "none"
+    #: Модель-реранкер «провайдер/модель» из списка knowledge_service; "" — модель сервиса по умолчанию.
+    rag_rerank_model: str = ""
+    #: Порог отсечения после реранкинга (0..1).
+    rag_rerank_threshold: float = 0.3
+    #: Переписывание запроса перед поиском: "off" | "follow_up" | "llm".
+    rag_query_rewrite: str = "follow_up"
+    #: Модель переписывания ("provider:model"); "" — модель агента.
+    rag_rewrite_model: str = ""
 
 
 def settings_from_defaults(defaults: DefaultSettings) -> Settings:
@@ -406,6 +418,12 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "rag_score_threshold", "title": "Порог сходства", "group": "База знаний"},
     {"sys_name": "rag_only_from_kb", "title": "Отвечать только по базе знаний", "group": "База знаний"},
     {"sys_name": "rag_context_tokens", "title": "Бюджет контекста для фрагментов (токены)", "group": "База знаний"},
+    {"sys_name": "rag_candidate_k", "title": "Кандидатов до фильтрации", "group": "База знаний"},
+    {"sys_name": "rag_rerank", "title": "Реранкинг", "group": "База знаний"},
+    {"sys_name": "rag_rerank_model", "title": "Модель-реранкер", "group": "База знаний"},
+    {"sys_name": "rag_rerank_threshold", "title": "Порог после реранкинга", "group": "База знаний"},
+    {"sys_name": "rag_query_rewrite", "title": "Переписывание запроса", "group": "База знаний"},
+    {"sys_name": "rag_rewrite_model", "title": "Модель переписывания", "group": "База знаний"},
     {"sys_name": "include_usage_in_stream", "title": "Показывать токены при потоковых ответах", "group": "Дополнительно"},
     {"sys_name": "logprobs", "title": "Показывать вероятности появления токенов", "group": "Дополнительно"},
     {"sys_name": "frequency_penalty", "title": "Штраф за частоту", "group": "Дополнительно"},
@@ -528,7 +546,7 @@ class Message:
     run_id: Optional[str] = None
     #: Вызовы ВСЕХ инструментов за этот ответ (не только MCP): JSON-массив
     #: [{"type":"tool_call","name","source","status","ok","error"}, ...],
-    #: `source` — "mcp" | "memory" | "task" | "skill".
+    #: `source` — "mcp" | "memory" | "task" | "skill" | "agents_core" (встроенные инструменты «Доступ к agents core").
     tool_events: Optional[str] = None
     #: Текст ошибки для `status == "failed"`.
     error: Optional[str] = None
@@ -538,8 +556,9 @@ class Message:
     #: "document_id", "title", "source", "source_type", "doc_date", "doc_version",
     #: "collection_id", "collection_name"}], "cited": [n...], "confirmed"}.
     rag: Optional[str] = None
-    #: Кто отправил сообщение пользователя: "app" | "scheduler". Запросы
-    #: планировщика считаются непрочитанными (пользователь их не писал).
+    #: Кто отправил сообщение пользователя: "app" | "scheduler" |
+    #: "test_dialog" (вопрос тестового диалога). Запросы планировщика
+    #: считаются непрочитанными (пользователь их не писал).
     source: str = "app"
 
 
@@ -665,6 +684,21 @@ INVARIANT_KIND_LABELS = {
     "business_rule": "Бизнес-правило",
     "state_machine_rule": "Правило стейт-машины",
 }
+
+
+@dataclass
+class TestDialog:
+    """Тестовый диалог — именованный набор последовательных вопросов
+    пользователя. ОБЩИЙ СПРАВОЧНИК (как инварианты и профили): заводится один
+    раз и запускается в любом чате (`kind="test_dialog"` у запуска)."""
+
+    __test__ = False  # не тест для pytest/unittest-сборщиков
+
+    id: str
+    name: str
+    questions: List[str] = field(default_factory=list)
+    created_at: int = 0
+    updated_at: int = 0
 
 
 @dataclass
