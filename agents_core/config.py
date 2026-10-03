@@ -188,7 +188,10 @@ class AgentConfig:
     # Ключ API сервиса баз знаний (KNOWLEDGE_API_KEY на его стороне), если задан.
     KNOWLEDGE_SERVICE_API_KEY: str = os.environ.get("KNOWLEDGE_SERVICE_API_KEY", "").strip()
     # Таймаут поиска (секунды): эмбеддинг вопроса + поиск по индексу.
-    KNOWLEDGE_SERVICE_TIMEOUT: float = float(os.environ.get("KNOWLEDGE_SERVICE_TIMEOUT", "30") or "30")
+    # Тайм-аут поиска, с. Должен быть больше KB_RERANK_TIMEOUT сервиса баз знаний
+    # (20 с): модель-реранкер на CPU может работать десятки секунд, и сервис
+    # должен успеть откатиться на эвристику до того, как AgentsCore оборвёт запрос.
+    KNOWLEDGE_SERVICE_TIMEOUT: float = float(os.environ.get("KNOWLEDGE_SERVICE_TIMEOUT", "60") or "60")
 
     # --- Асинхронные запуски (ТЗ «асинхронные ответы», раздел 2.4) ---------
     # Сколько ответов модели выполняется одновременно (в разных чатах; в
