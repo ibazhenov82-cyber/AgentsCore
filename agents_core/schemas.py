@@ -112,6 +112,10 @@ class SettingsOut(BaseModel):
     rag_rerank_threshold: float = Field(0.3, ge=0, le=1, description="Порог отсечения после реранкинга (0..1)")
     rag_query_rewrite: str = Field("follow_up", description="Переписывание запроса: 'off' | 'follow_up' («Дополнять уточняющие») | 'llm' («Моделью до поиска»)")
     rag_rewrite_model: str = Field("", description="Модель переписывания 'provider:model'; '' — модель агента")
+    rag_quotes: bool = Field(
+        True, description="«Цитаты и источники обязательны»: ответ со ссылками [n] и дословными цитатами из "
+                          "фрагментов (код сверяет их с фрагментами); при слабом контексте — «Не знаю» и уточнение",
+    )
 
     tools_sources: List[str] = Field(
         default_factory=list,
@@ -195,6 +199,7 @@ class SettingsPatch(BaseModel):
     rag_rerank_threshold: Optional[float] = Field(None, ge=0, le=1)
     rag_query_rewrite: Optional[str] = None
     rag_rewrite_model: Optional[str] = None
+    rag_quotes: Optional[bool] = None
 
     model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {"temperature": 0.7, "max_tokens": 2048}})
 

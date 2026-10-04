@@ -347,6 +347,9 @@ class Settings:
     rag_query_rewrite: str = "follow_up"
     #: Модель переписывания ("provider:model"); "" — модель агента.
     rag_rewrite_model: str = ""
+    #: «Цитаты и источники обязательны»: модель приводит дословные цитаты из
+    #: фрагментов, код сверяет их с фрагментами; «не знаю» при слабом контексте.
+    rag_quotes: bool = True
 
 
 def settings_from_defaults(defaults: DefaultSettings) -> Settings:
@@ -424,6 +427,7 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "rag_rerank_threshold", "title": "Порог после реранкинга", "group": "База знаний"},
     {"sys_name": "rag_query_rewrite", "title": "Переписывание запроса", "group": "База знаний"},
     {"sys_name": "rag_rewrite_model", "title": "Модель переписывания", "group": "База знаний"},
+    {"sys_name": "rag_quotes", "title": "Цитаты и источники обязательны", "group": "База знаний"},
     {"sys_name": "include_usage_in_stream", "title": "Показывать токены при потоковых ответах", "group": "Дополнительно"},
     {"sys_name": "logprobs", "title": "Показывать вероятности появления токенов", "group": "Дополнительно"},
     {"sys_name": "frequency_penalty", "title": "Штраф за частоту", "group": "Дополнительно"},

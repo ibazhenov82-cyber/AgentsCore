@@ -28,7 +28,7 @@ from .invariant_checks import format_violation_warning, validate_response
 from .events import CancelToken, EventLog, RunCancelled
 from .knowledge import (
     RAG_STATUS_NOT_FOUND, RAG_STATUS_OK, RAG_STATUS_UNAVAILABLE, REWRITE_INSTRUCTION, RERANK_MODES, REWRITE_MODES,
-    KnowledgeClient, KnowledgeServiceError, RagOutcome, augmented_question, citations, clean_rewritten,
+    KnowledgeClient, KnowledgeServiceError, RagOutcome, augmented_question, citations, clean_rewritten, finalize_answer,
     rag_instruction, rewrite_request_text, search_query, select_sources,
 )
 from .mcp_client import MCPClient, MCPClientError
@@ -2412,6 +2412,7 @@ class Repository:
         candidate_k = max(settings.rag_candidate_k, settings.rag_top_k)
         outcome = RagOutcome(
             query=query, status=RAG_STATUS_OK, only_from_kb=settings.rag_only_from_kb, original_query=text.strip(),
+            quotes_required=settings.rag_quotes,
             rewrite=rewrite or {}, params={
                 "candidate_k": candidate_k, "top_k": settings.rag_top_k,
                 "score_threshold": settings.rag_score_threshold, "rerank": settings.rag_rerank,
@@ -2749,7 +2750,7 @@ class Repository:
                     use_stream=use_stream, token=token, status_text=status_text,
                 )
                 if rag is not None:
-                    rag.cited = citations(final_content, len(rag.sources))
+                    final_content = finalize_answer(final_content, rag)
                     acc.rag = rag.to_dict()
                 duration_ms = int((time.monotonic() - started) * 1000)
                 # Токены НА ВХОД этого обмена (показываются под сообщением

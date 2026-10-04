@@ -90,6 +90,7 @@ _SETTINGS_COLUMNS = [
     ("rag_rerank_threshold", "REAL"),
     ("rag_query_rewrite", "TEXT"),
     ("rag_rewrite_model", "TEXT"),
+    ("rag_quotes", "INTEGER"),
 ]
 
 _DEFAULT_SETTINGS_COLUMNS = [
@@ -177,6 +178,7 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "rag_rerank_threshold": settings.rag_rerank_threshold,
         "rag_query_rewrite": settings.rag_query_rewrite,
         "rag_rewrite_model": settings.rag_rewrite_model,
+        "rag_quotes": int(settings.rag_quotes),
     }
 
 
@@ -232,6 +234,7 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
                               else Settings.rag_rerank_threshold),
         rag_query_rewrite=row["rag_query_rewrite"] or Settings.rag_query_rewrite,
         rag_rewrite_model=row["rag_rewrite_model"] or "",
+        rag_quotes=bool(row["rag_quotes"]) if row["rag_quotes"] is not None else True,
     )
 
 
