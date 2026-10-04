@@ -67,12 +67,12 @@ MEMORY_SOURCE_OPTIONS = ["manual", "agent"]
 #: `TaskTransitionLog`) и "пауза" (kind="pause"/"resume", ортогональный
 #: состоянию флаг `Task.paused`, см. докстринг `task_state_machine`).
 #: Оставлено здесь только для истории записи журнала переходов.
-TASK_TRANSITION_KINDS = ["advance", "pause", "resume"]
+TASK_TRANSITION_KINDS = ["advance", "pause", "resume", "memory"]
 
 #: Кто применил переход задачи — сам агент (через tool-calling, `apply_task_action`)
 #: или человек вручную (кнопки "Пауза"/"Продолжить" в списке/на экране задачи).
 #: Те же два значения и тот же смысл, что и `MEMORY_SOURCE_OPTIONS`.
-TASK_APPLIED_BY_OPTIONS = ["manual", "agent"]
+TASK_APPLIED_BY_OPTIONS = ["manual", "agent", "system"]
 
 #: Вычисляемый статус задачи (`Task.status`, см. `Repository._task_status`):
 #: "done" — `Task.state == TaskState.DONE.value`; "paused" — `Task.paused`
@@ -295,6 +295,13 @@ class Settings:
     #: `Message.is_task_manager_step`).
     task_tracking_enabled: bool = False
 
+    #: «Останавливаться на каждом этапе» — ставить задачу на паузу после
+    #: создания (`start_task`) и после каждого продвижения этапа
+    #: (`apply_task_action`), чтобы пользователь проверял каждый шаг. По
+    #: умолчанию выключено для задач любого типа: модель ведёт задачу
+    #: непрерывно, пауза остаётся ручной кнопкой.
+    task_pause_each_stage: bool = False
+
     #: "Менеджер задач" — лимит АВТОНОМНЫХ шагов подряд без участия
     #: пользователя (защита от зацикливания модели и неконтролируемого
     #: расхода токенов, см. `Repository.run_task_manager_step`). Считается
@@ -406,6 +413,7 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "tools_json", "title": "Список функций в формате OpenAI", "group": "Инструменты"},
     {"sys_name": "memory_tools_enabled", "title": "Разрешить агенту сохранять память", "group": "Память"},
     {"sys_name": "task_tracking_enabled", "title": "Отслеживать задачи", "group": "Задачи"},
+    {"sys_name": "task_pause_each_stage", "title": "Останавливаться на каждом этапе", "group": "Задачи"},
     {"sys_name": "task_manager_max_steps", "title": "Лимит автоматических шагов менеджера задач", "group": "Задачи"},
     {"sys_name": "summary_system_prompt", "title": "Системный prompt для суммаризации", "group": "Суммаризация запросов"},
     {"sys_name": "summary_prompt", "title": "Шаблон prompt пользователя", "group": "Суммаризация запросов"},
@@ -807,6 +815,19 @@ class Task:
     current_step: Optional[str] = None
     created_at: int = 0
     updated_at: int = 0
+    #: Тип задачи: "work" («Рабочая задача», машина planning → … → done) или
+    #: "search" («Задача поиска», машина clarifying ⇄ answering ⇄ achieved),
+    #: см. task_state_machine.KIND_*.
+    kind: str = "work"
+    #: Память задачи (ТЗ «Мини-чат с RAG + памятью»): цель диалога, уточнения
+    #: и ограничения пользователя ({"text", "message_id"}), зафиксированные
+    #: термины ({"term", "definition"}) и накопленные источники — фрагменты,
+    #: на которые уже опирались ответы (формат элементов `RagOutcome.sources`).
+    goal: str = ""
+    clarifications: List[dict] = field(default_factory=list)
+    constraints: List[dict] = field(default_factory=list)
+    terms: List[dict] = field(default_factory=list)
+    sources: List[dict] = field(default_factory=list)
 
 
 @dataclass

@@ -77,6 +77,11 @@ class SettingsOut(BaseModel):
             "`POST /chats/{chat_id}/tasks/{task_id}/runs`)."
         ),
     )
+    task_pause_each_stage: bool = Field(
+        False,
+        description="«Останавливаться на каждом этапе»: ставить задачу (любого типа) на паузу после создания "
+                    "и после каждого продвижения этапа. По умолчанию выключено — модель ведёт задачу непрерывно.",
+    )
     task_manager_max_steps: int = Field(
         20,
         ge=0,
@@ -139,6 +144,7 @@ class SettingsOut(BaseModel):
             "working_memory_enabled": True, "long_term_memory_enabled": True,
             "episodic_memory_enabled": False, "semantic_memory_enabled": False, "procedural_memory_enabled": False,
             "task_tracking_enabled": False,
+            "task_pause_each_stage": False,
             "task_manager_max_steps": 20,
             "summary_prompt": DEFAULT_SUMMARY_PROMPT,
             "summary_system_prompt": DEFAULT_SUMMARY_SYSTEM_PROMPT,
@@ -174,6 +180,7 @@ class SettingsPatch(BaseModel):
     semantic_memory_enabled: Optional[bool] = None
     procedural_memory_enabled: Optional[bool] = None
     task_tracking_enabled: Optional[bool] = None
+    task_pause_each_stage: Optional[bool] = None
     task_manager_max_steps: Optional[int] = Field(None, ge=0)
     summary_prompt: Optional[str] = None
     summary_system_prompt: Optional[str] = None
@@ -786,13 +793,58 @@ class TaskStateInfoOut(BaseModel):
 
 
 class TaskStateMachineInfoOut(BaseModel):
-    """Read-only описание единственной, заданной в коде машины состояний
-    задачи + список инвариантов категории "Правило стейт-машины",
-    привязанных к ней (единая на всю систему настройка, см.
-    `task_state_machine_invariants`)."""
+    """Read-only описание машин состояний (заданы в коде): `states` —
+    «Рабочая задача», `search_states` — «Задача поиска», + список
+    инвариантов категории "Правило стейт-машины", привязанных к машине
+    рабочей задачи (единая на всю систему настройка)."""
 
     states: List[TaskStateInfoOut]
+    search_states: List[TaskStateInfoOut] = Field(default_factory=list)
     invariants: List[InvariantOut]
+
+
+class TaskMemoryItemOut(BaseModel):
+    text: str
+    message_id: Optional[int] = Field(None, description="Сообщение пользователя, из которого пункт попал в память")
+
+
+class TaskTermOut(BaseModel):
+    term: str
+    definition: str
+
+
+class TaskSourceOut(BaseModel):
+    """Фрагмент, на который уже опирались ответы задачи поиска."""
+
+    chunk_id: Optional[str] = None
+    title: str = ""
+    section: str = ""
+    text: str = ""
+    source: Optional[str] = None
+    page: Optional[int] = None
+    collection_name: Optional[str] = None
+    document_id: Optional[str] = None
+
+
+class TaskMemoryPatchRequest(BaseModel):
+    """Ручная правка памяти задачи: переданные списки ЗАМЕНЯЮТ текущие
+    целиком; не переданные поля не меняются."""
+
+    title: Optional[str] = None
+    goal: Optional[str] = None
+    clarifications: Optional[List[str]] = None
+    constraints: Optional[List[str]] = None
+    terms: Optional[List[TaskTermOut]] = None
+    clear_sources: bool = Field(False, description="Очистить накопленные источники задачи")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TaskStateSetRequest(BaseModel):
+    """Ручной переход по графу машины типа задачи (например «Цель достигнута»)."""
+
+    state: str = Field(..., min_length=1, examples=["achieved"])
+    note: Optional[str] = None
 
 
 class TaskMachineInvariantIdsSetRequest(BaseModel):
@@ -812,7 +864,10 @@ class TaskSummaryOut(BaseModel):
     id: str
     chat_id: str
     title: str
-    state: str = Field(..., description="Системное имя текущего состояния (значение TaskState)")
+    kind: str = Field("work", description="'work' — «Рабочая задача», 'search' — «Задача поиска»")
+    kind_display_name: str = "Рабочая задача"
+    goal: str = ""
+    state: str = Field(..., description="Системное имя текущего состояния (машины своего типа)")
     state_display_name: str = Field(..., description="Отображаемое имя текущего этапа")
     paused: bool = Field(..., description="Ортогональный состоянию флаг — не часть графа переходов, см. task_state_machine.py")
     status: str = Field(
@@ -871,6 +926,14 @@ class TaskDetailOut(BaseModel):
     id: str
     chat_id: str
     title: str
+    kind: str = Field("work", description="'work' — «Рабочая задача», 'search' — «Задача поиска»")
+    kind_display_name: str = "Рабочая задача"
+    goal: str = ""
+    clarifications: List[TaskMemoryItemOut] = Field(default_factory=list)
+    constraints: List[TaskMemoryItemOut] = Field(default_factory=list)
+    terms: List[TaskTermOut] = Field(default_factory=list)
+    sources: List[TaskSourceOut] = Field(default_factory=list)
+    description: str = ""
     state: str
     state_display_name: str
     paused: bool
@@ -882,8 +945,8 @@ class TaskDetailOut(BaseModel):
     plan: List[str] = Field(default_factory=list, description="План, переданный моделью при старте задачи (start_task); может быть пуст")
     done: List[str] = Field(default_factory=list, description="Шаги, отмеченные моделью как завершённые (completed_step в apply_task_action)")
     current: Optional[str] = None
-    step: int = Field(..., description="Позиция текущего состояния в машине состояний (1..4), см. task_state_machine.TASK_STATE_ORDER")
-    total: int = Field(..., description="Общее число состояний машины — всегда 4 (planning/execution/validation/done)")
+    step: int = Field(..., description="Позиция текущего состояния в машине состояний своего типа (с 1)")
+    total: int = Field(..., description="Число состояний машины: 4 у рабочей задачи, 3 у задачи поиска")
     created_at: int
     updated_at: int
     stages: List[TaskStageOut]
@@ -984,6 +1047,8 @@ class TaskCreateRequest(BaseModel):
     title: str = Field(..., min_length=1, examples=["Разобрать новые issues"])
     description: str = Field("", examples=["Составь план работ на неделю по новым issues AgentsCore"])
     source: str = Field("app", description="'app' | 'scheduler'")
+    kind: str = Field("work", pattern="^(work|search)$", description="'work' — «Рабочая задача», 'search' — «Задача поиска»")
+    goal: str = Field("", description="Цель задачи (память задачи); для задачи поиска по умолчанию — название")
     run: Optional[TaskRunCreateRequest] = Field(
         None, description="Сразу создать запуск Менеджера задач (например `{\"auto_pause\": false}` — выполнить до конца)",
     )

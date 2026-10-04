@@ -24,6 +24,9 @@ from ..schemas import (
     SettingsOut,
     TaskAvailableActionOut,
     TaskDetailOut,
+    TaskMemoryItemOut,
+    TaskSourceOut,
+    TaskTermOut,
     TaskHistoryEntryOut,
     TaskStageOut,
     TaskStateInfoOut,
@@ -193,6 +196,7 @@ def task_state_machine_info_out(info: dict) -> TaskStateMachineInfoOut:
     {"states": [...], "invariants": [<Invariant>, ...]}."""
     return TaskStateMachineInfoOut(
         states=[TaskStateInfoOut(**s) for s in info["states"]],
+        search_states=[TaskStateInfoOut(**s) for s in info.get("search_states", [])],
         invariants=[invariant_out(inv) for inv in info["invariants"]],
     )
 
@@ -205,6 +209,7 @@ def task_summary_out(summary: dict) -> TaskSummaryOut:
     task = summary["task"]
     return TaskSummaryOut(
         id=task.id, chat_id=task.chat_id, title=task.title,
+        kind=task.kind, kind_display_name=summary.get("kind_display_name") or task.kind, goal=task.goal,
         state=task.state, state_display_name=summary["state_display_name"],
         paused=task.paused, current_step=task.current_step,
         created_at=task.created_at, updated_at=task.updated_at,
@@ -220,6 +225,16 @@ def task_detail_out(detail: dict) -> TaskDetailOut:
     task = detail["task"]
     return TaskDetailOut(
         id=task.id, chat_id=task.chat_id, title=task.title,
+        kind=task.kind, kind_display_name=detail.get("kind_display_name") or task.kind, goal=task.goal,
+        clarifications=[TaskMemoryItemOut(text=str(c.get("text") or ""), message_id=c.get("message_id"))
+                        for c in task.clarifications],
+        constraints=[TaskMemoryItemOut(text=str(c.get("text") or ""), message_id=c.get("message_id"))
+                     for c in task.constraints],
+        terms=[TaskTermOut(term=str(t.get("term") or ""), definition=str(t.get("definition") or ""))
+               for t in task.terms],
+        sources=[TaskSourceOut(**{k: v for k, v in src.items() if k in TaskSourceOut.model_fields and v is not None})
+                 for src in task.sources],
+        description=task.description,
         state=task.state, state_display_name=detail["state_display_name"],
         paused=task.paused,
         status=detail["status"], status_display=detail["status_display"],

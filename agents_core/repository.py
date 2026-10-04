@@ -18,7 +18,7 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .catalog import ModelCatalog
 from .config import AgentConfig
@@ -29,7 +29,8 @@ from .events import CancelToken, EventLog, RunCancelled
 from .knowledge import (
     RAG_STATUS_NOT_FOUND, RAG_STATUS_OK, RAG_STATUS_UNAVAILABLE, REWRITE_INSTRUCTION, RERANK_MODES, REWRITE_MODES,
     KnowledgeClient, KnowledgeServiceError, RagOutcome, augmented_question, citations, clean_rewritten, finalize_answer,
-    rag_instruction, rewrite_request_text, search_query, select_sources,
+    rag_instruction, rewrite_instruction, rewrite_request_text, search_query, select_sources, is_no_search,
+    starts_with_dont_know,
 )
 from .mcp_client import MCPClient, MCPClientError
 from .models import (
@@ -62,15 +63,22 @@ from .providers import ChatResult, ProviderError, ProviderMessage, ProviderRegis
 from .skills import registry as skills_registry
 from .skills import shopping_demo
 from .task_state_machine import (
-    allowed_transitions,
-    can_transition,
+    KIND_SEARCH,
+    KIND_WORK,
+    TASK_KIND_LABELS,
+    TASK_KINDS,
+    format_search_states_for_prompt,
     format_states_for_prompt,
-    TASK_STATE_ORDER,
-    TaskState as TaskStateEnum,
-    display_name as task_state_display_name,
-    parse_task_state,
+    kind_allowed,
+    kind_can_transition,
+    kind_display_name,
+    kind_final_state,
+    kind_initial_state,
+    kind_is_final,
+    kind_is_valid_state,
+    kind_states,
 )
-from .tokens import estimate_messages_tokens
+from .tokens import estimate_messages_tokens, estimate_tokens
 from . import builtin_tools
 from . import test_dialogs as test_dialog_rules
 
@@ -160,34 +168,124 @@ def _build_save_long_term_memory_tool(categories: List[str]) -> dict:
 # этапа хотя бы одной из открытых задач чата (см. `Repository._settings_with_merged_tools`).
 # ---------------------------------------------------------------------------
 
-def _build_start_task_tool() -> dict:
+def _build_start_task_tool(kinds: Sequence[str] = ("work",)) -> dict:
+    kinds = list(kinds) or ["work"]
+    search_hint = (
+        " Тип «search» («Задача поиска») — когда пользователь ищет ответ/инструкцию по базе "
+        "знаний («как настроить…», «где описано…», «что такое…»): ассистент только ищет и "
+        "отвечает со ссылками на источники, ничего не выполняет. Тип «work» («Рабочая "
+        "задача») — когда нужно что-то СДЕЛАТЬ (изменить файлы, настроить, запустить) по этапам "
+        "«Планирование» → «Выполнение» → «Проверка» → «Завершено»."
+        if "search" in kinds else ""
+    )
+    properties: Dict[str, Any] = {
+        "title": {"type": "string", "description": "Короткая формулировка задачи"},
+        "goal": {
+            "type": "string",
+            "description": "Цель пользователя одной-двумя фразами — то, к чему ведёт диалог/работа",
+        },
+        "plan": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Только для «work»: согласованный план — список шагов до выполнения задачи (PLAN). "
+                "Можно оставить пустым и задать позже через apply_task_action."
+            ),
+        },
+    }
+    properties["clarifications"] = {
+        "type": "array", "items": {"type": "string"},
+        "description": "Уточнения пользователя, уже известные на старте (необязательно)",
+    }
+    properties["constraints"] = {
+        "type": "array", "items": {"type": "string"},
+        "description": "Ограничения пользователя, уже известные на старте (необязательно)",
+    }
+    properties["terms"] = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"term": {"type": "string"}, "definition": {"type": "string"}},
+            "required": ["term", "definition"],
+        },
+        "description": "Термины, определённые пользователем (необязательно)",
+    }
+    if "search" in kinds:
+        properties["needs_clarification"] = {
+            "type": "boolean",
+            "description": (
+                "Только для «search»: true, если запрос неполон и до поиска нужно уточнить цель или "
+                "условия — задача начнётся с этапа «Уточнение»; иначе — с «Поиск ответа»"
+            ),
+        }
+    required = ["title"]
+    if len(kinds) > 1:
+        properties = {
+            "kind": {
+                "type": "string", "enum": kinds,
+                "description": "Тип задачи: 'search' — задача поиска ответа, 'work' — рабочая задача",
+            },
+            **properties,
+        }
+        required = ["kind", "title", "goal"]
     return {
         "type": "function",
         "function": {
             "name": "start_task",
             "description": (
                 "Начать отслеживание НОВОЙ задачи в этом чате (см. «Состояние задачи»). "
-                "Используй, когда в сообщении пользователя выделяется отдельная задача, "
+                "Используй, когда в сообщении пользователя выделяется отдельная задача или цель, "
                 "которую стоит вести по этапам — не для каждой реплики. НЕ жди прямой просьбы "
                 "пользователя отслеживать задачу или явной команды вроде «возьми в работу» — "
                 "начинай сам, если задача очевидна по смыслу сообщения. В чате может быть "
-                "несколько открытых задач одновременно. Задача всегда начинается с этапа "
-                "«Планирование»."
+                "несколько открытых задач одновременно." + search_hint
+            ),
+            "parameters": {"type": "object", "properties": properties, "required": required},
+        },
+    }
+
+
+def _build_update_task_memory_tool() -> dict:
+    """«Память задачи» (ТЗ «Мини-чат с RAG + памятью»): модель сама фиксирует
+    цель, уточнения, ограничения и термины пользователя — код хранит их в
+    `Task` и подмешивает в каждый следующий промпт и в переписывание запроса."""
+    item_list = lambda desc: {"type": "array", "items": {"type": "string"}, "description": desc}  # noqa: E731
+    return {
+        "type": "function",
+        "function": {
+            "name": "update_task_memory",
+            "description": (
+                "Обновить память задачи (блок [ЗАДАЧА ПОИСКА]/[ЗАДАЧА]): цель, уточнения, "
+                "ограничения и термины пользователя. Вызывай ДО ответа каждый раз, когда "
+                "пользователь сообщил что-то, что должно действовать до конца диалога: уточнил "
+                "цель («мне нужно…»), поставил ограничение («только CPU», «порт занят», «без …»), "
+                "определил термин («под X я понимаю Y») или отменил что-то сказанное раньше "
+                "(тогда передай это в remove). Не дублируй то, что уже есть в памяти."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "Короткая формулировка задачи"},
-                    "plan": {
+                    "task_id": {"type": "string", "description": "Id задачи из блока [ЗАДАЧА ПОИСКА]/[ЗАДАЧА]"},
+                    "goal": {"type": "string", "description": "Новая формулировка цели, если она изменилась"},
+                    "add_clarifications": item_list("Новые уточнения пользователя (кратко, своими словами)"),
+                    "add_constraints": item_list("Новые ограничения пользователя (кратко)"),
+                    "add_terms": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Согласованный план — список шагов до выполнения задачи (PLAN). "
-                            "Можно оставить пустым и задать позже через apply_task_action."
-                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "term": {"type": "string"},
+                                "definition": {"type": "string"},
+                            },
+                            "required": ["term", "definition"],
+                        },
+                        "description": "Термины, которые пользователь определил («под X я понимаю Y»)",
                     },
+                    "remove": item_list(
+                        "Тексты уточнений/ограничений или названия терминов, которые пользователь отменил"
+                    ),
                 },
-                "required": ["title"],
+                "required": ["task_id"],
             },
         },
     }
@@ -200,6 +298,7 @@ def _build_apply_task_action_tool(target_state_options: List[str]) -> dict:
             "name": "apply_task_action",
             "description": (
                 "Обновить прогресс уже начатой задачи этого чата — продвинуть этап "
+                "(у задачи поиска: «Уточнение»/«Поиск ответа»/«Цель достигнута») "
                 "(в т.ч. в рамках автономного продолжения работы «Менеджером задач», без нового "
                 "сообщения пользователя — см. системную реплику «Продолжай самостоятельно "
                 "работать над задачей»), и/или обновить текущий шаг (CURRENT) и список "
@@ -236,6 +335,11 @@ def _build_apply_task_action_tool(target_state_options: List[str]) -> dict:
             },
         },
     }
+
+
+def _tool_name(tool: Any) -> Optional[str]:
+    fn = tool.get("function") if isinstance(tool, dict) else None
+    return fn.get("name") if isinstance(fn, dict) else None
 
 
 _SUMMARY_TAG_RE = {
@@ -1306,24 +1410,27 @@ class Repository:
     # машине инвариантов категории "Правило стейт-машины".
 
     def get_task_state_machine_info(self) -> dict:
-        """Read-only описание единственной (заданной в коде) машины
-        состояний — номер, отображаемое и системное имя, список достижимых
+        """Read-only описание машин состояний (заданы в коде) обоих типов
+        задач — номер, отображаемое и системное имя, список достижимых
         состояний для каждого этапа — плюс текущий список привязанных
         инвариантов категории "Правило стейт-машины" (см.
-        `set_task_machine_invariants`)."""
-        states = [
-            {
-                "position": index,
-                "state": state.value,
-                "display_name": task_state_display_name(state),
-                "target_states": [s.value for s in allowed_transitions(state)],
-                "target_state_display_names": [task_state_display_name(s) for s in allowed_transitions(state)],
-            }
-            for index, state in enumerate(TASK_STATE_ORDER, start=1)
-        ]
+        `set_task_machine_invariants`; относятся к рабочей задаче)."""
+
+        def _states(kind: str) -> List[dict]:
+            return [
+                {
+                    "position": index,
+                    "state": state,
+                    "display_name": kind_display_name(kind, state),
+                    "target_states": kind_allowed(kind, state),
+                    "target_state_display_names": [kind_display_name(kind, t) for t in kind_allowed(kind, state)],
+                }
+                for index, state in enumerate(kind_states(kind), start=1)
+            ]
+
         invariant_ids = set(self._db.get_task_machine_invariant_ids())
         invariants = [inv for inv in self._db.list_invariants() if inv.id in invariant_ids]
-        return {"states": states, "invariants": invariants}
+        return {"states": _states(KIND_WORK), "search_states": _states(KIND_SEARCH), "invariants": invariants}
 
     def set_task_machine_invariants(self, invariant_ids: List[str]) -> dict:
         """Заменяет весь список привязанных к машине состояний инвариантов —
@@ -1344,6 +1451,7 @@ class Repository:
     # ---- задачи (чтение/агрегирование, изменение — см. tool-calling ниже) ----
 
     _TASK_STATUS_LABELS = {"active": "активна", "paused": "на паузе", "done": "завершена"}
+    _SEARCH_STATUS_LABELS = {"active": "активна", "paused": "на паузе", "done": "цель достигнута"}
 
     def _require_task(self, task_id: str) -> Task:
         task = self._db.get_task(task_id)
@@ -1352,33 +1460,46 @@ class Repository:
         return task
 
     def _task_status(self, task: Task) -> str:
-        """"active" | "paused" | "done" — см. `TASK_STATUS_OPTIONS`. Заметно
-        проще прежней версии: "done" прямо по значению `task.state`, "paused"
-        — прямо по флагу `task.paused` (ортогональному состоянию, см.
-        докстринг `task_state_machine`), без обращения к истории переходов."""
-        if task.state == TaskStateEnum.DONE.value:
+        """"active" | "paused" | "done" — см. `TASK_STATUS_OPTIONS`. "done" —
+        конечное состояние машины своего типа ("done" у рабочей задачи,
+        "achieved" у задачи поиска), "paused" — флаг `task.paused`
+        (ортогональный состоянию), иначе "active"."""
+        if kind_is_final(task.kind, task.state):
             return "done"
         return "paused" if task.paused else "active"
 
+    def _task_status_display(self, task: Task, status: str) -> str:
+        labels = self._SEARCH_STATUS_LABELS if task.kind == KIND_SEARCH else self._TASK_STATUS_LABELS
+        return labels.get(status, status)
+
     def _task_next_state_display_name(self, task: Task) -> Optional[str]:
         """Этап, в который ведёт "Продолжить"/"Выполнить" из текущего этапа —
-        для карточки-подтверждения в чате и списка задач. Если из текущего
-        этапа возможно несколько целей (см. `TASK_TRANSITIONS` — например,
-        VALIDATION может вернуться в EXECUTION), берётся ПЕРВАЯ по порядку —
-        она всегда прямое продолжение вперёд (порядок задан примером ТЗ:
-        `EXECUTION to listOf(VALIDATION, PLANNING)` — VALIDATION первым).
-        `None`, если задача уже завершена."""
-        targets = allowed_transitions(parse_task_state(task.state))
-        return task_state_display_name(targets[0]) if targets else None
+        ПЕРВАЯ цель по порядку переходов (она всегда прямое продолжение
+        вперёд). `None`, если задача в конечном состоянии."""
+        if kind_is_final(task.kind, task.state):
+            return None
+        targets = kind_allowed(task.kind, task.state)
+        return kind_display_name(task.kind, targets[0]) if targets else None
+
+    @staticmethod
+    def _task_memory_dict(task: Task) -> dict:
+        return {
+            "goal": task.goal,
+            "clarifications": list(task.clarifications),
+            "constraints": list(task.constraints),
+            "terms": list(task.terms),
+            "sources": list(task.sources),
+        }
 
     def _task_summary(self, task: Task, chat_title: Optional[str] = None) -> dict:
         status = self._task_status(task)
         summary = {
             "task": task,
             "status": status,
-            "status_display": self._TASK_STATUS_LABELS.get(status, status),
-            "state_display_name": task_state_display_name(parse_task_state(task.state)),
+            "status_display": self._task_status_display(task, status),
+            "state_display_name": kind_display_name(task.kind, task.state),
             "next_state_display_name": self._task_next_state_display_name(task) if status != "done" else None,
+            "kind_display_name": TASK_KIND_LABELS.get(task.kind, task.kind),
         }
         if chat_title is not None:
             summary["chat_title"] = chat_title
@@ -1410,20 +1531,19 @@ class Repository:
         return summaries
 
     def get_task(self, task_id: str) -> dict:
-        """Полные детали задачи для экрана "Задача": вычисляемый статус,
-        степпер по фиксированным четырём этапам (иконка: "check" — для уже
-        пройденных, "pause" — для текущего, если задача на паузе, "none" —
-        для ещё не достигнутых), доступные действия (продвижение в каждое из
-        достижимых состояний + пауза, если задача сейчас не на паузе) и
-        полная история переходов."""
+        """Полные детали задачи для экрана "Задача": тип и память задачи,
+        вычисляемый статус, степпер по этапам машины её типа (иконка: "check"
+        — для уже пройденных, "pause" — для текущего, если задача на паузе,
+        "none" — для ещё не достигнутых), доступные действия (продвижение в
+        каждое из достижимых состояний + пауза) и полная история переходов."""
         task = self._require_task(task_id)
         status = self._task_status(task)
-        current_state = parse_task_state(task.state)
-        current_index = TASK_STATE_ORDER.index(current_state)
+        states = kind_states(task.kind)
+        current_index = states.index(task.state) if task.state in states else 0
 
         stages = []
-        for index, state in enumerate(TASK_STATE_ORDER):
-            is_current = state == current_state
+        for index, state in enumerate(states):
+            is_current = state == task.state
             if is_current and status == "paused":
                 icon = "pause"
             elif index <= current_index:
@@ -1431,40 +1551,36 @@ class Repository:
             else:
                 icon = "none"
             stages.append({
-                "state": state.value,
-                "display_name": task_state_display_name(state),
+                "state": state,
+                "display_name": kind_display_name(task.kind, state),
                 "is_current": is_current,
-                "is_final": state == TaskStateEnum.DONE,
+                "is_final": kind_is_final(task.kind, state),
                 "icon": icon,
             })
 
         available_actions = []
-        if status != "done":
-            for target in allowed_transitions(current_state):
+        # У задачи поиска из «Цель достигнута» можно вернуться к поиску
+        # ответа — поэтому переходы предлагаются и для неё.
+        if status != "done" or task.kind == KIND_SEARCH:
+            for target in kind_allowed(task.kind, task.state):
                 available_actions.append({
                     "kind": "advance",
-                    "to_state": target.value,
-                    "to_state_display_name": task_state_display_name(target),
+                    "to_state": target,
+                    "to_state_display_name": kind_display_name(task.kind, target),
                 })
-            if not task.paused:
+            if not task.paused and status != "done":
                 available_actions.append({
-                    "kind": "pause", "to_state": current_state.value,
-                    "to_state_display_name": task_state_display_name(current_state),
+                    "kind": "pause", "to_state": task.state,
+                    "to_state_display_name": kind_display_name(task.kind, task.state),
                 })
-
-        def _state_display(value: str) -> str:
-            try:
-                return task_state_display_name(parse_task_state(value))
-            except ValueError:
-                return value
 
         history = [
             {
                 "id": log.id,
                 "from_state": log.from_state,
-                "from_state_display_name": _state_display(log.from_state),
+                "from_state_display_name": kind_display_name(task.kind, log.from_state),
                 "to_state": log.to_state,
-                "to_state_display_name": _state_display(log.to_state),
+                "to_state_display_name": kind_display_name(task.kind, log.to_state),
                 "kind": log.kind,
                 "applied_by": log.applied_by,
                 "note": log.note,
@@ -1476,30 +1592,88 @@ class Repository:
         return {
             "task": task,
             "status": status,
-            "status_display": self._TASK_STATUS_LABELS.get(status, status),
-            "state_display_name": task_state_display_name(current_state),
+            "status_display": self._task_status_display(task, status),
+            "state_display_name": kind_display_name(task.kind, task.state),
             "next_state_display_name": self._task_next_state_display_name(task) if status != "done" else None,
+            "kind_display_name": TASK_KIND_LABELS.get(task.kind, task.kind),
             "step": current_index + 1,
-            "total": len(TASK_STATE_ORDER),
+            "total": len(states),
             "stages": stages,
             "available_actions": available_actions,
             "history": history,
         }
 
     def apply_manual_task_action(self, task_id: str, action: str, note: Optional[str] = None) -> dict:
-        """Ручное вмешательство человека — теперь только "Пауза" (кнопка
-        "Продолжить"/"Выполнить" ВСЕГДА обращается к модели, см.
-        `run_task_manager_step`; явного действия "Отклонить" в новой модели
-        нет вовсе, см. `task_state_machine.py`)."""
+        """Ручное вмешательство человека — "Пауза" (кнопка "Продолжить"/
+        "Выполнить" ВСЕГДА обращается к модели, см. `run_task_manager_step`).
+        Ручная смена этапа — `set_task_state_manually`."""
         task = self._require_task(task_id)
         if action != "pause":
             raise ValidationError(f"unsupported manual action: {action!r} (only 'pause' is supported)")
-        if task.state == TaskStateEnum.DONE.value:
+        if kind_is_final(task.kind, task.state):
             raise ValidationError("cannot pause a task that is already done")
         if task.paused:
             raise ValidationError("task is already paused")
         self._db.set_task_paused(task.id, True)
         self._db.add_task_transition_log(task.id, task.state, task.state, kind="pause", applied_by="manual", note=note)
+        return self.get_task(task.id)
+
+    def set_task_state_manually(self, task_id: str, state: str, note: Optional[str] = None) -> dict:
+        """Ручной переход по графу машины типа задачи (кнопка «Цель
+        достигнута», «Вернуться к поиску ответа» и т.п.) — без обращения к
+        модели. Снимает паузу; записывается в историю с applied_by='manual'."""
+        task = self._require_task(task_id)
+        if not kind_is_valid_state(task.kind, state):
+            raise ValidationError(f"unknown state {state!r} for task kind {task.kind!r}; available: {kind_states(task.kind)}")
+        if not kind_can_transition(task.kind, task.state, state):
+            raise ValidationError(
+                f"transition {task.state} -> {state} is not allowed; available: {kind_allowed(task.kind, task.state)}"
+            )
+        self._db.update_task_progress(task.id, state=state, _current_step_set=False)
+        self._db.set_task_paused(task.id, False)
+        self._db.add_task_transition_log(task.id, task.state, state, kind="advance", applied_by="manual", note=note)
+        return self.get_task(task.id)
+
+    def update_task_memory_manually(
+        self, task_id: str, title: Optional[str] = None, goal: Optional[str] = None,
+        clarifications: Optional[List[str]] = None, constraints: Optional[List[str]] = None,
+        terms: Optional[List[dict]] = None, clear_sources: bool = False,
+    ) -> dict:
+        """Ручная правка памяти задачи с экрана «Задача»: переданные списки
+        ЗАМЕНЯЮТ текущие целиком (у сохранённых строк сохраняется ссылка на
+        сообщение-источник, если текст не изменился)."""
+        task = self._require_task(task_id)
+
+        def _merge_texts(current: List[dict], texts: Optional[List[str]]) -> Optional[List[dict]]:
+            if texts is None:
+                return None
+            by_text = {str(item.get("text") or ""): item for item in current}
+            result: List[dict] = []
+            for text in texts:
+                text = str(text or "").strip()
+                if text and all(r["text"] != text for r in result):
+                    result.append(by_text.get(text) or {"text": text, "message_id": None})
+            return result
+
+        new_terms: Optional[List[dict]] = None
+        if terms is not None:
+            new_terms = []
+            for item in terms:
+                term = str((item or {}).get("term") or "").strip()
+                definition = str((item or {}).get("definition") or "").strip()
+                if term and definition:
+                    new_terms = [t for t in new_terms if t["term"].lower() != term.lower()]
+                    new_terms.append({"term": term, "definition": definition})
+        self._db.update_task_memory(
+            task.id,
+            title=title.strip() if title and title.strip() else None,
+            goal=goal.strip() if goal is not None else None,
+            clarifications=_merge_texts(task.clarifications, clarifications),
+            constraints=_merge_texts(task.constraints, constraints),
+            terms=new_terms,
+            sources=[] if clear_sources else None,
+        )
+        self._db.add_task_transition_log(task.id, task.state, task.state, kind="memory", applied_by="manual", note=None)
         return self.get_task(task.id)
 
     def delete_task(self, task_id: str) -> None:
@@ -1577,13 +1751,127 @@ class Repository:
     def _handle_view_cart(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         return shopping_demo.view_cart(self._current_cart(chat.id))
 
-    # ---- start_task / apply_task_action (tool-calling) -----------------------
+    # ---- start_task / apply_task_action / update_task_memory (tool-calling) --
 
     def _open_tasks_for_chat(self, chat: Chat) -> List[Task]:
         return [t for t in self._db.list_tasks_for_chat(chat.id) if self._task_status(t) != "done"]
 
-    def _task_allowed_target_states(self, task: Task) -> List["TaskStateEnum"]:
-        return allowed_transitions(parse_task_state(task.state))
+    def _current_task(self, chat: Chat) -> Optional[Task]:
+        """Текущая задача чата — последняя незакрытая. Исключение — задача
+        поиска в состоянии «Цель достигнута», если она последняя из
+        созданных: её можно продолжить новым вопросом по той же цели
+        (achieved → answering), поэтому она остаётся текущей."""
+        tasks = self._db.list_tasks_for_chat(chat.id)
+        if not tasks:
+            return None
+        latest = tasks[-1]
+        if latest.kind == KIND_SEARCH:
+            return latest
+        open_tasks = [t for t in tasks if self._task_status(t) != "done"]
+        return open_tasks[-1] if open_tasks else None
+
+    def _current_search_task(self, chat: Chat) -> Optional[Task]:
+        if not (chat.settings.task_tracking_enabled and chat.settings.rag_enabled):
+            return None
+        task = self._current_task(chat)
+        return task if task is not None and task.kind == KIND_SEARCH else None
+
+    def _task_allowed_target_states(self, task: Task) -> List[str]:
+        return kind_allowed(task.kind, task.state)
+
+    def _available_task_kinds(self, chat: Chat) -> List[str]:
+        """Задача поиска имеет смысл только при включённой базе знаний."""
+        return [KIND_WORK, KIND_SEARCH] if chat.settings.rag_enabled else [KIND_WORK]
+
+    def _last_user_message_id(self, chat_id: str) -> Optional[int]:
+        return self._db.last_user_message_id(chat_id)
+
+    @staticmethod
+    def _text_items(raw: Any) -> List[str]:
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [str(x).strip() for x in raw if str(x or "").strip()]
+
+    @staticmethod
+    def _term_items(raw: Any) -> List[dict]:
+        items = []
+        for item in raw if isinstance(raw, list) else []:
+            if isinstance(item, dict):
+                term = str(item.get("term") or "").strip()
+                definition = str(item.get("definition") or "").strip()
+            elif isinstance(item, str) and ("=" in item or "—" in item):
+                term, _, definition = item.replace("—", "=", 1).partition("=")
+                term, definition = term.strip(), definition.strip()
+            else:
+                continue
+            if term and definition:
+                items.append({"term": term, "definition": definition})
+        return items
+
+    def _apply_memory_changes(self, task: Task, arguments: dict, message_id: Optional[int]) -> List[dict]:
+        """Слияние изменений памяти задачи (инструменты `start_task`/
+        `update_task_memory`) и запись в БД. Возвращает список изменений для
+        строки под ответом: [{"op": "+"|"-"|"=", "field": ..., "text": ...}]."""
+        changes: List[dict] = []
+        clarifications = [dict(c) for c in task.clarifications]
+        constraints = [dict(c) for c in task.constraints]
+        terms = [dict(t) for t in task.terms]
+        goal = None
+
+        new_goal = str(arguments.get("goal") or "").strip()
+        if new_goal and new_goal != task.goal:
+            goal = new_goal
+            changes.append({"op": "=", "field": "goal", "text": new_goal})
+
+        for raw in self._text_items(arguments.get("remove")):
+            key = raw.casefold()
+            for field_name, items in (("clarification", clarifications), ("constraint", constraints)):
+                for item in list(items):
+                    if item.get("text", "").casefold() == key:
+                        items.remove(item)
+                        changes.append({"op": "-", "field": field_name, "text": item["text"]})
+            for item in list(terms):
+                if item.get("term", "").casefold() == key:
+                    terms.remove(item)
+                    changes.append({"op": "-", "field": "term", "text": item["term"]})
+
+        for field_name, items, key in (("clarification", clarifications, "add_clarifications"),
+                                       ("constraint", constraints, "add_constraints")):
+            for text in self._text_items(arguments.get(key)):
+                if any(i.get("text", "").casefold() == text.casefold() for i in items):
+                    continue
+                items.append({"text": text, "message_id": message_id})
+                changes.append({"op": "+", "field": field_name, "text": text})
+
+        for term in self._term_items(arguments.get("add_terms")):
+            existing = next((t for t in terms if t["term"].casefold() == term["term"].casefold()), None)
+            if existing is not None and existing["definition"] == term["definition"]:
+                continue
+            if existing is not None:
+                terms.remove(existing)
+            terms.append(term)
+            changes.append({"op": "+", "field": "term", "text": f"{term['term']} — {term['definition']}"})
+
+        if changes:
+            self._db.update_task_memory(
+                task.id, goal=goal, clarifications=clarifications, constraints=constraints, terms=terms,
+            )
+        return changes
+
+    def _memory_event(self, task: Task, changes: List[dict]) -> dict:
+        return {
+            "task_id": task.id, "task_title": task.title, "task_kind": task.kind, "kind": "memory",
+            "from_state_display_name": None, "to_state_display_name": kind_display_name(task.kind, task.state),
+            "changes": changes,
+        }
+
+    def _pause_after_stage(self, chat: Chat, auto_pause: bool) -> bool:
+        """«Останавливаться на каждом этапе» (по умолчанию выключено) — в
+        обычном чате пауза после этапа ставится только с этой настройкой;
+        кнопка «Выполнить» (auto_pause=false) паузу не ставит никогда."""
+        return auto_pause and chat.settings.task_pause_each_stage
 
     def _handle_start_task(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         if not chat.settings.task_tracking_enabled:
@@ -1591,31 +1879,59 @@ class Repository:
         title = str(arguments.get("title") or "").strip()
         if not title:
             return {"error": "title is required"}
+        kind = str(arguments.get("kind") or KIND_WORK).strip().lower()
+        if kind not in self._available_task_kinds(chat):
+            return {"error": f"kind must be one of {self._available_task_kinds(chat)}"}
         plan_raw = arguments.get("plan")
-        plan = [str(s).strip() for s in plan_raw if str(s).strip()] if isinstance(plan_raw, list) else []
-        task = self._db.create_task(chat.id, title, plan=plan)
-        state_name = task_state_display_name(TaskStateEnum.PLANNING)
-        # Редизайн "Менеджера задач" (замечание пользователя, перенесено из
-        # предыдущей версии): прежде чем приступать к планированию/
-        # выполнению/проверке, задача ВСЕГДА показывается пользователю и
-        # ставится на паузу — независимо от `auto_pause` (он относится
-        # только к ПРОДВИЖЕНИЮ уже начатой задачи, см. `_handle_apply_task_action`).
-        self._db.set_task_paused(task.id, True)
-        self._db.add_task_transition_log(
-            task.id, TaskStateEnum.PLANNING.value, TaskStateEnum.PLANNING.value,
-            kind="pause", applied_by="system", note=None,
-        )
+        plan = [str(s).strip() for s in plan_raw if str(s).strip()] if isinstance(plan_raw, list) and kind == KIND_WORK else []
+        goal = str(arguments.get("goal") or "").strip() or (title if kind == KIND_SEARCH else "")
+        state = kind_initial_state(kind)
+        if kind == KIND_SEARCH and arguments.get("needs_clarification") is True:
+            state = "clarifying"
+        pause = chat.settings.task_pause_each_stage
+        task = self._db.create_task(chat.id, title, plan=plan, kind=kind, state=state, goal=goal, paused=pause)
+        if pause:
+            self._db.add_task_transition_log(task.id, state, state, kind="pause", applied_by="system", note=None)
+        memory_args = {
+            "add_clarifications": arguments.get("clarifications") or arguments.get("add_clarifications"),
+            "add_constraints": arguments.get("constraints") or arguments.get("add_constraints"),
+            "add_terms": arguments.get("terms") or arguments.get("add_terms"),
+        }
+        changes = self._apply_memory_changes(task, memory_args, self._last_user_message_id(chat.id))
+        state_name = kind_display_name(kind, state)
+        event = {
+            "task_id": task.id, "task_title": task.title, "task_kind": kind, "goal": goal,
+            "from_state_display_name": None, "to_state_display_name": state_name, "kind": "advance",
+        }
+        if changes:
+            event["changes"] = changes
         return {
             "started": True,
             "task_id": task.id,
+            "kind": kind,
             "title": task.title,
+            "goal": goal,
             "state": state_name,
-            "status": "paused",
-            "_event": {
-                "task_id": task.id, "task_title": task.title, "from_state_display_name": None,
-                "to_state_display_name": state_name, "kind": "advance",
-            },
+            "status": "paused" if pause else "active",
+            "_event": event,
         }
+
+    def _handle_update_task_memory(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
+        if not chat.settings.task_tracking_enabled:
+            return {"error": "task tracking is disabled for this chat"}
+        task_id = arguments.get("task_id")
+        task = self._db.get_task(task_id) if task_id else None
+        if task is None or task.chat_id != chat.id:
+            return {"error": "unknown task_id for this chat"}
+        changes = self._apply_memory_changes(task, arguments, self._last_user_message_id(chat.id))
+        updated = self._db.get_task(task.id) or task
+        result: Dict[str, Any] = {
+            "updated": bool(changes), "task_id": task.id, "changes": changes,
+            "memory": {k: v for k, v in self._task_memory_dict(updated).items() if k != "sources"},
+        }
+        if changes:
+            result["_event"] = self._memory_event(updated, changes)
+        return result
 
     def _handle_apply_task_action(self, chat: Chat, agent: Agent, arguments: dict, auto_pause: bool = True, events: Optional[List[dict]] = None) -> dict:
         if not chat.settings.task_tracking_enabled:
@@ -1624,28 +1940,26 @@ class Repository:
         task = self._db.get_task(task_id) if task_id else None
         if task is None or task.chat_id != chat.id:
             return {"error": "unknown task_id for this chat"}
-        current_state = parse_task_state(task.state)
-        if current_state == TaskStateEnum.DONE:
+        current_state = task.state
+        if task.kind == KIND_WORK and kind_is_final(task.kind, current_state):
             return {"error": "task is already done"}
 
         target_state_raw = arguments.get("target_state")
         to_state = current_state
         if target_state_raw:
-            try:
-                to_state = parse_task_state(str(target_state_raw))
-            except ValueError:
-                return {"error": f"unknown target_state: {target_state_raw!r}"}
-            if not can_transition(current_state, to_state):
-                options = sorted(s.value for s in allowed_transitions(current_state))
-                return {"error": f"transition {current_state.value} -> {to_state.value} is not allowed; available: {options}"}
+            to_state = str(target_state_raw).strip().lower()
+            if not kind_is_valid_state(task.kind, to_state):
+                return {"error": f"unknown target_state for this task: {target_state_raw!r}; "
+                                 f"available: {self._task_allowed_target_states(task)}"}
+            if to_state != current_state and not kind_can_transition(task.kind, current_state, to_state):
+                options = sorted(self._task_allowed_target_states(task))
+                return {"error": f"transition {current_state} -> {to_state} is not allowed; available: {options}"}
 
-        # Редизайн "Менеджера задач": пока auto_pause=true (обычный чат и
-        # кнопка "Продолжить"), одна и та же задача может быть продвинута
-        # (сменить этап) не более ОДНОГО раза за один ответ модели — иначе
-        # пользователь не успеет увидеть промежуточный этап и подтвердить
-        # продолжение. В режиме "Выполнить" (auto_pause=false) это
-        # ограничение не действует.
-        if auto_pause and to_state != current_state and events is not None:
+        pause_after = self._pause_after_stage(chat, auto_pause)
+        # «Останавливаться на каждом этапе»: одна и та же задача может быть
+        # продвинута не более ОДНОГО раза за один ответ модели — иначе
+        # пользователь не успеет увидеть промежуточный этап.
+        if pause_after and to_state != current_state and events is not None:
             if any(e.get("task_id") == task.id and e.get("kind") == "advance" for e in events):
                 return {
                     "error": (
@@ -1655,16 +1969,6 @@ class Repository:
                     )
                 }
 
-        # Собственно "снимает паузу" из докстринга task_state_machine.py —
-        # раньше нигде не было вызова `set_task_paused(..., False)` вообще
-        # (пауза только ставилась, никогда не снималась программно). Снимаем
-        # её именно здесь, ПЕРЕД применением перехода, а не отдельным логом
-        # "resume" — пауза ортогональна графу переходов (см. task_state_machine.py),
-        # поэтому её снятие не требует отдельной записи в истории: она и так
-        # видна по соседней записи kind="advance" (или по её отсутствию, если
-        # автопауза сразу поставит новую). Обновление БЕЗ смены этапа
-        # (target_state не передан) статус паузы не трогает — им явно
-        # управляет только «Пауза»/продвижение.
         if to_state != current_state:
             self._db.set_task_paused(task.id, False)
 
@@ -1676,34 +1980,61 @@ class Repository:
             done_steps.append(str(completed_step).strip())
         self._db.update_task_progress(
             task.id,
-            state=to_state.value if to_state != current_state else None,
+            state=to_state if to_state != current_state else None,
             current_step=current_step_raw if current_step_raw is not None else task.current_step,
             done_steps=done_steps if completed_step else None,
         )
         if to_state != current_state:
             self._db.add_task_transition_log(
-                task.id, current_state.value, to_state.value, kind="advance", applied_by="agent", note=note,
+                task.id, current_state, to_state, kind="advance", applied_by="agent", note=note,
             )
-        # Автопауза сразу после продвижения (auto_pause=true, этап сменился,
-        # новый этап не конечный) — тот же приём, что и при создании задачи.
-        if auto_pause and to_state != current_state and to_state != TaskStateEnum.DONE:
+        if pause_after and to_state != current_state and not kind_is_final(task.kind, to_state):
             self._db.set_task_paused(task.id, True)
             self._db.add_task_transition_log(
-                task.id, to_state.value, to_state.value, kind="pause", applied_by="system", note=None,
+                task.id, to_state, to_state, kind="pause", applied_by="system", note=None,
             )
         updated_task = self._db.get_task(task.id)
         status = self._task_status(updated_task) if updated_task is not None else "active"
         return {
             "applied": True,
             "task_id": task.id,
-            "state": task_state_display_name(to_state),
+            "state": kind_display_name(task.kind, to_state),
             "status": status,
             "_event": {
-                "task_id": task.id, "task_title": task.title,
-                "from_state_display_name": task_state_display_name(current_state),
-                "to_state_display_name": task_state_display_name(to_state),
+                "task_id": task.id, "task_title": task.title, "task_kind": task.kind,
+                "from_state_display_name": kind_display_name(task.kind, current_state),
+                "to_state_display_name": kind_display_name(task.kind, to_state),
                 "kind": "advance" if to_state != current_state else "update",
             },
+        }
+
+    def _auto_search_transition(self, chat: Chat, task: Task, target: str, reason: str) -> Optional[dict]:
+        """Переход задачи поиска по итогам ответа (код, не модель).
+        achieved → clarifying идёт через answering (по графу)."""
+        path: List[str] = []
+        current = task.state
+        if target == current:
+            return None
+        if kind_can_transition(task.kind, current, target):
+            path = [target]
+        elif current == "achieved" and target == "clarifying":
+            path = ["answering", "clarifying"]
+        else:
+            return None
+        start = current
+        for state in path:
+            self._db.add_task_transition_log(task.id, current, state, kind="advance", applied_by="system", note=reason)
+            current = state
+        self._db.update_task_progress(task.id, state=current, _current_step_set=False)
+        pause = chat.settings.task_pause_each_stage and not kind_is_final(task.kind, current)
+        self._db.set_task_paused(task.id, pause)
+        if pause:
+            self._db.add_task_transition_log(task.id, current, current, kind="pause", applied_by="system", note=None)
+        return {
+            "task_id": task.id, "task_title": task.title, "task_kind": task.kind, "kind": "state",
+            "from_state_display_name": kind_display_name(task.kind, start),
+            "to_state_display_name": kind_display_name(task.kind, current),
+            "note": reason,
         }
 
     _TOOL_HANDLERS = {
@@ -1714,6 +2045,7 @@ class Repository:
         "view_cart": _handle_view_cart,
         "start_task": _handle_start_task,
         "apply_task_action": _handle_apply_task_action,
+        "update_task_memory": _handle_update_task_memory,
     }
 
     def _settings_with_merged_tools(self, chat: Chat) -> Settings:
@@ -1737,11 +2069,15 @@ class Repository:
             if enabled_categories:
                 tools.append(_build_save_long_term_memory_tool(enabled_categories))
         if chat.settings.task_tracking_enabled:
-            tools.append(_build_start_task_tool())
+            tools.append(_build_start_task_tool(self._available_task_kinds(chat)))
             open_tasks = self._open_tasks_for_chat(chat)
+            current = self._current_task(chat)
+            if current is not None and current not in open_tasks:
+                open_tasks.append(current)
             if open_tasks:
+                tools.append(_build_update_task_memory_tool())
                 target_states = sorted({
-                    s.value for task in open_tasks for s in self._task_allowed_target_states(task)
+                    state for task in open_tasks for state in self._task_allowed_target_states(task)
                 })
                 if target_states:
                     tools.append(_build_apply_task_action_tool(target_states))
@@ -1776,6 +2112,12 @@ class Repository:
         # недоступности сервера (отдаёт кэш последнего успешного ответа).
         if self._mcp_client is not None and chat.settings.tools_json.strip():
             self._mcp_client.list_tools()
+        search_task = self._current_search_task(chat)
+        if search_task is not None and search_task.state != "achieved":
+            # Задача поиска: ассистент только ищет и отвечает — инструменты,
+            # которые что-то делают (git, файлы, планировщик, скиллы), модели
+            # не предлагаются; остаются чтение (read_chat), память и задачи.
+            tools = [t for t in tools if _tool_name(t) in self._SEARCH_TASK_TOOLS]
         if not tools:
             return chat.settings
         # Дедупликация по имени функции (первое вхождение побеждает) —
@@ -2126,35 +2468,95 @@ class Repository:
             return []
         return [inv.rule_text for inv in self._db.list_invariants() if inv.id in ids and inv.is_active]
 
-    def _build_task_context_block(self, task: Task) -> str:
-        """Скрытый служебный блок с ТЕКУЩИМИ данными ОДНОЙ задачи — те же
-        поля, что модель должна "возвращать" по системному prompt'у (см.
-        `_build_task_tracking_prompt`): task/state/step/total/plan/done/
-        current, плюс id задачи (нужен для `apply_task_action`). Добавляется
-        в промпт МОДЕЛИ отдельным `system`-сообщением — исходный текст
-        запроса пользователя (`Message.content`) при этом не меняется, см.
-        `_build_task_and_invariant_context`.
+    @staticmethod
+    def _task_memory_lines(task: Task) -> List[str]:
+        lines: List[str] = []
+        if task.goal:
+            lines.append(f"Цель: {task.goal}")
+        if task.clarifications:
+            lines.append("Уточнения пользователя:")
+            lines += [f"- {c.get('text', '')}" for c in task.clarifications]
+        if task.constraints:
+            lines.append("Ограничения пользователя (соблюдай всегда):")
+            lines += [f"- {c.get('text', '')}" for c in task.constraints]
+        if task.terms:
+            lines.append("Термины (используй в этом значении):")
+            lines += [f"- {t.get('term', '')} — {t.get('definition', '')}" for t in task.terms]
+        return lines
 
-        `step`/`total` — по шаблону ТЗ это НЕ прогресс по `plan` (как было
-        раньше: пройденных/всего пунктов плана), а позиция ТЕКУЩЕГО состояния
-        в машине состояний (1..4) и общее число её состояний (всегда 4) —
-        см. пример заполнения `task_states` в сопроводительном сообщении к
-        доработке. Прогресс по плану по-прежнему виден целиком через
-        `plan`/`done` (списки), просто не сведён к отдельным числам."""
-        state = parse_task_state(task.state)
-        position = TASK_STATE_ORDER.index(state) + 1
-        total = len(TASK_STATE_ORDER)
+    def _build_task_context_block(self, task: Task) -> str:
+        """Скрытый служебный блок с ТЕКУЩИМИ данными ОДНОЙ рабочей задачи —
+        task/state/step/total/plan/done/current и id задачи (нужен для
+        `apply_task_action`/`update_task_memory`), плюс память задачи (цель,
+        уточнения, ограничения, термины). Добавляется в промпт модели
+        отдельным `system`-сообщением; текст запроса пользователя не меняется.
+
+        `step`/`total` — позиция текущего состояния в машине состояний и
+        общее число её состояний."""
+        states = kind_states(task.kind)
+        position = states.index(task.state) + 1 if task.state in states else 1
         lines = [
             f"[ЗАДАЧА] id: {task.id}",
             f"task: {task.title}",
             *([f"description: {task.description}"] if task.description else []),
-            f"state: {state.value}",
+            f"state: {task.state}",
             f"step: {position}",
-            f"total: {total}",
+            f"total: {len(states)}",
             f"plan: {json.dumps(task.plan, ensure_ascii=False)}",
             f"done: {json.dumps(task.done_steps, ensure_ascii=False)}",
             f"current: {task.current_step or ''}",
+            *self._task_memory_lines(task),
         ]
+        return "\n".join(lines)
+
+    def _build_search_task_block(self, task: Task) -> str:
+        """[ЗАДАЧА ПОИСКА] — память и правила текущей задачи поиска. Цель,
+        ограничения и термины остаются в промпте, даже если ранние сообщения
+        выпали из окна контекста (Sliding Window, суммаризация)."""
+        targets = kind_allowed(task.kind, task.state)
+        lines = [
+            f"[ЗАДАЧА ПОИСКА] id: {task.id}",
+            f"Название: {task.title}",
+            *self._task_memory_lines(task),
+            f"Состояние: {task.state} («{kind_display_name(task.kind, task.state)}»); "
+            f"доступные переходы: {', '.join(targets) or 'нет'}",
+            "Правила задачи поиска:",
+            "- Ты ищешь ответ в базе знаний и отвечаешь в рамках цели. Ничего не выполняй сам (не меняй файлы, "
+            "не запускай команды, не создавай задачи планировщика) — давай инструкции со ссылками на источники.",
+            "- Соблюдай ограничения. Если найденный в базе способ им противоречит — скажи об этом и предложи "
+            "вариант, который не противоречит, или задай уточняющий вопрос.",
+            "- Используй термины в зафиксированном значении.",
+            "- Если пользователь уточнил цель, поставил ограничение, определил термин или отменил сказанное "
+            "раньше — сначала вызови update_task_memory, потом отвечай.",
+            "- Служебные поля задачи (id, state, step, total, plan, done, current) в ответе не печатай и "
+            "подтверждения на продолжение не запрашивай.",
+            "- Если пользователь просит повторить, сократить, перевести или переформулировать предыдущий "
+            "ответ — сделай это по тем же фрагментам и с теми же номерами [n].",
+            "- Если вопрос уводит в сторону от цели — ответь на него и одной фразой вернись к цели.",
+            "- Когда пользователь получил итоговый ответ (например, собрана итоговая инструкция) или подтвердил, "
+            "что вопрос закрыт, — переведи задачу в achieved через apply_task_action.",
+            "- Если пользователь перешёл к другой цели — начни новую задачу поиска (start_task, kind=search); "
+            "если просит что-то сделать, а не найти — рабочую задачу (start_task, kind=work).",
+        ]
+        return "\n".join(lines)
+
+    def _build_task_types_hint(self, chat: Chat) -> str:
+        lines = []
+        if chat.settings.rag_enabled:
+            lines += [
+                "[ТИПЫ ЗАДАЧ]",
+                "«Рабочая задача» (kind=work) — что-то сделать; этапы и формат параметров — как описано выше.",
+                "«Задача поиска» (kind=search) — найти ответ/инструкцию в базе знаний. Состояния: "
+                f"{format_search_states_for_prompt()}. Формат параметров task/state/step/total/plan/done/current "
+                "и запрос подтверждения к задаче поиска не относятся.",
+                "Если пользователь спрашивает «как сделать…», «где описано…», «что такое…» — это задача поиска.",
+            ]
+        if not chat.settings.task_pause_each_stage:
+            lines.append(
+                "Режим «Останавливаться на каждом этапе» выключен: НЕ запрашивай подтверждение пользователя на "
+                "переход к следующему этапу — продвигай задачу сам; останавливайся, только если для продолжения "
+                "нужен ответ пользователя."
+            )
         return "\n".join(lines)
 
     def _build_task_and_invariant_context(self, chat: Chat, agent: Agent) -> List[ProviderMessage]:
@@ -2185,8 +2587,15 @@ class Repository:
         blocks: List[ProviderMessage] = []
         if chat.settings.task_tracking_enabled:
             blocks.append(ProviderMessage("system", self._build_task_tracking_prompt()))
+            hint = self._build_task_types_hint(chat)
+            if hint:
+                blocks.append(ProviderMessage("system", hint))
             for task in self._open_tasks_for_chat(chat):
-                blocks.append(ProviderMessage("system", self._build_task_context_block(task)))
+                if task.kind == KIND_WORK:
+                    blocks.append(ProviderMessage("system", self._build_task_context_block(task)))
+            search_task = self._current_search_task(chat)
+            if search_task is not None:
+                blocks.append(ProviderMessage("system", self._build_search_task_block(search_task)))
         invariants = self._active_invariants(chat, agent)
         if invariants:
             lines = [
@@ -2355,15 +2764,21 @@ class Repository:
         if not chat.settings.collection_ids:
             raise ValidationError("Включено «Использовать RAG», но не выбраны базы знаний")
 
-    def _rewrite_query(self, chat: Chat, history: List[Message], text: str) -> Tuple[str, dict]:
+    def _rewrite_query(
+        self, chat: Chat, history: List[Message], text: str, task: Optional[Task] = None,
+    ) -> Tuple[str, dict]:
         """Поисковый запрос по настройке «Переписывание запроса»:
         «Нет» — вопрос как есть; «Дополнять уточняющие» — короткий вопрос
         склеивается с предыдущим вопросом пользователя; «Моделью до поиска» —
         модель (модель переписывания или модель агента) по последним репликам
-        диалога формулирует самостоятельный поисковый запрос. Ошибка модели не
-        прерывает ответ — поиск идёт по исходному вопросу."""
+        диалога и памяти текущей задачи (цель, термины, ограничения)
+        формулирует самостоятельный поисковый запрос — или отвечает
+        «БЕЗ_ПОИСКА», если пользователь просит что-то сделать с предыдущим
+        ответом (`info["no_search"]`). Ошибка модели не прерывает ответ —
+        поиск идёт по исходному вопросу."""
         mode = chat.settings.rag_query_rewrite
-        info: dict = {"mode": mode, "rewritten": False, "model": None, "error": None, "tokens": None}
+        info: dict = {"mode": mode, "rewritten": False, "model": None, "error": None, "tokens": None,
+                      "no_search": False, "task_memory": False}
         if mode == "off":
             return text.strip(), info
         if mode != "llm":
@@ -2373,6 +2788,8 @@ class Repository:
             return query, info
         model = chat.settings.rag_rewrite_model or chat.settings.model
         info["model"] = model
+        memory_lines = self._task_memory_lines(task) if task is not None else []
+        info["task_memory"] = bool(memory_lines)
         try:
             if self._catalog.get(model) is None:
                 raise ProviderError(f"модель переписывания {model!r} не найдена в каталоге")
@@ -2384,7 +2801,7 @@ class Repository:
                 logprobs=False, frequency_penalty=None, presence_penalty=None,
             )
             result = provider.chat(model_id, [
-                ProviderMessage("system", REWRITE_INSTRUCTION),
+                ProviderMessage("system", rewrite_instruction(memory_lines)),
                 ProviderMessage("user", rewrite_request_text(history, text)),
             ], request_settings)
             info["tokens"] = result.usage.total_tokens if result.usage else None
@@ -2394,57 +2811,183 @@ class Repository:
         except (ProviderError, ValidationError) as exc:
             info["error"] = f"переписать не удалось: {exc}"
             return text.strip(), info
+        if is_no_search(query):
+            info["no_search"] = True
+            return text.strip(), info
         info["rewritten"] = query != text.strip()
         return query, info
 
+    @staticmethod
+    def _previous_rag(history: List[Message]) -> Tuple[Optional[Message], Optional[dict]]:
+        """Последний ответ ассистента с найденными фрагментами — для «БЕЗ_ПОИСКА»."""
+        for message in reversed(history):
+            if message.role != "assistant" or not message.rag:
+                continue
+            try:
+                rag = json.loads(message.rag)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(rag, dict) and rag.get("sources"):
+                return message, rag
+        return None, None
+
+    #: Сколько фрагментов хранит задача поиска (`Task.sources`) и сколько из
+    #: них подмешивается к новым результатам поиска.
+    TASK_SOURCES_LIMIT = 12
+    TASK_SOURCES_IN_CONTEXT = 4
+
+    @staticmethod
+    def _stored_source(src: dict) -> dict:
+        keys = ("chunk_id", "text", "section", "page", "document_id", "title", "source", "source_type",
+                "doc_date", "doc_version", "collection_id", "collection_name")
+        return {k: src.get(k) for k in keys}
+
+    def _merge_task_sources(self, outcome: RagOutcome, task: Task, budget_tokens: int) -> None:
+        """Фрагменты, накопленные задачей поиска, — после новых результатов
+        (в пределах бюджета контекста, без повторов). Если поиск ничего не
+        нашёл — они единственный контекст ответа."""
+        if not task.sources:
+            return
+        present = {s.get("chunk_id") for s in outcome.sources}
+        used = sum(estimate_tokens(s.get("text") or "") for s in outcome.sources)
+        fallback = not outcome.sources
+        limit = len(task.sources) if fallback else self.TASK_SOURCES_IN_CONTEXT
+        added = 0
+        for stored in reversed(task.sources):
+            if added >= limit:
+                break
+            if stored.get("chunk_id") in present:
+                continue
+            tokens = estimate_tokens(stored.get("text") or "")
+            if outcome.sources and used + tokens > budget_tokens:
+                break
+            outcome.sources.append({**stored, "n": len(outcome.sources) + 1, "score": None,
+                                    "vector_score": None, "rerank_score": None, "from_task": True})
+            present.add(stored.get("chunk_id"))
+            used += tokens
+            added += 1
+        outcome.task_sources_added = added
+        if added and fallback:
+            outcome.task_sources_fallback = True
+            outcome.status = RAG_STATUS_OK
+
+    def _accumulate_task_sources(self, task: Task, outcome: RagOutcome) -> int:
+        """Фрагменты, на которые сослался ответ, — в `Task.sources` (дедупликация
+        по chunk_id, повторно процитированный переносится в конец, лимит —
+        `TASK_SOURCES_LIMIT` последних)."""
+        cited = [s for s in outcome.sources if s.get("n") in set(outcome.cited) and s.get("chunk_id")]
+        if not cited:
+            return 0
+        stored = [dict(s) for s in task.sources]
+        new_count = 0
+        for src in cited:
+            existing = next((x for x in stored if x.get("chunk_id") == src.get("chunk_id")), None)
+            if existing is not None:
+                stored.remove(existing)
+            else:
+                new_count += 1
+            stored.append(self._stored_source(src))
+        self._db.update_task_memory(task.id, sources=stored[-self.TASK_SOURCES_LIMIT:])
+        return new_count
+
     def _prepare_rag(
         self, chat: Chat, history: List[Message], text: str, provider_messages: List[ProviderMessage],
-        query: Optional[str] = None, rewrite: Optional[dict] = None,
+        query: Optional[str] = None, rewrite: Optional[dict] = None, task: Optional[Task] = None,
     ) -> RagOutcome:
         """Поиск фрагментов и сборка запроса: перед последним сообщением
         (вопросом) — инструкция RAG, сам вопрос заменяется на «Контекст +
         вопрос». В историю чата уходит исходный вопрос, фрагменты — только в
         `Message.rag` ответа. Недоступность сервиса не прерывает ответ: модель
-        отвечает без базы знаний и предупреждает об этом."""
+        отвечает без базы знаний и предупреждает об этом.
+
+        «БЕЗ_ПОИСКА» (`rewrite["no_search"]`): нового поиска нет — фрагменты и
+        их номера берутся из предыдущего ответа. В задаче поиска (`task`) к
+        найденному добавляются фрагменты, накопленные задачей."""
         settings = chat.settings
         if query is None:
-            query, rewrite = self._rewrite_query(chat, history, text)
+            query, rewrite = self._rewrite_query(chat, history, text, task)
+        rewrite = rewrite or {}
         candidate_k = max(settings.rag_candidate_k, settings.rag_top_k)
         outcome = RagOutcome(
             query=query, status=RAG_STATUS_OK, only_from_kb=settings.rag_only_from_kb, original_query=text.strip(),
             quotes_required=settings.rag_quotes,
-            rewrite=rewrite or {}, params={
+            rewrite=rewrite, params={
                 "candidate_k": candidate_k, "top_k": settings.rag_top_k,
                 "score_threshold": settings.rag_score_threshold, "rerank": settings.rag_rerank,
                 "rerank_threshold": settings.rag_rerank_threshold if settings.rag_rerank != "none" else None,
             },
         )
-        try:
-            found = self._knowledge.retrieve(
-                query, list(settings.collection_ids), settings.rag_top_k, settings.rag_score_threshold,
-                candidate_k=candidate_k, rerank=settings.rag_rerank, rerank_model=settings.rag_rerank_model or None,
-                rerank_threshold=settings.rag_rerank_threshold,
-            )
-            outcome.stages = found.get("stages") or {}
-            outcome.missing_collections = list(found.get("missing_collections") or [])
-            if outcome.missing_collections:
-                _logger.warning("Чат %s: базы знаний не найдены в knowledge_service: %s",
-                                chat.id, ", ".join(outcome.missing_collections))
-            outcome.rerank = found.get("rerank") or {}
-            outcome.sources = select_sources(found["results"], settings.rag_context_tokens)
-            if not outcome.sources:
-                outcome.status = RAG_STATUS_NOT_FOUND
-        except KnowledgeServiceError as exc:
-            outcome.status, outcome.error = RAG_STATUS_UNAVAILABLE, str(exc)
-            # Причина видна под ответом и в логе: без неё «База знаний недоступна»
-            # не отличить от сетевой ошибки, удалённой базы или сбоя эмбеддингов.
-            _logger.warning("Чат %s: поиск в базе знаний не удался: %s", chat.id, exc)
+        previous_message, previous_rag = self._previous_rag(history) if rewrite.get("no_search") else (None, None)
+        if previous_rag is not None:
+            outcome.sources = [dict(s) for s in previous_rag.get("sources") or []]
+            outcome.query = previous_rag.get("query") or query
+            outcome.context_reused = {"message_id": previous_message.id}
+        else:
+            if rewrite.get("no_search"):
+                rewrite["no_search_note"] = "предыдущего ответа с фрагментами нет — выполнен обычный поиск"
+            try:
+                found = self._knowledge.retrieve(
+                    query, list(settings.collection_ids), settings.rag_top_k, settings.rag_score_threshold,
+                    candidate_k=candidate_k, rerank=settings.rag_rerank, rerank_model=settings.rag_rerank_model or None,
+                    rerank_threshold=settings.rag_rerank_threshold,
+                )
+                outcome.stages = found.get("stages") or {}
+                outcome.missing_collections = list(found.get("missing_collections") or [])
+                if outcome.missing_collections:
+                    _logger.warning("Чат %s: базы знаний не найдены в knowledge_service: %s",
+                                    chat.id, ", ".join(outcome.missing_collections))
+                outcome.rerank = found.get("rerank") or {}
+                outcome.sources = select_sources(found["results"], settings.rag_context_tokens)
+                if not outcome.sources:
+                    outcome.status = RAG_STATUS_NOT_FOUND
+            except KnowledgeServiceError as exc:
+                outcome.status, outcome.error = RAG_STATUS_UNAVAILABLE, str(exc)
+                # Причина видна под ответом и в логе: без неё «База знаний недоступна»
+                # не отличить от сетевой ошибки, удалённой базы или сбоя эмбеддингов.
+                _logger.warning("Чат %s: поиск в базе знаний не удался: %s", chat.id, exc)
+            if task is not None and outcome.status != RAG_STATUS_UNAVAILABLE:
+                self._merge_task_sources(outcome, task, settings.rag_context_tokens)
         question = provider_messages[-1]
         provider_messages[-1:] = [
             ProviderMessage("system", rag_instruction(outcome)),
             ProviderMessage(question.role, augmented_question(question.content, outcome)),
         ]
         return outcome
+
+    def _after_search_answer(
+        self, chat: Chat, rag: RagOutcome, answer: str, acc: "_TurnAccumulator",
+    ) -> List[dict]:
+        """После ответа в задаче поиска: процитированные фрагменты — в
+        `Task.sources`; переход состояния по итогам ответа (если модель сама
+        не меняла состояние задачи в этом ходе):
+        «Не знаю» / уточняющий вопрос без ссылок → «Уточнение»;
+        ответ со ссылками из «Уточнения» или «Цель достигнута» → «Поиск ответа».
+        Возвращает новые события задачи (они же добавлены в `acc.task_events`)."""
+        task = self._current_search_task(chat)
+        if task is None:
+            return []
+        events: List[dict] = []
+        self._accumulate_task_sources(task, rag)
+        rag.dont_know = rag.dont_know or starts_with_dont_know(answer)
+        # Модель сама создала задачу или сменила её состояние в этом ходе —
+        # её решение не перекрываем.
+        touched = any(e.get("task_id") == task.id and e.get("kind") == "advance" for e in acc.task_events)
+        if touched:
+            return []
+        lines = [line.strip() for line in (answer or "").strip().splitlines() if line.strip()]
+        asks_question = not rag.cited and bool(lines) and lines[-1].endswith("?")
+        target = None
+        if rag.dont_know or asks_question:
+            target, reason = "clarifying", "ответ «Не знаю» или уточняющий вопрос"
+        elif rag.cited and task.state in ("clarifying", "achieved"):
+            target, reason = "answering", "ответ с источниками"
+        if target is None:
+            return []
+        event = self._auto_search_transition(chat, task, target, reason)
+        if event is not None:
+            acc.task_events.append(event)
+            events.append(event)
+        return events
 
     def _validate_send_flags(self, chat: Chat, get_facts: bool, sliding_window: bool, autosummary: str) -> None:
         if get_facts:
@@ -2496,9 +3039,38 @@ class Repository:
             raise NotFoundError(f"task {task_id!r} does not belong to chat {chat_id!r}")
         if not chat.settings.task_tracking_enabled:
             raise ValidationError("task tracking is disabled for this chat")
+        if task.kind == KIND_SEARCH:
+            raise ValidationError(
+                "задача поиска продолжается сообщением пользователя — Менеджер задач к ней не применяется"
+            )
         if self._task_status(task) == "done":
             raise ValidationError("task is already done; task manager is not applicable")
         return chat, task
+
+    def work_task_to_continue(self, chat_id: str, terminal: dict) -> Optional[str]:
+        """Рабочая задача, которую нужно вести дальше сразу после ответа на
+        сообщение пользователя: «Останавливаться на каждом этапе» выключено, в
+        этом ответе задача создана или продвинута и осталась активной (не на
+        паузе и не завершена). Если модель задала пользователю вопрос и этап
+        не продвигала — продолжения нет."""
+        if terminal.get("type") != "done":
+            return None
+        chat = self._db.get_chat(chat_id)
+        if chat is None or not chat.settings.task_tracking_enabled or chat.settings.task_pause_each_stage:
+            return None
+        message = terminal.get("message")
+        raw = getattr(message, "task_events", None)
+        try:
+            events = json.loads(raw) if raw else []
+        except (ValueError, TypeError):
+            return None
+        for event in reversed(events):
+            if event.get("kind") != "advance":
+                continue
+            task = self._db.get_task(event.get("task_id") or "")
+            if task is not None and task.kind == KIND_WORK and self._task_status(task) == "active":
+                return task.id
+        return None
 
     def prepare_task_step_draft(self, chat_id: str, run_id: Optional[str] = None) -> Message:
         """Черновик сообщения одного шага Менеджера задач (у шага нет
@@ -2513,7 +3085,9 @@ class Repository:
     # ---- общий цикл одного ответа модели --------------------------------------
 
     _MEMORY_TOOLS = frozenset({"save_working_memory", "save_long_term_memory"})
-    _TASK_TOOLS = frozenset({"start_task", "apply_task_action"})
+    _TASK_TOOLS = frozenset({"start_task", "apply_task_action", "update_task_memory"})
+    #: Инструменты, доступные модели в задаче поиска (только чтение).
+    _SEARCH_TASK_TOOLS = _MEMORY_TOOLS | _TASK_TOOLS | frozenset({builtin_tools.READ_CHAT})
 
     def _tool_source(self, name: str, allowed_mcp_names: Optional[set]) -> str:
         """Откуда инструмент — для строки «Использую инструмент …» в клиенте."""
@@ -2727,17 +3301,28 @@ class Repository:
                 )
                 provider_name, model_id = _split_model(chat.settings.model)
                 provider = self._registry.get(provider_name)
+                search_task = self._current_search_task(chat)
+                if search_task is not None and search_task.paused:
+                    # Новое сообщение пользователя продолжает задачу поиска —
+                    # пауза («Останавливаться на каждом этапе») снимается.
+                    self._db.set_task_paused(search_task.id, False)
+                    self._db.add_task_transition_log(
+                        search_task.id, search_task.state, search_task.state, kind="resume", applied_by="system", note=None,
+                    )
                 request_settings = self._settings_with_merged_tools(chat)
 
                 rag: Optional[RagOutcome] = None
                 if chat.settings.rag_enabled:
                     if chat.settings.rag_query_rewrite == "llm":
                         yield {"type": "status", "status": "Переписываю запрос"}
-                    search_text, rewrite_info = self._rewrite_query(chat, messages, text)
+                    search_text, rewrite_info = self._rewrite_query(chat, messages, text, search_task)
                     if token is not None:
                         token.raise_if_cancelled()
-                    yield {"type": "status", "status": "Поиск в базе знаний"}
-                    rag = self._prepare_rag(chat, messages, text, provider_messages, search_text, rewrite_info)
+                    reuse = rewrite_info.get("no_search")
+                    yield {"type": "status", "status": "Беру фрагменты предыдущего ответа" if reuse else "Поиск в базе знаний"}
+                    rag = self._prepare_rag(
+                        chat, messages, text, provider_messages, search_text, rewrite_info, task=search_task,
+                    )
                     acc.rag = rag.to_dict()
                     yield {"type": "rag_context", "rag": acc.rag}
                     if token is not None:
@@ -2751,6 +3336,8 @@ class Repository:
                 )
                 if rag is not None:
                     final_content = finalize_answer(final_content, rag)
+                    for event in self._after_search_answer(chat, rag, final_content, acc):
+                        yield {"type": "task_event", **event}
                     acc.rag = rag.to_dict()
                 duration_ms = int((time.monotonic() - started) * 1000)
                 # Токены НА ВХОД этого обмена (показываются под сообщением
@@ -2953,8 +3540,9 @@ class Repository:
         yield from self.execute_task_step(chat_id, task_id, draft, auto_pause=auto_pause, use_stream=True)
 
     def create_task_direct(
-        self, chat_id: str, title: str, description: str = "", source: str = "app",
-    ) -> Tuple[dict, Message]:
+        self, chat_id: str, title: str, description: str = "", source: str = "app", kind: str = "work",
+        goal: str = "", add_message: bool = True,
+    ) -> Tuple[dict, Optional[Message]]:
         """Создание задачи напрямую, без участия модели (ТЗ, раздел 2.3 —
         нужно планировщику: вид задачи «Задача агенту»). В ленту чата
         добавляется сообщение-запрос «Задача: …» от имени `source`, чтобы
@@ -2968,8 +3556,19 @@ class Repository:
         if not title:
             raise ValidationError("title must be a non-empty string")
         description = (description or "").strip()
-        task = self._db.create_task(chat_id, title, plan=[], description=description)
-        text = f"Задача: {title}" + (f"\n\n{description}" if description else "")
+        if kind not in TASK_KINDS:
+            raise ValidationError(f"kind must be one of {list(TASK_KINDS)}")
+        if kind == KIND_SEARCH and not chat.settings.rag_enabled:
+            raise PreconditionFailedError("Задача поиска требует включённой базы знаний (rag_enabled)")
+        goal = (goal or "").strip() or (title if kind == KIND_SEARCH else "")
+        task = self._db.create_task(
+            chat_id, title, plan=[], description=description, kind=kind,
+            state=kind_initial_state(kind), goal=goal,
+        )
+        if not add_message:
+            return self._task_summary(task, chat.title), None
+        prefix = "Задача поиска" if kind == KIND_SEARCH else "Задача"
+        text = f"{prefix}: {title}" + (f"\n\n{description}" if description else "")
         message = self._db.add_message(Message(
             id=0, chat_id=chat_id, role="user", content=text, created_at=int(time.time()),
             format=detect_message_format(text), branch=0, source=source,

@@ -65,6 +65,7 @@ _SETTINGS_COLUMNS = [
     ("semantic_memory_enabled", "INTEGER"),
     ("procedural_memory_enabled", "INTEGER"),
     ("task_tracking_enabled", "INTEGER"),
+    ("task_pause_each_stage", "INTEGER"),
     ("task_manager_max_steps", "INTEGER"),
     ("summary_prompt", "TEXT"),
     ("summary_system_prompt", "TEXT"),
@@ -153,6 +154,7 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "semantic_memory_enabled": int(settings.semantic_memory_enabled),
         "procedural_memory_enabled": int(settings.procedural_memory_enabled),
         "task_tracking_enabled": int(settings.task_tracking_enabled),
+        "task_pause_each_stage": int(settings.task_pause_each_stage),
         "task_manager_max_steps": settings.task_manager_max_steps,
         "summary_prompt": settings.summary_prompt,
         "summary_system_prompt": settings.summary_system_prompt,
@@ -204,6 +206,7 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         semantic_memory_enabled=bool(row["semantic_memory_enabled"]),
         procedural_memory_enabled=bool(row["procedural_memory_enabled"]),
         task_tracking_enabled=bool(row["task_tracking_enabled"]),
+        task_pause_each_stage=bool(row["task_pause_each_stage"]),
         task_manager_max_steps=row["task_manager_max_steps"],
         summary_prompt=row["summary_prompt"],
         summary_system_prompt=row["summary_system_prompt"]
@@ -496,7 +499,13 @@ class Database:
                     done_steps TEXT NOT NULL DEFAULT '[]',
                     current_step TEXT,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'work',
+                    goal TEXT NOT NULL DEFAULT '',
+                    clarifications TEXT NOT NULL DEFAULT '[]',
+                    constraints TEXT NOT NULL DEFAULT '[]',
+                    terms TEXT NOT NULL DEFAULT '[]',
+                    sources TEXT NOT NULL DEFAULT '[]'
                 );
 
                 CREATE TABLE IF NOT EXISTS task_transition_log (
@@ -1293,32 +1302,66 @@ class Database:
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> Task:
+        def _list(name: str) -> List[Any]:
+            return json.loads(row[name]) if row[name] else []
+
         return Task(
             id=row["id"], chat_id=row["chat_id"], title=row["title"], state=row["state"],
             paused=bool(row["paused"]),
-            plan=json.loads(row["plan"]) if row["plan"] else [],
-            done_steps=json.loads(row["done_steps"]) if row["done_steps"] else [],
+            plan=_list("plan"), done_steps=_list("done_steps"),
             current_step=row["current_step"],
             created_at=row["created_at"], updated_at=row["updated_at"],
             description=row["description"],
+            kind=row["kind"] or "work", goal=row["goal"] or "",
+            clarifications=_list("clarifications"), constraints=_list("constraints"),
+            terms=_list("terms"), sources=_list("sources"),
         )
 
     def create_task(
         self, chat_id: str, title: str, plan: Optional[List[str]] = None, description: str = "",
+        kind: str = "work", state: str = "planning", goal: str = "", paused: bool = False,
     ) -> Task:
         task_id = str(uuid.uuid4())
         now = int(time.time())
         plan = plan or []
         with self._connect() as conn:
             conn.execute(
-                "INSERT INTO tasks (id, chat_id, title, state, paused, plan, done_steps, current_step, created_at, updated_at, description) "
-                "VALUES (?, ?, ?, 'planning', 0, ?, '[]', NULL, ?, ?, ?)",
-                (task_id, chat_id, title, json.dumps(plan, ensure_ascii=False), now, now, description or ""),
+                "INSERT INTO tasks (id, chat_id, title, state, paused, plan, done_steps, current_step, "
+                "created_at, updated_at, description, kind, goal) "
+                "VALUES (?, ?, ?, ?, ?, ?, '[]', NULL, ?, ?, ?, ?, ?)",
+                (task_id, chat_id, title, state, int(paused), json.dumps(plan, ensure_ascii=False),
+                 now, now, description or "", kind, goal or ""),
             )
         return Task(
-            id=task_id, chat_id=chat_id, title=title, state="planning", plan=plan, created_at=now, updated_at=now,
-            description=description or "",
+            id=task_id, chat_id=chat_id, title=title, state=state, paused=paused, plan=plan,
+            created_at=now, updated_at=now, description=description or "", kind=kind, goal=goal or "",
         )
+
+    def update_task_memory(
+        self, task_id: str, goal: Optional[str] = None, clarifications: Optional[List[dict]] = None,
+        constraints: Optional[List[dict]] = None, terms: Optional[List[dict]] = None,
+        sources: Optional[List[dict]] = None, title: Optional[str] = None,
+    ) -> None:
+        """Перезаписывает переданные поля памяти задачи целиком (`None` — не
+        трогать). Слияние/дедупликацию делает `Repository`."""
+        assignments: List[str] = []
+        values: List[Any] = []
+        for name, value in (("goal", goal), ("title", title)):
+            if value is not None:
+                assignments.append(f"{name} = ?")
+                values.append(value)
+        for name, value in (("clarifications", clarifications), ("constraints", constraints),
+                            ("terms", terms), ("sources", sources)):
+            if value is not None:
+                assignments.append(f"{name} = ?")
+                values.append(json.dumps(value, ensure_ascii=False))
+        if not assignments:
+            return
+        assignments.append("updated_at = ?")
+        values.append(int(time.time()))
+        values.append(task_id)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?", values)
 
     def get_task(self, task_id: str) -> Optional[Task]:
         with self._connect() as conn:
@@ -1384,6 +1427,13 @@ class Database:
                 "UPDATE tasks SET paused = ?, updated_at = ? WHERE id = ?",
                 (int(paused), int(time.time()), task_id),
             )
+
+    def last_user_message_id(self, chat_id: str) -> Optional[int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages WHERE chat_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1", (chat_id,)
+            ).fetchone()
+            return row["id"] if row is not None else None
 
     def delete_task(self, task_id: str) -> None:
         with self._connect() as conn:
