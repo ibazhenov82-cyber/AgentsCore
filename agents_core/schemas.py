@@ -46,7 +46,15 @@ class SettingsOut(BaseModel):
     stream: bool
     thinking_enabled: bool
     reasoning_effort: Optional[str] = Field(None, description="'low' | 'high' | 'max', имеет смысл только при thinking_enabled=true")
-    max_tokens: Optional[int] = Field(None, ge=1)
+    max_tokens: Optional[int] = Field(None, ge=1, description="Предел длины ОТВЕТА в токенах (у Ollama — num_predict)")
+    num_ctx: Optional[int] = Field(
+        None, ge=1,
+        description=(
+            "Размер контекстного окна локальной модели (Ollama num_ctx): prompt + ответ целиком. "
+            "Влияет на память и на то, что модель увидит (лишнее начало prompt'а Ollama отбрасывает). "
+            "null — окно по умолчанию сервера Ollama; облачные провайдеры игнорируют"
+        ),
+    )
     json_mode: bool
     stop_sequences: List[str] = Field(default_factory=list)
 
@@ -169,6 +177,7 @@ class SettingsPatch(BaseModel):
     thinking_enabled: Optional[bool] = None
     reasoning_effort: Optional[str] = None
     max_tokens: Optional[int] = Field(None, ge=1)
+    num_ctx: Optional[int] = Field(None, ge=1)
     json_mode: Optional[bool] = None
     stop_sequences: Optional[List[str]] = None
     tool_choice: Optional[str] = None
@@ -354,6 +363,15 @@ class MessageOut(BaseModel):
             "confirmed=false — в ответе нет ссылок на фрагменты («не подтверждён базой знаний»)"
         ),
     )
+    metrics: Optional[str] = Field(
+        None,
+        description=(
+            "Скорость и ресурсы ответа ассистента: JSON {\"ttft_ms\" (до первого токена), \"tokens_per_sec\" "
+            "(генерация), \"prompt_tokens_per_sec\" (чтение prompt'а), \"load_ms\" (загрузка модели в память), "
+            "\"memory_mb\", \"vram_mb\", \"gpu_percent\" (сколько модель занимает, по Ollama /api/ps), "
+            "\"num_ctx\" (фактическое окно)}; любое поле может отсутствовать"
+        ),
+    )
 
 _SLIDING_WINDOW_DESCRIPTION = (
     "Запросить обрезку контекста стратегией Sliding Window. Требует "
@@ -429,10 +447,9 @@ class ChatStatsOut(BaseModel):
     context_fill_ratio: Optional[float] = Field(
         None,
         description=(
-            "total_tokens / effective_window — реальный расход по видимой (не бледной) части чата, где "
-            "effective_window — это context_window модели, но если у чата задана настройка max_tokens и она "
-            "МЕНЬШЕ размера окна модели, используется именно max_tokens (пользователь явно ограничил бюджет "
-            "чата). Значение намеренно НЕ обрезается сервером и может быть больше 1.0, если чат уже перерос "
+            "total_tokens / context_window — реальный расход по видимой (не бледной) части чата; "
+            "context_window — окно модели, у локальной модели с num_ctx — num_ctx (max_tokens — только предел "
+            "длины ответа и на заполнение не влияет). Значение намеренно НЕ обрезается сервером и может быть больше 1.0, если чат уже перерос "
             "этот бюджет: клиент должен сам показать переполнение (например, отобразить 100% вместо большего "
             "числа и покрасить индикатор заполненности в красный)"
         ),
@@ -441,6 +458,13 @@ class ChatStatsOut(BaseModel):
         None, description="Id самого раннего сообщения, которое ещё попадёт в следующий запрос к модели — всё, что раньше, можно отображать более бледным"
     )
     can_summarize: bool = Field(..., description="Доступна ли сейчас кнопка «Подготовить суммарный запрос»")
+    # «День 29» — средние по завершённым ответам ветки, у которых есть метрики.
+    measured_answers: int = Field(0, description="Сколько ответов ассистента с метриками учтено в средних ниже")
+    avg_tokens_per_sec: Optional[float] = Field(None, description="Средняя скорость генерации, токенов/с")
+    avg_ttft_ms: Optional[int] = Field(None, description="Среднее время до первого токена, мс (потоковые ответы)")
+    avg_duration_ms: Optional[int] = Field(None, description="Среднее время ответа без загрузки модели в память, мс")
+    max_memory_mb: Optional[int] = Field(None, description="Наибольший объём памяти, занятый моделью, МБ")
+    max_vram_mb: Optional[int] = Field(None, description="Наибольший объём видеопамяти, занятый моделью, МБ")
 
 
 class ChatCreate(BaseModel):
@@ -1098,3 +1122,130 @@ class McpToolOut(BaseModel):
     title: str = Field("", description="Краткое русское описание")
     description: str = ""
     parameters: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Локальные модели Ollama («День 29»)
+# ---------------------------------------------------------------------------
+
+class LocalModelOut(BaseModel):
+    model: str = Field(..., description="Имя модели в Ollama (тег), например 'qwen3:8b'")
+    id: str = Field(..., description="Составной идентификатор для настроек агента: 'ollama:<имя>'")
+    family: Optional[str] = None
+    parameter_size: Optional[str] = Field(None, description="Размер модели, например '8.2B'")
+    quantization_level: Optional[str] = Field(None, description="Квантование, например 'Q4_K_M'")
+    size_mb: Optional[int] = Field(None, description="Размер на диске, МБ")
+    modified_at: Optional[str] = None
+    status: str = Field(..., description="'running' | 'stopped' | 'starting' | 'stopping'")
+    competitive_start: bool = Field(
+        False, description="Конкурентный запуск: при запуске этой модели другие запущенные локальные чат-модели останавливаются",
+    )
+    memory_mb: Optional[int] = Field(None, description="Сколько занимает запущенная модель, МБ")
+    vram_mb: Optional[int] = Field(None, description="Из них в видеопамяти, МБ")
+    gpu_percent: Optional[int] = Field(None, description="Доля модели в видеопамяти, %")
+    num_ctx: Optional[int] = Field(None, description="Окно, с которым модель запущена")
+    error: Optional[str] = Field(None, description="Ошибка последнего запуска/остановки")
+    kind: str = Field("chat", description="'chat' | 'embedding' (embedding-модели агентам недоступны)")
+    need_mb: Optional[int] = Field(
+        None, description="Оценка памяти для запуска (незапущенная модель, окно Ollama по умолчанию 4096), МБ",
+    )
+
+
+class LocalPullOut(BaseModel):
+    model: str = Field(..., description="Что скачивается: 'qwen3:8b' или 'hf.co/<репозиторий>:<квант>'")
+    status: str = Field(..., description="'starting' | 'downloading' | 'verifying' | 'failed'")
+    completed_mb: int = 0
+    total_mb: Optional[int] = None
+    percent: Optional[int] = None
+    error: Optional[str] = None
+
+
+class SystemMemoryOut(BaseModel):
+    available_mb: int = Field(..., description="Свободно ОЗУ + свободная видеопамять NVIDIA, МБ")
+    ram_available_mb: int
+    ram_total_mb: int
+    vram_free_mb: int = 0
+
+
+class LocalModelsOut(BaseModel):
+    available: bool = Field(..., description="Ollama включена и отвечает")
+    error: Optional[str] = Field(None, description="Почему список недоступен")
+    models: List[LocalModelOut] = Field(default_factory=list)
+    pulls: List[LocalPullOut] = Field(default_factory=list, description="Идущие и неудавшиеся скачивания")
+    memory: Optional[SystemMemoryOut] = Field(
+        None, description="Свободная память компьютера с Ollama (только если Ollama на этом же компьютере)",
+    )
+
+
+class RecommendedModelOut(BaseModel):
+    model: str
+    title: str
+    kind: str
+    size_mb: int
+    description: str
+
+
+class ModelProbeIn(BaseModel):
+    model: str = Field(..., min_length=1, description="Составной id модели из каталога, например 'ollama:qwen3:8b'")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ModelProbeOut(BaseModel):
+    ok: bool
+    answer: Optional[str] = None
+    error: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    prompt_ms: Optional[int] = Field(None, description="Чтение prompt'а (prefill), мс — у локальных моделей")
+    tokens_per_sec: Optional[float] = Field(None, description="Скорость генерации — у локальных моделей")
+    load_ms: Optional[int] = None
+    duration_ms: Optional[int] = None
+
+
+class HfModelOut(BaseModel):
+    id: str
+    author: Optional[str] = None
+    downloads: int = 0
+    likes: int = 0
+    pipeline_tag: Optional[str] = None
+    last_modified: Optional[str] = None
+
+
+class HfFileOut(BaseModel):
+    path: str
+    name: str
+    size_mb: int
+    quant: Optional[str] = None
+    supported: bool
+    reason: Optional[str] = Field(None, description="Почему файл нельзя скачать через Ollama")
+    ollama_model: Optional[str] = Field(None, description="Имя для скачивания: 'hf.co/<репозиторий>:<квант>'")
+    downloaded: bool = False
+    need_mb: int = Field(..., description="Оценка памяти при окне ctx, МБ")
+    fits: Optional[bool] = Field(None, description="Хватит ли свободной памяти; null — неизвестно")
+
+
+class HfRepoOut(BaseModel):
+    id: str
+    author: Optional[str] = None
+    license: Optional[str] = None
+    downloads: int = 0
+    likes: int = 0
+    pipeline_tag: Optional[str] = None
+    ctx: int
+    available_mb: Optional[int] = None
+    files: List[HfFileOut] = Field(default_factory=list)
+
+
+class LocalModelActionIn(BaseModel):
+    model: str = Field(..., min_length=1, description="Имя модели в Ollama, например 'qwen3:8b'")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class LocalModelSettingsIn(BaseModel):
+    model: str = Field(..., min_length=1)
+    competitive_start: bool
+
+    model_config = ConfigDict(extra="forbid")

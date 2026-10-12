@@ -54,6 +54,7 @@ _SETTINGS_COLUMNS = [
     ("thinking_enabled", "INTEGER"),
     ("reasoning_effort", "TEXT"),
     ("max_tokens", "INTEGER"),
+    ("num_ctx", "INTEGER"),
     ("json_mode", "INTEGER"),
     ("stop_sequences", "TEXT"),  # JSON-массив строк
     ("tool_choice", "TEXT"),
@@ -123,6 +124,7 @@ _DEFAULT_STATE_MACHINE_RULE_INVARIANT_TITLES = [
 _MESSAGE_UPDATABLE_FIELDS = (
     "content", "reasoning_content", "duration_ms", "total_tokens", "prompt_tokens", "completion_tokens",
     "format", "facts", "task_events", "status", "tool_events", "error", "created_at", "rag",
+    "metrics",
 )
 
 #: Поля запуска, которые можно обновлять (`Database.update_run`).
@@ -143,6 +145,7 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "thinking_enabled": int(settings.thinking_enabled),
         "reasoning_effort": settings.reasoning_effort,
         "max_tokens": settings.max_tokens,
+        "num_ctx": settings.num_ctx,
         "json_mode": int(settings.json_mode),
         "stop_sequences": json.dumps(settings.stop_sequences, ensure_ascii=False),
         "tool_choice": settings.tool_choice,
@@ -195,6 +198,7 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         thinking_enabled=bool(row["thinking_enabled"]),
         reasoning_effort=row["reasoning_effort"],
         max_tokens=row["max_tokens"],
+        num_ctx=row["num_ctx"],
         json_mode=bool(row["json_mode"]),
         stop_sequences=json.loads(row["stop_sequences"]) if row["stop_sequences"] else [],
         tool_choice=row["tool_choice"],
@@ -401,7 +405,8 @@ class Database:
                     tool_events TEXT,
                     error TEXT,
                     source TEXT NOT NULL DEFAULT 'app',
-                    rag TEXT
+                    rag TEXT,
+                    metrics TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_branches (
@@ -426,6 +431,13 @@ class Database:
                     supports_json_mode INTEGER NOT NULL DEFAULT 0,
                     supports_logprobs INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (provider, model_id)
+                );
+
+                -- Настройки локальных моделей Ollama (экран «Модели»): живут
+                -- отдельно от models_catalog, т.к. каталог пересобирается.
+                CREATE TABLE IF NOT EXISTS local_model_settings (
+                    model_id TEXT PRIMARY KEY,
+                    competitive_start INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS profiles (
@@ -865,8 +877,8 @@ class Database:
                    (chat_id, role, content, created_at, reasoning_content, is_summary,
                     duration_ms, total_tokens, prompt_tokens, completion_tokens,
                     format, branch, facts, task_events, is_task_manager_step,
-                    status, run_id, tool_events, error, source, rag)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, run_id, tool_events, error, source, rag, metrics)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.chat_id, message.role, message.content, message.created_at,
                     message.reasoning_content, int(message.is_summary),
@@ -875,7 +887,7 @@ class Database:
                     message.format, message.branch, message.facts, message.task_events,
                     int(message.is_task_manager_step),
                     message.status, message.run_id, message.tool_events, message.error, message.source,
-                    message.rag,
+                    message.rag, message.metrics,
                 ),
             )
             message.id = cur.lastrowid
@@ -936,6 +948,7 @@ class Database:
             error=row["error"],
             source=row["source"],
             rag=row["rag"],
+            metrics=row["metrics"],
         )
 
     def list_messages(self, chat_id: str) -> List[Message]:
@@ -1005,6 +1018,22 @@ class Database:
                 )
                 for r in rows
             ]
+
+    # ---- настройки локальных моделей ---------------------------------------
+
+    def local_model_competitive_flags(self) -> Dict[str, bool]:
+        """Модели Ollama с включённым «Конкурентным запуском» (имя → True)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT model_id, competitive_start FROM local_model_settings").fetchall()
+            return {r["model_id"]: bool(r["competitive_start"]) for r in rows}
+
+    def set_local_model_competitive(self, model_id: str, value: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO local_model_settings (model_id, competitive_start) VALUES (?, ?)
+                   ON CONFLICT(model_id) DO UPDATE SET competitive_start = excluded.competitive_start""",
+                (model_id, int(value)),
+            )
 
     # ---- рабочая память (working_memory, область видимости — чат) ----------
 

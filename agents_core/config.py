@@ -115,28 +115,23 @@ class AgentConfig:
     REGISTERED_SKILLS_JSON: str = os.environ.get("AGENT_REGISTERED_SKILLS", "").strip()
 
     OLLAMA_BASE_URL: str = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-    # По умолчанию предлагается qwen3:0.6b — компактная модель, которую
-    # реально запустить локально без мощного GPU; ниже перечислены и другие
-    # размеры семейства qwen3 для локального запуска через Ollama.
-    OLLAMA_MODELS: List[str] = _split_csv(
-        os.environ.get(
-            "OLLAMA_MODELS",
-            "qwen3:0.6b,qwen3:1.7b,qwen3:4b,qwen3:8b,qwen3:14b,qwen3:30b-a3b",
-        )
-    )
+    # Каталог GGUF-моделей Hugging Face (экран «Поиск моделей»). Токен нужен
+    # только для закрытых (gated) репозиториев.
+    HF_ENDPOINT: str = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    HF_TOKEN: str = os.environ.get("HF_TOKEN", "").strip()
+    # Список локальных моделей в .env больше не задаётся: каталог берёт все
+    # скачанные в Ollama чат-модели (`ollama list`, без embedding-моделей) —
+    # см. `agents_core.catalog.ModelCatalog`.
 
     @classmethod
     def configured_models(cls) -> List[ProviderModelEntry]:
-        """Полный список моделей, объявленных в .env для всех активных
-        провайдеров — используется при старте сервиса для наполнения каталога
-        моделей (см. `agents_core.repository.ModelCatalog`)."""
+        """Облачные модели, объявленные в .env (`DEEPSEEK_MODELS`). Локальные
+        модели в .env не перечисляются — их список берётся из Ollama (см.
+        `agents_core.catalog.ModelCatalog`)."""
         entries: List[ProviderModelEntry] = []
         if "deepseek" in cls.PROVIDERS:
             for model_id in cls.DEEPSEEK_MODELS:
                 entries.append(ProviderModelEntry("deepseek", model_id))
-        if "ollama" in cls.PROVIDERS:
-            for model_id in cls.OLLAMA_MODELS:
-                entries.append(ProviderModelEntry("ollama", model_id))
         return entries
 
     # --- "Менеджер задач": system prompt по шаблону ---------------------

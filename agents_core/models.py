@@ -241,6 +241,14 @@ class Settings:
     thinking_enabled: bool = True
     reasoning_effort: Optional[str] = None
     max_tokens: Optional[int] = None
+    #: «День 29» — размер контекстного окна локальной модели (`num_ctx` у
+    #: Ollama): сколько токенов модель держит в памяти на ВСЁ сразу — prompt
+    #: (system prompt, история, фрагменты RAG) плюс ответ. В отличие от
+    #: `max_tokens` (предел длины ОТВЕТА, у Ollama — `num_predict`) влияет на
+    #: расход памяти (KV-кэш) и на то, что модель вообще увидит: не
+    #: поместившееся начало prompt'а Ollama молча отбрасывает. `None` — окно
+    #: по умолчанию сервера Ollama. Облачные провайдеры параметр игнорируют.
+    num_ctx: Optional[int] = None
     json_mode: bool = False
     stop_sequences: List[str] = field(default_factory=list)
 
@@ -407,6 +415,7 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "thinking_enabled", "title": "Включить рассуждения", "group": "Параметры ответа"},
     {"sys_name": "reasoning_effort", "title": "Уровень рассуждений", "group": "Параметры ответа"},
     {"sys_name": "max_tokens", "title": "Максимальное число токенов", "group": "Параметры ответа"},
+    {"sys_name": "num_ctx", "title": "Размер контекста (локальные модели)", "group": "Параметры ответа"},
     {"sys_name": "json_mode", "title": "Ответ в JSON", "group": "Параметры ответа"},
     {"sys_name": "stop_sequences", "title": "Стоп-последовательности (через запятую)", "group": "Параметры ответа"},
     {"sys_name": "tool_choice", "title": "Выбор функции", "group": "Инструменты"},
@@ -568,6 +577,11 @@ class Message:
     #: "document_id", "title", "source", "source_type", "doc_date", "doc_version",
     #: "collection_id", "collection_name"}], "cited": [n...], "confirmed"}.
     rag: Optional[str] = None
+    #: «День 29» — скорость и ресурсы ответа ассистента: JSON {"ttft_ms",
+    #: "tokens_per_sec", "prompt_tokens_per_sec", "load_ms", "memory_mb",
+    #: "vram_mb", "gpu_percent", "num_ctx"} (любое поле может отсутствовать —
+    #: что смог сообщить провайдер, см. `Repository._build_metrics`).
+    metrics: Optional[str] = None
     #: Кто отправил сообщение пользователя: "app" | "scheduler" |
     #: "test_dialog" (вопрос тестового диалога). Запросы планировщика
     #: считаются непрочитанными (пользователь их не писал).

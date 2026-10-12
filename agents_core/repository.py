@@ -399,6 +399,8 @@ def _validate_settings_payload(payload: dict) -> None:
         value = payload["context_strategy_limit"]
         if value is not None and value <= 2:
             raise ValidationError("context_strategy_limit must be > 2")
+    if payload.get("num_ctx") is not None and payload["num_ctx"] < 1:
+        raise ValidationError("num_ctx must be >= 1")
 
 
 def _fill_summary_template(template: str, previous_summary: str, new_messages_text: str) -> str:
@@ -476,8 +478,12 @@ class Repository:
     def __init__(
         self, db: Database, registry: ProviderRegistry, catalog: ModelCatalog,
         mcp_client: Optional[MCPClient] = None, knowledge_client: Optional[KnowledgeClient] = None,
+        local_models=None,
     ):
         self._db = db
+        #: Управление локальными моделями Ollama (`LocalModelManager`) —
+        #: автозапуск модели перед ответом в чате; `None` — без Ollama.
+        self._local_models = local_models
         #: Клиент сервиса баз знаний — `None`, если RAG не настроен
         #: (`KNOWLEDGE_SERVICE_URL` пуст). См. `_prepare_rag`.
         self._knowledge = knowledge_client
@@ -519,6 +525,44 @@ class Repository:
 
     def list_models(self) -> List[ModelInfo]:
         return self._catalog.list_models()
+
+    def probe_model(self, composite_model_id: str) -> Dict[str, Any]:
+        """Пробный запрос к модели («Проверить» на экране «Модели»): короткий
+        вопрос без рассуждений; локальная модель при необходимости
+        запускается. Ответ, токены, скорость чтения prompt'а и генерации."""
+        model = self._require_model(composite_model_id)
+        provider = self._registry.get(model.provider)
+        settings = Settings(
+            model=composite_model_id, system_prompt="Отвечай кратко, одним предложением, по-русски.",
+            temperature=0.2, top_p=1.0, thinking_enabled=False, max_tokens=96, stream=False,
+        )
+        messages = [ProviderMessage("system", settings.system_prompt), ProviderMessage("user", "Кто ты?")]
+        started = time.monotonic()
+        try:
+            result = provider.chat(model.model_id, messages, settings)
+        except ProviderError as exc:
+            return {"ok": False, "error": str(exc), "duration_ms": int((time.monotonic() - started) * 1000)}
+        usage = result.usage
+        out: Dict[str, Any] = {
+            "ok": True,
+            "answer": (result.content or "").strip()[:400],
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+        if usage.prompt_eval_duration_ms is not None:
+            out["prompt_ms"] = int(usage.prompt_eval_duration_ms)
+        if usage.completion_tokens and usage.eval_duration_ms:
+            out["tokens_per_sec"] = round(usage.completion_tokens / (usage.eval_duration_ms / 1000), 1)
+        if usage.load_duration_ms is not None:
+            out["load_ms"] = int(usage.load_duration_ms)
+        return out
+
+    @property
+    def local_models(self):
+        """`LocalModelManager` или `None` (см. `agents_core.local_models`)."""
+        return self._local_models
 
     def _require_model(self, composite_model_id: str) -> ModelInfo:
         model = self._catalog.get(composite_model_id)
@@ -803,13 +847,11 @@ class Repository:
         уйдёт в следующем запросе модели, т.е. prompt_tokens +
         completion_tokens ПОСЛЕДНЕГО обмена в эффективном окне (см.
         `_current_context_tokens`) — используется только для проверки
-        `can_summarize`/лимитов модели и чата, НЕ для `context_fill_ratio`.
+        `can_summarize`/лимита модели, НЕ для `context_fill_ratio`.
 
-        Знаменатель `context_fill_ratio` — это `context_window` модели, ЕСЛИ
-        только настройка чата `max_tokens` не задана и не меньше его: в этом
-        случае (по прямой инструкции пользователя) вместо размера окна модели
-        используется именно `max_tokens` — пользователь явно ограничил чат
-        меньшим бюджетом, и заполнение должно считаться относительно него.
+        Знаменатель `context_fill_ratio` — окно модели, а у локальной модели с
+        «Размером контекста» — `num_ctx` (см. `_model_limits`). Настройка
+        `max_tokens` — только предел длины ответа и на заполнение не влияет.
         """
         if messages is None:
             messages = self._db.list_messages(chat.id)
@@ -822,26 +864,17 @@ class Repository:
         prompt_total = sum(m.prompt_tokens or 0 for m in effective if m.role == "user")
         completion_total = sum(m.completion_tokens or 0 for m in effective if m.role == "assistant")
         total_tokens = prompt_total + completion_total
-        model_info = self._catalog.get(chat.settings.model)
-        max_input = model_info.max_input_tokens if model_info else None
-        context_window = model_info.context_window if model_info else None
-        # Заполненность контекстного окна = total_tokens / effective_window —
+        model_info, context_window, max_input = self._model_limits(chat.settings)
+        # Заполненность контекстного окна = total_tokens / context_window —
         # реальный расход по видимой (не бледной) части чата; может выйти за
-        # 100%, если чат уже перерос контекстное окно — значение НЕ
-        # обрезается здесь намеренно (клиент сам решает, как показать
-        # переполнение: капом на 100% и красным цветом индикатора).
-        # effective_window — это context_window модели, но если у чата задан
-        # max_tokens и он МЕНЬШЕ размера окна модели, то именно max_tokens
-        # ограничивает реальный бюджет чата, и его нужно использовать вместо
-        # context_window.
-        effective_window = context_window
-        if chat.settings.max_tokens is not None and context_window is not None and chat.settings.max_tokens < context_window:
-            effective_window = chat.settings.max_tokens
-        fill_ratio = (total_tokens / effective_window) if effective_window else None
+        # 100%, если чат уже перерос окно — значение НЕ обрезается намеренно
+        # (клиент показывает переполнение капом на 100% и красным цветом).
+        fill_ratio = (total_tokens / context_window) if context_window else None
         within_model_limit = max_input is None or current_context <= max_input
-        within_chat_limit = chat.settings.max_tokens is None or current_context <= chat.settings.max_tokens
         active_context_start_id = effective[0].id if effective else None
+        speed = self._speed_summary(scoped)
         return {
+            **speed,
             "prompt_tokens": prompt_total,
             "completion_tokens": completion_total,
             "total_tokens": total_tokens,
@@ -850,8 +883,68 @@ class Repository:
             "context_window": context_window,
             "context_fill_ratio": fill_ratio,
             "active_context_start_id": active_context_start_id,
-            "can_summarize": bool(scoped) and within_model_limit and within_chat_limit,
+            "can_summarize": bool(scoped) and within_model_limit,
             "model": model_info,
+        }
+
+    def _model_limits(self, settings: Settings):
+        """`(model_info, context_window, max_input_tokens)` с учётом
+        «Размера контекста» (`num_ctx`) локальной модели: Ollama работает
+        ровно в этом окне, а не в нативном окне модели из каталога, поэтому
+        индикатор заполненности и проверки суммаризации должны считать от
+        него. Из окна вычитается резерв под ответ — `max_tokens`, но не
+        больше половины окна."""
+        model_info = self._catalog.get(settings.model)
+        if model_info is None:
+            return None, None, None
+        context_window = model_info.context_window
+        max_input = model_info.max_input_tokens
+        if model_info.is_local and settings.num_ctx:
+            context_window = min(context_window, settings.num_ctx) if context_window else settings.num_ctx
+            reserve = min(settings.max_tokens or 0, context_window // 2)
+            max_input = context_window - reserve
+        return model_info, context_window, max_input
+
+    @staticmethod
+    def _speed_summary(messages: List[Message]) -> Dict[str, object]:
+        """«День 29» — средние скорости и пик памяти по завершённым ответам
+        ассистента с метриками (для сравнения конфигураций одним тестовым
+        диалогом). Время ответа — без загрузки модели в память (`load_ms`),
+        чтобы первый ответ после смены модели/окна не искажал среднее."""
+        tps: List[float] = []
+        ttft: List[int] = []
+        durations: List[int] = []
+        memory: List[int] = []
+        vram: List[int] = []
+        measured = 0
+        for m in messages:
+            if m.role != "assistant" or m.status != "complete" or m.is_summary or not m.metrics:
+                continue
+            try:
+                data = json.loads(m.metrics)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            measured += 1
+            if isinstance(data.get("tokens_per_sec"), (int, float)):
+                tps.append(float(data["tokens_per_sec"]))
+            if isinstance(data.get("ttft_ms"), int):
+                ttft.append(data["ttft_ms"])
+            if m.duration_ms is not None:
+                load = data.get("load_ms") if isinstance(data.get("load_ms"), int) else 0
+                durations.append(max(m.duration_ms - load, 0))
+            if isinstance(data.get("memory_mb"), int):
+                memory.append(data["memory_mb"])
+            if isinstance(data.get("vram_mb"), int):
+                vram.append(data["vram_mb"])
+        return {
+            "measured_answers": measured,
+            "avg_tokens_per_sec": round(sum(tps) / len(tps), 1) if tps else None,
+            "avg_ttft_ms": int(sum(ttft) / len(ttft)) if ttft else None,
+            "avg_duration_ms": int(sum(durations) / len(durations)) if durations else None,
+            "max_memory_mb": max(memory) if memory else None,
+            "max_vram_mb": max(vram) if vram else None,
         }
 
     # ---- сообщения --------------------------------------------------------
@@ -879,15 +972,10 @@ class Repository:
 
     def _perform_summarization(self, chat: Chat, messages: List[Message]) -> Message:
         current_tokens = self._current_context_tokens(chat, messages)
-        model_info = self._catalog.get(chat.settings.model)
-        max_input = model_info.max_input_tokens if model_info else None
+        _model_info, _context_window, max_input = self._model_limits(chat.settings)
         if max_input is not None and current_tokens > max_input:
             raise PreconditionFailedError(
                 "chat already exceeds the model's max input tokens; cannot summarize"
-            )
-        if chat.settings.max_tokens is not None and current_tokens > chat.settings.max_tokens:
-            raise PreconditionFailedError(
-                "chat exceeds the chat's configured max_tokens setting; cannot summarize"
             )
 
         # Изолированный вызов: system = summary_system_prompt, единственное
@@ -3158,10 +3246,13 @@ class Repository:
         `(final_result, final_content)`."""
         allowed_mcp_names = self._offered_tool_names(request_settings)
         iterations = 0
+        if acc.llm_started_at is None:
+            acc.llm_started_at = time.monotonic()
         while True:
             if token is not None:
                 token.raise_if_cancelled()
             done_result: Optional[ChatResult] = None
+            call_first_token: Optional[float] = None
             if use_stream:
                 stream = provider.stream_chat(model_id, provider_messages, request_settings)
                 try:
@@ -3171,6 +3262,10 @@ class Repository:
                         if delta.done:
                             done_result = delta.result
                             continue
+                        if (delta.content or delta.reasoning_content) and call_first_token is None:
+                            call_first_token = time.monotonic()
+                            if acc.first_token_at is None:
+                                acc.first_token_at = call_first_token
                         if delta.content:
                             acc.partial_content.append(delta.content)
                         if delta.reasoning_content:
@@ -3188,6 +3283,11 @@ class Repository:
                     token.raise_if_cancelled()
             if done_result is None:
                 raise ProviderError("provider returned no result")
+            # Окно генерации последнего потокового вызова — запасной способ
+            # посчитать скорость, если провайдер не сообщает свои тайминги.
+            acc.last_stream_window = (
+                (done_result, call_first_token, time.monotonic()) if call_first_token is not None else None
+            )
             if done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
                 yield {"type": "status", "status": "Выполняется вызов инструментов"}
                 provider_messages.append(
@@ -3222,7 +3322,62 @@ class Repository:
             yield {"type": "delta", "content": f"{violation_warning}\n\n", "reasoning_content": None}
             yield {"type": "delta", "content": final_result.content, "reasoning_content": None}
         final_content = f"{violation_warning}\n\n{final_result.content}" if violation_warning else final_result.content
+        acc.metrics = self._build_metrics(provider, model_id, request_settings, final_result, acc)
         return final_result, final_content
+
+    def _ensure_local_model(
+        self, provider_name: str, model_id: str, settings: Settings, acc: "_TurnAccumulator",
+        token: Optional[CancelToken],
+    ) -> Iterator[dict]:
+        """«День 29» — локальная модель не запущена (или запущена с другим
+        «Размером контекста»): запускаем её до запроса, с конкурентным
+        запуском — сначала останавливаем другие. Каждый шаг — статус в чате.
+        Ошибка запуска — `ProviderError` (ответ завершится ошибкой)."""
+        if provider_name != "ollama" or self._local_models is None:
+            return
+        for action, name in self._local_models.plan(model_id, settings.num_ctx):
+            if token is not None:
+                token.raise_if_cancelled()
+            yield {"type": "status", "status": self._local_models.describe(action, name, settings.num_ctx)}
+            load_ms = self._local_models.apply(action, name, settings.num_ctx)
+            if load_ms is not None:
+                acc.preload_ms = (acc.preload_ms or 0) + load_ms
+
+    def _build_metrics(
+        self, provider, model_id: str, settings: Settings, result: ChatResult, acc: "_TurnAccumulator",
+    ) -> Optional[dict]:
+        """«День 29» — скорость и ресурсы ответа (см. `Message.metrics`).
+        Скорость генерации — по таймингам провайдера (Ollama `eval_duration`),
+        иначе по часам сервиса между первым и последним токеном потокового
+        вызова. Память — по `provider.runtime_stats` (Ollama `/api/ps`)."""
+        usage = result.usage
+        metrics: Dict[str, object] = {}
+        if acc.llm_started_at is not None and acc.first_token_at is not None:
+            metrics["ttft_ms"] = int((acc.first_token_at - acc.llm_started_at) * 1000)
+        completion = usage.completion_tokens
+        if completion and usage.eval_duration_ms:
+            metrics["tokens_per_sec"] = round(completion / (usage.eval_duration_ms / 1000), 1)
+        elif completion and acc.last_stream_window is not None and acc.last_stream_window[0] is result:
+            _, first, last = acc.last_stream_window
+            if last - first > 0.05:
+                metrics["tokens_per_sec"] = round(completion / (last - first), 1)
+        if usage.prompt_tokens and usage.prompt_eval_duration_ms:
+            metrics["prompt_tokens_per_sec"] = round(usage.prompt_tokens / (usage.prompt_eval_duration_ms / 1000), 1)
+        load_ms = int(usage.load_duration_ms) if usage.load_duration_ms is not None else None
+        if acc.preload_ms:
+            # Модель запускали перед запросом — её загрузка и есть «загрузка».
+            load_ms = max(load_ms or 0, acc.preload_ms)
+        if load_ms is not None:
+            metrics["load_ms"] = load_ms
+        try:
+            runtime = provider.runtime_stats(model_id)
+        except Exception:  # метрики не должны ломать ответ
+            runtime = None
+        if runtime:
+            metrics.update(runtime)
+        if "num_ctx" not in metrics and settings.num_ctx:
+            metrics["num_ctx"] = settings.num_ctx
+        return metrics or None
 
     def _finalize_draft(
         self, draft: Message, *, content: str, status: str, result: Optional[ChatResult] = None,
@@ -3249,6 +3404,8 @@ class Repository:
             fields["tool_events"] = json.dumps(acc.tool_events, ensure_ascii=False) if acc.tool_events else None
             if acc.rag is not None:
                 fields["rag"] = json.dumps(acc.rag, ensure_ascii=False)
+            if status == "complete" and acc.metrics:
+                fields["metrics"] = json.dumps(acc.metrics, ensure_ascii=False)
         self._db.update_message_fields(draft.id, **fields)
         saved = self._db.get_message(draft.id)
         self._publish_unread(draft.chat_id)
@@ -3328,6 +3485,7 @@ class Repository:
                     if token is not None:
                         token.raise_if_cancelled()
 
+                yield from self._ensure_local_model(provider_name, model_id, request_settings, acc, token)
                 status_text = "Выполняется запрос к модели"
                 yield {"type": "status", "status": status_text}
                 final_result, final_content = yield from self._model_turn(
@@ -3406,6 +3564,7 @@ class Repository:
                 provider = self._registry.get(provider_name)
                 request_settings = self._settings_with_merged_tools(chat)
 
+                yield from self._ensure_local_model(provider_name, model_id, request_settings, acc, token)
                 status_text = "Менеджер задач продолжает работу"
                 yield {"type": "status", "status": status_text}
                 final_result, final_content = yield from self._model_turn(
@@ -3617,3 +3776,10 @@ class _TurnAccumulator:
         self.partial_reasoning: List[str] = []
         #: Итог RAG (`RagOutcome.to_dict()`), если он был в этом ответе.
         self.rag: Optional[dict] = None
+        #: «День 29» — замеры скорости (см. `Repository._build_metrics`).
+        self.llm_started_at: Optional[float] = None
+        self.first_token_at: Optional[float] = None
+        self.last_stream_window: Optional[tuple] = None
+        #: Время запуска локальной модели перед запросом, мс (`_ensure_local_model`).
+        self.preload_ms: Optional[int] = None
+        self.metrics: Optional[dict] = None

@@ -340,12 +340,9 @@ class RepositoryTestCase(unittest.TestCase):
         self.assertTrue(stats["can_summarize"])
         self.assertIsNotNone(stats["active_context_start_id"])
 
-    def test_chat_stats_fill_ratio_uses_chat_max_tokens_when_smaller_than_context_window(self):
-        # context_window модели = 1200; если у чата настройка max_tokens
-        # задана и МЕНЬШЕ размера окна модели (например 40), именно она
-        # ограничивает реальный бюджет чата — по прямой инструкции
-        # пользователя знаменатель context_fill_ratio должен быть max_tokens,
-        # а не полный context_window модели.
+    def test_chat_stats_fill_ratio_ignores_max_tokens(self):
+        # max_tokens — предел длины ответа, а не бюджет чата («День 29»):
+        # знаменатель — всегда окно модели.
         agent = self.repo.create_agent("A", model=TEST_MODEL_ID)
         chat = self.repo.create_chat(agent.id, "C1")
         self.repo.update_chat_settings(chat.id, {"max_tokens": 40})
@@ -353,19 +350,8 @@ class RepositoryTestCase(unittest.TestCase):
         chat = self.repo.get_chat(chat.id)
         stats = self.repo.chat_stats(chat)
         self.assertEqual(stats["total_tokens"], 25)
-        self.assertEqual(stats["context_window"], 1200)
-        self.assertAlmostEqual(stats["context_fill_ratio"], 25 / 40)
-
-    def test_chat_stats_fill_ratio_ignores_chat_max_tokens_when_not_smaller(self):
-        # Если max_tokens чата >= context_window модели, он ничего не
-        # ограничивает — знаменатель остаётся полным context_window.
-        agent = self.repo.create_agent("A", model=TEST_MODEL_ID)
-        chat = self.repo.create_chat(agent.id, "C1")
-        self.repo.update_chat_settings(chat.id, {"max_tokens": 5000})
-        self.repo.send_message_blocking(chat.id, "Привет")
-        chat = self.repo.get_chat(chat.id)
-        stats = self.repo.chat_stats(chat)
         self.assertAlmostEqual(stats["context_fill_ratio"], 25 / 1200)
+        self.assertTrue(stats["can_summarize"])
 
     def test_chat_stats_total_tokens_uses_effective_context_not_full_history(self):
         # По явной инструкции пользователя: total_tokens/prompt_tokens/

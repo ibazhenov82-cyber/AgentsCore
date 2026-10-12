@@ -17,6 +17,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from ..catalog import ModelCatalog
+from ..hf_hub import HuggingFaceHub
+from ..local_models import LocalModelManager
 from ..config import AgentConfig
 from ..db import Database
 from ..events import EventsGone
@@ -32,7 +34,10 @@ from ..repository import (
     ValidationError,
 )
 from ..runs import RunConflictError, RunManager
-from . import agents, chats, health, invariants, mcp_tools, memory, messages, models_routes, runs, settings_routes, tasks, test_dialogs
+from . import (
+    agents, chats, health, invariants, local_models, mcp_tools, memory, messages, models_routes, runs,
+    settings_routes, tasks, test_dialogs,
+)
 from .logging_middleware import AccessLogMiddleware
 
 DESCRIPTION = """
@@ -78,11 +83,16 @@ def create_app(config: type = AgentConfig, enable_mcp: Optional[bool] = None) ->
                         config.KNOWLEDGE_SERVICE_TIMEOUT)
         if config.KNOWLEDGE_SERVICE_URL else None
     )
-    repo = Repository(db, registry, catalog, mcp_client=mcp_client, knowledge_client=knowledge_client)
-    return create_app_with_repository(repo)
+    local_manager = LocalModelManager(registry.all().get("ollama"), catalog, db)
+    repo = Repository(
+        db, registry, catalog, mcp_client=mcp_client, knowledge_client=knowledge_client, local_models=local_manager,
+    )
+    return create_app_with_repository(repo, hf_hub=HuggingFaceHub(config.HF_ENDPOINT, config.HF_TOKEN or None))
 
 
-def create_app_with_repository(repo: Repository, run_manager: Optional[RunManager] = None) -> FastAPI:
+def create_app_with_repository(
+    repo: Repository, run_manager: Optional[RunManager] = None, hf_hub: Optional[HuggingFaceHub] = None,
+) -> FastAPI:
     """Сборка приложения вокруг уже готового `Repository` — используется
     `create_app()`, а также тестами API (с репозиторием на фиктивном
     провайдере, без обращения к настоящим DeepSeek/Ollama)."""
@@ -106,6 +116,7 @@ def create_app_with_repository(repo: Repository, run_manager: Optional[RunManage
     )
     app.state.repo = repo
     app.state.run_manager = manager
+    app.state.hf_hub = hf_hub or HuggingFaceHub()
 
     # Логируем каждый REST-запрос (метод, путь, параметры, тело, итоговый
     # статус, время выполнения) — см. `agents_core.logging_middleware`.
@@ -118,6 +129,7 @@ def create_app_with_repository(repo: Repository, run_manager: Optional[RunManage
 
     app.include_router(health.router)
     app.include_router(models_routes.router)
+    app.include_router(local_models.router)
     app.include_router(settings_routes.router)
     app.include_router(agents.router)
     app.include_router(chats.router)

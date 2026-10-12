@@ -17,11 +17,14 @@ router = APIRouter(tags=["Models"])
     response_model=List[ModelInfoOut],
     summary="Каталог моделей",
     description=(
-        "Список моделей, зарегистрированных при старте сервиса на основе .env "
-        "(отдаётся из памяти сервиса, без обращения к провайдерам)."
+        "Облачные модели из .env и все скачанные в Ollama чат-модели. Список локальных "
+        "сверяется с `ollama list` при каждом запросе (Ollama недоступна — последний известный)."
     ),
 )
 def list_models(repo: Repository = Depends(get_repository)) -> List[ModelInfoOut]:
+    manager = repo.local_models
+    if manager is not None and manager.enabled:
+        manager.sync_catalog()
     return [model_info_out(m) for m in repo.list_models()]
 
 

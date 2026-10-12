@@ -69,6 +69,10 @@ def chat_stats_out(stats: dict) -> ChatStatsOut:
         max_input_tokens=stats["max_input_tokens"], context_window=stats["context_window"],
         context_fill_ratio=stats["context_fill_ratio"], active_context_start_id=stats["active_context_start_id"],
         can_summarize=stats["can_summarize"],
+        measured_answers=stats.get("measured_answers", 0),
+        avg_tokens_per_sec=stats.get("avg_tokens_per_sec"), avg_ttft_ms=stats.get("avg_ttft_ms"),
+        avg_duration_ms=stats.get("avg_duration_ms"), max_memory_mb=stats.get("max_memory_mb"),
+        max_vram_mb=stats.get("max_vram_mb"),
     )
 
 

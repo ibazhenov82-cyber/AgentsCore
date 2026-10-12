@@ -44,6 +44,12 @@ class ChatUsage:
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    #: «День 29» — тайминги, которые сообщает сам провайдер (сейчас только
+    #: Ollama: `eval_duration`, `prompt_eval_duration`, `load_duration`), в мс.
+    #: Нет у провайдера — `None`, скорость тогда считается по часам сервиса.
+    eval_duration_ms: Optional[float] = None
+    prompt_eval_duration_ms: Optional[float] = None
+    load_duration_ms: Optional[float] = None
 
 
 @dataclass
@@ -100,6 +106,12 @@ class BaseProvider(ABC):
         есть смысл проверять именно эту модель (см. `OllamaProvider`, где
         проверка идёт по списку моделей `GET /api/tags`)."""
         return self.health()
+
+    def runtime_stats(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """«День 29» — сколько памяти занимает загруженная модель:
+        `{"memory_mb", "vram_mb", "gpu_percent", "num_ctx"}`. Есть смысл
+        только для локальных моделей (Ollama `/api/ps`); по умолчанию `None`."""
+        return None
 
     @abstractmethod
     def discover_model(self, model_id: str) -> ModelCapabilities:
