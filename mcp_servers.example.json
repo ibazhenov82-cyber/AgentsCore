@@ -1,0 +1,19 @@
+{
+  "tools": {
+    "url": "http://localhost:8001/mcp",
+    "initialize": false
+  },
+  "scheduler": {
+    "url": "http://localhost:8002/mcp",
+    "initialize": false
+  },
+  "github": {
+    "url": "https://api.githubcopilot.com/mcp/",
+    "title": "GitHub",
+    "headers": {
+      "Authorization": "Bearer ${GITHUB_MCP_TOKEN}",
+      "X-MCP-Toolsets": "repos,issues,pull_requests",
+      "X-MCP-Readonly": "true"
+    }
+  }
+}
