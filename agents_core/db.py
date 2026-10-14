@@ -29,6 +29,7 @@ from .models import (
     Agent,
     Branch,
     Chat,
+    ChatProject,
     DefaultSettings,
     Invariant,
     TestDialog,
@@ -93,6 +94,8 @@ _SETTINGS_COLUMNS = [
     ("rag_query_rewrite", "TEXT"),
     ("rag_rewrite_model", "TEXT"),
     ("rag_quotes", "INTEGER"),
+    ("dev_commands_enabled", "INTEGER"),
+    ("dev_read_only", "INTEGER"),
 ]
 
 _DEFAULT_SETTINGS_COLUMNS = [
@@ -124,7 +127,7 @@ _DEFAULT_STATE_MACHINE_RULE_INVARIANT_TITLES = [
 _MESSAGE_UPDATABLE_FIELDS = (
     "content", "reasoning_content", "duration_ms", "total_tokens", "prompt_tokens", "completion_tokens",
     "format", "facts", "task_events", "status", "tool_events", "error", "created_at", "rag",
-    "metrics",
+    "metrics", "command",
 )
 
 #: Поля запуска, которые можно обновлять (`Database.update_run`).
@@ -184,6 +187,8 @@ def _settings_to_row(settings: Settings) -> Dict[str, Any]:
         "rag_query_rewrite": settings.rag_query_rewrite,
         "rag_rewrite_model": settings.rag_rewrite_model,
         "rag_quotes": int(settings.rag_quotes),
+        "dev_commands_enabled": int(settings.dev_commands_enabled),
+        "dev_read_only": int(settings.dev_read_only),
     }
 
 
@@ -242,6 +247,8 @@ def _row_to_settings(row: sqlite3.Row) -> Settings:
         rag_query_rewrite=row["rag_query_rewrite"] or Settings.rag_query_rewrite,
         rag_rewrite_model=row["rag_rewrite_model"] or "",
         rag_quotes=bool(row["rag_quotes"]) if row["rag_quotes"] is not None else True,
+        dev_commands_enabled=bool(row["dev_commands_enabled"]),
+        dev_read_only=bool(row["dev_read_only"]) if row["dev_read_only"] is not None else True,
     )
 
 
@@ -406,7 +413,8 @@ class Database:
                     error TEXT,
                     source TEXT NOT NULL DEFAULT 'app',
                     rag TEXT,
-                    metrics TEXT
+                    metrics TEXT,
+                    command TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_branches (
@@ -435,6 +443,27 @@ class Database:
 
                 -- Настройки локальных моделей Ollama (экран «Модели»): живут
                 -- отдельно от models_catalog, т.к. каталог пересобирается.
+                CREATE TABLE IF NOT EXISTS chat_projects (
+                    chat_id TEXT PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+                    link TEXT NOT NULL,
+                    repo_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL DEFAULT '',
+                    branch TEXT,
+                    default_branch TEXT,
+                    remote TEXT,
+                    writable INTEGER NOT NULL DEFAULT 0,
+                    collection_id TEXT,
+                    source_id TEXT,
+                    index_job_id TEXT,
+                    index_status TEXT NOT NULL DEFAULT '',
+                    index_error TEXT,
+                    last_commit TEXT,
+                    opened_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS local_model_settings (
                     model_id TEXT PRIMARY KEY,
                     competitive_start INTEGER NOT NULL DEFAULT 0
@@ -877,8 +906,8 @@ class Database:
                    (chat_id, role, content, created_at, reasoning_content, is_summary,
                     duration_ms, total_tokens, prompt_tokens, completion_tokens,
                     format, branch, facts, task_events, is_task_manager_step,
-                    status, run_id, tool_events, error, source, rag, metrics)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, run_id, tool_events, error, source, rag, metrics, command)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     message.chat_id, message.role, message.content, message.created_at,
                     message.reasoning_content, int(message.is_summary),
@@ -887,7 +916,7 @@ class Database:
                     message.format, message.branch, message.facts, message.task_events,
                     int(message.is_task_manager_step),
                     message.status, message.run_id, message.tool_events, message.error, message.source,
-                    message.rag, message.metrics,
+                    message.rag, message.metrics, message.command,
                 ),
             )
             message.id = cur.lastrowid
@@ -949,6 +978,7 @@ class Database:
             source=row["source"],
             rag=row["rag"],
             metrics=row["metrics"],
+            command=row["command"],
         )
 
     def list_messages(self, chat_id: str) -> List[Message]:
@@ -1018,6 +1048,48 @@ class Database:
                 )
                 for r in rows
             ]
+
+    # ---- «День 31»: проект чата ---------------------------------------------
+
+    _PROJECT_FIELDS = (
+        "link", "repo_id", "kind", "name", "path", "branch", "default_branch", "remote", "writable",
+        "collection_id", "source_id", "index_job_id", "index_status", "index_error", "last_commit",
+        "opened_at", "updated_at",
+    )
+
+    def get_chat_project(self, chat_id: str) -> Optional[ChatProject]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM chat_projects WHERE chat_id = ?", (chat_id,)).fetchone()
+        if row is None:
+            return None
+        data = {k: row[k] for k in self._PROJECT_FIELDS}
+        data["writable"] = bool(data["writable"])
+        return ChatProject(chat_id=chat_id, **data)
+
+    def save_chat_project(self, project: ChatProject) -> ChatProject:
+        values = [getattr(project, k) for k in self._PROJECT_FIELDS]
+        values[self._PROJECT_FIELDS.index("writable")] = int(project.writable)
+        cols = ", ".join(("chat_id",) + self._PROJECT_FIELDS)
+        marks = ", ".join("?" for _ in range(len(self._PROJECT_FIELDS) + 1))
+        with self._connect() as conn:
+            conn.execute(f"INSERT OR REPLACE INTO chat_projects ({cols}) VALUES ({marks})", [project.chat_id] + values)
+        return project
+
+    def update_chat_project(self, chat_id: str, **fields: Any) -> None:
+        unknown = set(fields) - set(self._PROJECT_FIELDS)
+        if unknown:
+            raise ValueError(f"cannot update project fields: {sorted(unknown)}")
+        if "writable" in fields:
+            fields["writable"] = int(fields["writable"])
+        if not fields:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connect() as conn:
+            conn.execute(f"UPDATE chat_projects SET {assignments} WHERE chat_id = ?", list(fields.values()) + [chat_id])
+
+    def delete_chat_project(self, chat_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM chat_projects WHERE chat_id = ?", (chat_id,))
 
     # ---- настройки локальных моделей ---------------------------------------
 

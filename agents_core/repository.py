@@ -80,6 +80,7 @@ from .task_state_machine import (
 )
 from .tokens import estimate_messages_tokens, estimate_tokens
 from . import builtin_tools
+from .dev_assistant import DevAssistant, DevError, filter_context as dev_filter_context
 from . import test_dialogs as test_dialog_rules
 
 _logger = logging.getLogger("agents_core.repository")
@@ -499,6 +500,8 @@ class Repository:
         #: изменённые/удалённые чаты, запуски, непрочитанные — клиент держит
         #: одно SSE-соединение `GET /events` и обновляет главный экран сразу.
         self.events = EventLog(max_events=1000, max_age_seconds=600)
+        #: «День 31» — команды разработчика и проект чата.
+        self._dev = DevAssistant(self)
 
     def _lock_for(self, chat_id: str) -> threading.Lock:
         with self._locks_guard:
@@ -789,7 +792,7 @@ class Repository:
         """Сообщения, которые реально уйдут в API при следующей отправке (без
         нового сообщения пользователя) — с учётом суммаризации и, если
         включена, стратегии "Sliding Window"."""
-        context = self._context_messages(messages)
+        context = self._context_messages(dev_filter_context(messages))
         settings = chat.settings
         # И "Sliding Window", и "Sticky Facts" ограничивают эффективный контекст
         # последними N сообщениями (N=context_strategy_limit) — при "Sticky
@@ -2225,13 +2228,17 @@ class Repository:
                 deduped.append(tool)
         return dataclasses.replace(chat.settings, tools_json=json.dumps(deduped, ensure_ascii=False))
 
+    def _direct_only_tools(self) -> set:
+        fn = getattr(self._mcp_client, "direct_only_tools", None)
+        return fn() if fn is not None else set()
+
     def list_mcp_tools(self) -> List[dict]:
         """Инструменты для выбора в настройках: всех подключённых MCP-серверов
         (см. `mcp_client.MCPClient.list_tool_details`) и встроенные инструменты
         группы «Доступ к agents core» (`builtin_tools`) — для пользователя они
         выглядят так же, как инструменты MCP."""
         mcp_tools = self._mcp_client.list_tool_details() if self._mcp_client is not None else []
-        mcp_tools = [t for t in mcp_tools if not builtin_tools.is_builtin(t["name"])]
+        mcp_tools = [t for t in mcp_tools if not builtin_tools.is_builtin(t["name"]) and not t.get("direct_only")]
         return mcp_tools + builtin_tools.tool_details()
 
     def _tools_sources_for(self, settings: Settings, chat: Optional[Chat] = None) -> List[str]:
@@ -2293,7 +2300,7 @@ class Repository:
 
     def _execute_tool_call(
         self, chat: Chat, agent: Agent, call: dict, events: Optional[List[dict]] = None, auto_pause: bool = True,
-        allowed_mcp_names: Optional[set] = None,
+        allowed_mcp_names: Optional[set] = None, inject_args: Optional[dict] = None,
     ) -> str:
         """Выполняет ОДИН запрошенный моделью вызов и возвращает JSON-текст —
         именно он уйдёт обратно провайдеру как содержимое tool-сообщения.
@@ -2339,6 +2346,10 @@ class Repository:
                 arguments = {}
         except (ValueError, TypeError):
             arguments = {}
+        if inject_args:
+            # «День 31»: аргументы, которые подставляет сервис (repo_id проекта
+            # чата), — модель их не видит и подменить не может.
+            arguments.update(inject_args)
         handler = self._TOOL_HANDLERS.get(name)
         if handler is not None:
             try:
@@ -2352,6 +2363,10 @@ class Repository:
                 result = builtin_tools.execute(self, chat, name, arguments)
             except Exception as exc:  # noqa: BLE001
                 result = {"error": str(exc)}
+        elif self._mcp_client is not None and name in self._direct_only_tools():
+            # «Репозиторий: запись» (repo_commit, repo_undo_commit) — только по
+            # команде /commit, /undo после подтверждения, не моделью.
+            result = {"error": f"инструмент {name} вызывается только командой с подтверждением пользователя"}
         elif (
             self._mcp_client is not None
             and self._mcp_client.has_cached_tool(name)
@@ -2842,7 +2857,9 @@ class Repository:
         только сообщения ДО `before_id` (текущий запрос и его черновик
         добавляются в контекст отдельно)."""
         messages = self._filter_by_branch(self._db.list_messages(chat_id), branch)
-        return [m for m in messages if m.status == "complete" and (before_id is None or m.id < before_id)]
+        messages = [m for m in messages if m.status == "complete" and (before_id is None or m.id < before_id)]
+        # «День 31»: граница /clear и результаты локальных команд — вне контекста.
+        return dev_filter_context(messages)
 
     def _validate_rag_config(self, chat: Chat) -> None:
         if not chat.settings.rag_enabled:
@@ -3215,6 +3232,7 @@ class Repository:
         task_events_before = len(acc.task_events)
         tool_output = self._execute_tool_call(
             chat, agent, call, events=acc.task_events, auto_pause=auto_pause, allowed_mcp_names=allowed_mcp_names,
+            inject_args=acc.inject_args.get(name),
         )
         ok, error = True, None
         try:
@@ -3236,7 +3254,7 @@ class Repository:
     def _model_turn(
         self, provider, model_id: str, provider_messages: List[ProviderMessage], request_settings: Settings,
         chat: Chat, agent: Agent, acc: "_TurnAccumulator", *, use_stream: bool, token: Optional[CancelToken],
-        status_text: str, auto_pause: bool = True,
+        status_text: str, auto_pause: bool = True, max_tool_rounds: Optional[int] = None,
     ):
         """Один ответ модели целиком: запрос (потоковый или обычный), цикл
         вызова инструментов (до `_MAX_TOOL_ITERATIONS` раундов), итоговый
@@ -3245,6 +3263,7 @@ class Repository:
         переспросом. Генератор событий; через `yield from` возвращает
         `(final_result, final_content)`."""
         allowed_mcp_names = self._offered_tool_names(request_settings)
+        max_rounds = max_tool_rounds if max_tool_rounds is not None else _MAX_TOOL_ITERATIONS
         iterations = 0
         if acc.llm_started_at is None:
             acc.llm_started_at = time.monotonic()
@@ -3288,7 +3307,7 @@ class Repository:
             acc.last_stream_window = (
                 (done_result, call_first_token, time.monotonic()) if call_first_token is not None else None
             )
-            if done_result.tool_calls and iterations < _MAX_TOOL_ITERATIONS:
+            if done_result.tool_calls and iterations < max_rounds:
                 yield {"type": "status", "status": "Выполняется вызов инструментов"}
                 provider_messages.append(
                     ProviderMessage("assistant", done_result.content, tool_calls=done_result.tool_calls)
@@ -3382,9 +3401,11 @@ class Repository:
     def _finalize_draft(
         self, draft: Message, *, content: str, status: str, result: Optional[ChatResult] = None,
         duration_ms: Optional[int] = None, acc: Optional["_TurnAccumulator"] = None, error: Optional[str] = None,
+        command: Optional[dict] = None,
     ) -> Message:
         """Записывает итог в черновик (та же строка `messages`) и сообщает об
-        изменении непрочитанных в общую ленту."""
+        изменении непрочитанных в общую ленту. `command` — данные команды
+        разработчика (`Message.command`)."""
         content = content or ""
         fields: Dict[str, object] = {
             "content": content, "status": status, "format": detect_message_format(content),
@@ -3406,6 +3427,8 @@ class Repository:
                 fields["rag"] = json.dumps(acc.rag, ensure_ascii=False)
             if status == "complete" and acc.metrics:
                 fields["metrics"] = json.dumps(acc.metrics, ensure_ascii=False)
+        if command is not None:
+            fields["command"] = json.dumps(command, ensure_ascii=False)
         self._db.update_message_fields(draft.id, **fields)
         saved = self._db.get_message(draft.id)
         self._publish_unread(draft.chat_id)
@@ -3452,6 +3475,14 @@ class Repository:
         started = time.monotonic()
         with self._lock_for(chat_id):
             try:
+                route = self._dev.route(chat, text)
+                if route is not None:
+                    # «День 31»: команда разработчика или вопрос о проекте.
+                    yield from self._dev.execute(
+                        route, chat, agent, user_msg, draft, branch=branch, use_stream=use_stream, token=token,
+                        started=started,
+                    )
+                    return
                 messages = self._history_for_context(chat_id, branch, before_id=user_msg.id)
                 provider_messages, latest_facts, facts_boundary = self._resolve_send_context(
                     chat, agent, messages, text, get_facts, sliding_window, autosummary
@@ -3739,6 +3770,59 @@ class Repository:
 
     # ---- непрочитанные и общая лента изменений (ТЗ, раздел 2.6) --------------
 
+    # ---- «День 31»: ассистент разработчика ---------------------------------
+
+    def get_chat_project(self, chat_id: str):
+        self._require_chat(chat_id)
+        return self._dev.project(chat_id)
+
+    def refresh_chat_project(self, chat_id: str):
+        """Проект чата с обновлённым состоянием индексации базы знаний."""
+        project = self.get_chat_project(chat_id)
+        if project is not None:
+            self._dev.refresh_index(project)
+        return project
+
+    def dev_commands(self, chat_id: str) -> dict:
+        chat = self._require_chat(chat_id)
+        return {
+            "enabled": chat.settings.dev_commands_enabled, "read_only": chat.settings.dev_read_only,
+            "project": self._dev.project(chat_id), "commands": self._dev.commands_for(chat),
+        }
+
+    def _pending_command_message(self, chat_id: str, message_id: int) -> Tuple[Chat, Message]:
+        chat = self._require_chat(chat_id)
+        message = self._db.get_message(message_id)
+        if message is None or message.chat_id != chat_id:
+            raise NotFoundError(f"message {message_id} not found in chat {chat_id}")
+        if not message.command:
+            raise ValidationError("сообщение не требует подтверждения")
+        return chat, message
+
+    def confirm_command(self, chat_id: str, message_id: int, payload: Optional[dict] = None) -> Message:
+        """Подтверждение /commit или /undo: действие выполняет mcp_server.
+        Ошибка выполнения записывается в карточку (state="failed"), ошибка
+        запроса (уже выполнено, «Только чтение») — `PreconditionFailedError`."""
+        chat, message = self._pending_command_message(chat_id, message_id)
+        with self._lock_for(chat_id):
+            try:
+                saved = self._dev.confirm(chat, message, payload or {})
+            except DevError as exc:
+                raise PreconditionFailedError(str(exc)) from exc
+        self._db.touch_chat(chat_id)
+        self._publish_chat_event("chat_updated", chat_id, chat.agent_id)
+        return saved
+
+    def reject_command(self, chat_id: str, message_id: int) -> Message:
+        chat, message = self._pending_command_message(chat_id, message_id)
+        with self._lock_for(chat_id):
+            try:
+                saved = self._dev.reject(message)
+            except DevError as exc:
+                raise PreconditionFailedError(str(exc)) from exc
+        self._publish_chat_event("chat_updated", chat_id, chat.agent_id)
+        return saved
+
     def chat_activity(self, chat_ids: Optional[List[str]] = None) -> Dict[str, dict]:
         return self._db.chat_activity(chat_ids)
 
@@ -3783,3 +3867,6 @@ class _TurnAccumulator:
         #: Время запуска локальной модели перед запросом, мс (`_ensure_local_model`).
         self.preload_ms: Optional[int] = None
         self.metrics: Optional[dict] = None
+        #: «День 31» — аргументы, подставляемые в вызовы инструментов по имени
+        #: (repo_id проекта чата в командах разработчика).
+        self.inject_args: Dict[str, dict] = {}

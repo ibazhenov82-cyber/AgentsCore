@@ -188,6 +188,21 @@ class AgentConfig:
     # должен успеть откатиться на эвристику до того, как AgentsCore оборвёт запрос.
     KNOWLEDGE_SERVICE_TIMEOUT: float = float(os.environ.get("KNOWLEDGE_SERVICE_TIMEOUT", "60") or "60")
 
+    # --- Ассистент разработчика (День 31) -------------------------------------
+    # База знаний проекта: при открытии проекта AgentsCore создаёт в
+    # knowledge_service базу «Проект: <имя>» с источником-папкой репозитория
+    # и такими масками файлов (через запятую). Пусто — база не создаётся.
+    DEV_PROJECT_KB_INCLUDE: List[str] = [
+        p.strip() for p in os.environ.get(
+            "DEV_PROJECT_KB_INCLUDE",
+            "**/*.md,**/docs/**,**/openapi*.json,**/openapi*.yaml,**/openapi*.yml,**/swagger*.json,"
+            "**/swagger*.yaml,**/*.proto,**/*.graphql,**/*.sql,**/schema*.json,**/schema*.yaml,"
+            "**/schema*.yml,**/*.schema.json",
+        ).split(",") if p.strip()
+    ]
+    # Сколько раундов вызова инструментов у /ask, /explain, /history, /review.
+    DEV_MAX_TOOL_ROUNDS: int = int(os.environ.get("DEV_MAX_TOOL_ROUNDS", "10") or "10")
+
     # --- Асинхронные запуски (ТЗ «асинхронные ответы», раздел 2.4) ---------
     # Сколько ответов модели выполняется одновременно (в разных чатах; в
     # одном чате — всегда не больше одного).

@@ -451,6 +451,14 @@ class MCPClient:
                 return _tool_details(raw, name, self.name, self.title)["group"]
         return None
 
+    def direct_only_tools(self) -> set:
+        """Инструменты с `_meta["agentscore/direct_only"]` (по последнему
+        успешному `list_tools()`)."""
+        return {
+            raw["name"] for raw in self._cached_raw_tools
+            if isinstance(raw.get("_meta"), dict) and raw["_meta"].get(DIRECT_ONLY_META_KEY)
+        }
+
     def has_cached_tool(self, name: str) -> bool:
         """Использовалось ли имя `name` в последнем успешном `list_tools()`
         — так `Repository._execute_tool_call` решает, стоит ли вообще
@@ -526,6 +534,9 @@ ALLOWED_TOOLS_META_KEY = "agentscore/allowed_tools"
 #: «Планировщик» у наших серверов).
 GROUP_META_KEY = "agentscore/group"
 
+#: Ключ `_meta` инструмента: только прямой вызов сервисом, не моделью.
+DIRECT_ONLY_META_KEY = "agentscore/direct_only"
+
 
 def _tool_details(
     raw: Dict[str, Any], exposed_name: str, server: str, title: Optional[str] = None,
@@ -541,6 +552,9 @@ def _tool_details(
         "title": raw.get("title") or "",
         "description": raw.get("description") or "",
         "parameters": raw.get("inputSchema") or {"type": "object", "properties": {}},
+        # «День 31»: инструмент вызывает только сам сервис (после подтверждения
+        # пользователя), модели он не предлагается.
+        "direct_only": bool(meta.get(DIRECT_ONLY_META_KEY)),
     }
 
 
@@ -620,6 +634,9 @@ class MultiMCPClient:
 
     def has_cached_tool(self, name: str) -> bool:
         return name in self._routes
+
+    def direct_only_tools(self) -> set:
+        return {d["name"] for d in self._details if d.get("direct_only")}
 
     def tool_group(self, name: str) -> Optional[str]:
         for details in self._details:

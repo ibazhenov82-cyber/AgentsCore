@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from typing import Optional
 
 from ..models import Agent, Branch, Chat, Invariant, LongTermMemoryEntry, Message, ModelInfo, Profile, Run, WorkingMemoryEntry
 from ..schemas import (
+    ProjectOut,
     AgentOut,
     BranchOut,
     ChatOut,
@@ -97,7 +99,14 @@ def chat_out(chat: Chat, stats: dict, repo=None) -> ChatOut:
         first_unread_message_id=activity.get("first_unread_message_id"),
         last_message_at=activity.get("last_message_at"),
         preview=activity.get("preview"),
+        project=project_out(repo._db.get_chat_project(chat.id)) if repo is not None else None,
     )
+
+
+def project_out(project) -> Optional[ProjectOut]:
+    if project is None:
+        return None
+    return ProjectOut(**{k: getattr(project, k) for k in ProjectOut.model_fields})
 
 
 def run_brief_out(run: Run) -> RunBriefOut:

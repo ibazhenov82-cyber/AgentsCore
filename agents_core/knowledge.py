@@ -138,6 +138,55 @@ class KnowledgeClient:
             raise KnowledgeServiceError("сервис баз знаний вернул неожиданный ответ")
         return data
 
+    # ---- «День 31»: база знаний проекта (коллекция + источник-папка) --------
+
+    def _call(self, method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            resp = self._session.request(method, f"{self.base_url}/api/v1{path}", json=body, headers=self._headers(),
+                                         timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise KnowledgeServiceError(f"сервис баз знаний недоступен: {exc}") from exc
+        try:
+            data = resp.json() if resp.content else {}
+        except ValueError:
+            data = {}
+        if resp.status_code >= 400:
+            message = data.get("error") if isinstance(data, dict) else None
+            raise KnowledgeServiceError(f"сервис баз знаний: HTTP {resp.status_code}: {message or resp.text[:300]}")
+        return data if isinstance(data, dict) else {}
+
+    def list_collections(self) -> List[Dict[str, Any]]:
+        data = self._call("GET", "/collections")
+        return list(data.get("items") or [])
+
+    def get_collection(self, collection_id: str) -> Dict[str, Any]:
+        return self._call("GET", f"/collections/{collection_id}")
+
+    def create_collection(self, name: str, description: str = "", file_types: Optional[Dict[str, Any]] = None
+                          ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"name": name, "description": description}
+        if file_types:
+            body["file_types"] = file_types
+        return self._call("POST", "/collections", body)
+
+    def delete_collection(self, collection_id: str) -> None:
+        self._call("DELETE", f"/collections/{collection_id}")
+
+    def list_sources(self, collection_id: str) -> List[Dict[str, Any]]:
+        return list(self._call("GET", f"/collections/{collection_id}/sources").get("items") or [])
+
+    def add_path_source(self, collection_id: str, path: str, include: List[str], title: str) -> Dict[str, Any]:
+        """→ {"source": {...}, "job_id"} — индексация идёт в фоне."""
+        return self._call("POST", f"/collections/{collection_id}/sources", {
+            "source": {"type": "path", "path": path}, "include": include, "title": title,
+        })
+
+    def sync_source(self, source_id: str) -> Dict[str, Any]:
+        return self._call("POST", f"/sources/{source_id}/sync")
+
+    def get_job(self, job_id: str) -> Dict[str, Any]:
+        return self._call("GET", f"/jobs/{job_id}")
+
 
 @dataclass
 class RagOutcome:
