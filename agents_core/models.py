@@ -366,6 +366,14 @@ class Settings:
     #: фрагментов, код сверяет их с фрагментами; «не знаю» при слабом контексте.
     rag_quotes: bool = True
 
+    # --- «День 31» — ассистент разработчика (см. `dev_assistant.py`) --------
+    #: «Команды разработчика»: /help, /ask, /diff, … и ссылка на проект в
+    #: сообщении. Выключено — «/…» и ссылки обрабатываются как обычный текст.
+    dev_commands_enabled: bool = False
+    #: «Только чтение»: /commit и /undo недоступны. Модель инструментов
+    #: записи не получает никогда — от этой настройки не зависит.
+    dev_read_only: bool = True
+
 
 def settings_from_defaults(defaults: DefaultSettings) -> Settings:
     """Строит полные настройки нового агента: поля, присутствующие в
@@ -445,6 +453,8 @@ AGENT_SETTINGS_FIELDS = [
     {"sys_name": "rag_query_rewrite", "title": "Переписывание запроса", "group": "База знаний"},
     {"sys_name": "rag_rewrite_model", "title": "Модель переписывания", "group": "База знаний"},
     {"sys_name": "rag_quotes", "title": "Цитаты и источники обязательны", "group": "База знаний"},
+    {"sys_name": "dev_commands_enabled", "title": "Команды разработчика", "group": "Ассистент разработчика"},
+    {"sys_name": "dev_read_only", "title": "Только чтение", "group": "Ассистент разработчика"},
     {"sys_name": "include_usage_in_stream", "title": "Показывать токены при потоковых ответах", "group": "Дополнительно"},
     {"sys_name": "logprobs", "title": "Показывать вероятности появления токенов", "group": "Дополнительно"},
     {"sys_name": "frequency_penalty", "title": "Штраф за частоту", "group": "Дополнительно"},
@@ -502,6 +512,34 @@ class Chat:
     last_read_message_id: int = 0
     #: Кто создал чат: "app" (пользователь) | "scheduler" (планировщик).
     source: str = "app"
+
+
+@dataclass
+class ChatProject:
+    """«День 31» — проект чата для команд разработчика: открывается ссылкой
+    в сообщении или `/project`, новая ссылка заменяет его."""
+
+    chat_id: str
+    link: str
+    repo_id: str
+    kind: str  # "remote" (клон по URL) | "local" (рабочая копия)
+    name: str
+    path: str = ""
+    branch: Optional[str] = None
+    default_branch: Optional[str] = None
+    remote: Optional[str] = None
+    writable: bool = False
+    #: База знаний проекта в knowledge_service и её индексация.
+    collection_id: Optional[str] = None
+    source_id: Optional[str] = None
+    index_job_id: Optional[str] = None
+    #: "" | "indexing" | "ready" | "failed" | "unavailable"
+    index_status: str = ""
+    index_error: Optional[str] = None
+    #: Последний коммит, сделанный /commit (его откатывает /undo).
+    last_commit: Optional[str] = None
+    opened_at: int = 0
+    updated_at: int = 0
 
 
 @dataclass
@@ -582,6 +620,13 @@ class Message:
     #: "vram_mb", "gpu_percent", "num_ctx"} (любое поле может отсутствовать —
     #: что смог сообщить провайдер, см. `Repository._build_metrics`).
     metrics: Optional[str] = None
+    #: «День 31» — команда разработчика (JSON): у запроса `{"name", "role":
+    #: "request", "context"}`, у ответа ещё `kind` ("local" | "llm" |
+    #: "confirm"), `card` (данные карточки: help, status, diff, project…) и
+    #: `confirm` (подтверждение /commit, /undo: state pending|done|cancelled|
+    #: failed). `context: false` — сообщение не уходит в контекст модели;
+    #: `boundary: true` (/clear) — всё до него вне контекста.
+    command: Optional[str] = None
     #: Кто отправил сообщение пользователя: "app" | "scheduler" |
     #: "test_dialog" (вопрос тестового диалога). Запросы планировщика
     #: считаются непрочитанными (пользователь их не писал).

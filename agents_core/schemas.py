@@ -129,6 +129,15 @@ class SettingsOut(BaseModel):
         True, description="«Цитаты и источники обязательны»: ответ со ссылками [n] и дословными цитатами из "
                           "фрагментов (код сверяет их с фрагментами); при слабом контексте — «Не знаю» и уточнение",
     )
+    dev_commands_enabled: bool = Field(
+        False, description="«Команды разработчика»: /help, /ask, /status, /diff, /review, /commit … и ссылка на "
+                           "проект (URL репозитория или локальный путь) в сообщении. Выключено — «/…» и ссылки "
+                           "обрабатываются как обычный текст",
+    )
+    dev_read_only: bool = Field(
+        True, description="«Только чтение»: /commit и /undo недоступны. Модель инструментов записи не получает "
+                          "никогда, от этой настройки это не зависит",
+    )
 
     tools_sources: List[str] = Field(
         default_factory=list,
@@ -216,6 +225,8 @@ class SettingsPatch(BaseModel):
     rag_query_rewrite: Optional[str] = None
     rag_rewrite_model: Optional[str] = None
     rag_quotes: Optional[bool] = None
+    dev_commands_enabled: Optional[bool] = None
+    dev_read_only: Optional[bool] = None
 
     model_config = ConfigDict(extra="forbid", json_schema_extra={"example": {"temperature": 0.7, "max_tokens": 2048}})
 
@@ -372,6 +383,15 @@ class MessageOut(BaseModel):
             "\"num_ctx\" (фактическое окно)}; любое поле может отсутствовать"
         ),
     )
+    command: Optional[str] = Field(
+        None,
+        description=(
+            "Команда разработчика (День 31), JSON: {\"name\": \"status\"|\"diff\"|…, \"role\": \"request\"|"
+            "\"result\", \"kind\": \"local\"|\"llm\"|\"confirm\", \"context\": false — вне контекста модели, "
+            "\"boundary\": true — граница /clear, \"card\": {данные карточки}, \"confirm\": {\"action\": "
+            "\"commit\"|\"undo\", \"state\": \"pending\"|\"done\"|\"cancelled\"|\"failed\", …}}"
+        ),
+    )
 
 _SLIDING_WINDOW_DESCRIPTION = (
     "Запросить обрезку контекста стратегией Sliding Window. Требует "
@@ -508,6 +528,49 @@ class ChatOut(BaseModel):
     last_read_message_id: int = Field(0, description="Отметка прочтения (`POST /chats/{id}/read`)")
     last_message_at: Optional[int] = Field(None, description="Время последнего сообщения — для сортировки списка")
     preview: Optional[str] = Field(None, description="Начало последнего сообщения (до 120 символов)")
+    project: Optional["ProjectOut"] = Field(None, description="Проект чата для команд разработчика (День 31)")
+
+
+class ProjectOut(BaseModel):
+    """Проект чата (День 31): открыт ссылкой в сообщении или командой /project."""
+
+    link: str = Field(..., description="Ссылка, по которой открыт проект")
+    repo_id: str
+    kind: str = Field(..., description="'remote' — клон по URL; 'local' — локальная рабочая копия")
+    name: str = Field(..., description="owner/repo или имя папки")
+    branch: Optional[str] = None
+    default_branch: Optional[str] = None
+    remote: Optional[str] = None
+    writable: bool = Field(False, description="Коммиты возможны (только локальная рабочая копия)")
+    collection_id: Optional[str] = Field(None, description="База знаний проекта в knowledge_service")
+    index_status: str = Field("", description="'' | 'indexing' | 'ready' | 'failed' | 'unavailable'")
+    index_error: Optional[str] = None
+    last_commit: Optional[str] = Field(None, description="Последний коммит, сделанный /commit (его откатывает /undo)")
+    opened_at: int = 0
+
+
+class DevCommandOut(BaseModel):
+    name: str = Field(..., description="Имя без слэша: 'ask'")
+    usage: str = Field(..., description="Как вызывать: '/ask <вопрос>'")
+    title: str
+    description: str
+    group: str = Field(..., description="'Справка' | 'Вопросы' | 'Изменения'")
+    kind: str = Field(..., description="'local' — без модели; 'llm' — ответ модели (только чтение); 'confirm' — с подтверждением")
+    writes: bool = Field(False, description="Изменяет репозиторий (/commit, /undo)")
+    available: bool = Field(True, description="Доступна в этом чате (false — например, «Только чтение»)")
+    reason: Optional[str] = Field(None, description="Почему недоступна")
+
+
+class DevCommandsOut(BaseModel):
+    enabled: bool = Field(..., description="«Команды разработчика» включены в этом чате")
+    read_only: bool
+    project: Optional[ProjectOut] = None
+    commands: List[DevCommandOut]
+
+
+class CommandConfirmRequest(BaseModel):
+    message: Optional[str] = Field(None, description="/commit: сообщение коммита (можно исправить предложенное)")
+    files: Optional[List[str]] = Field(None, description="/commit: файлы коммита (по умолчанию — предложенные)")
 
 
 class ActiveProfileSetRequest(BaseModel):

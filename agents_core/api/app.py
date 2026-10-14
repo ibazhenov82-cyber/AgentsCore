@@ -35,7 +35,7 @@ from ..repository import (
 )
 from ..runs import RunConflictError, RunManager
 from . import (
-    agents, chats, health, invariants, local_models, mcp_tools, memory, messages, models_routes, runs,
+    agents, chats, dev, health, invariants, local_models, mcp_tools, memory, messages, models_routes, runs,
     settings_routes, tasks, test_dialogs,
 )
 from .logging_middleware import AccessLogMiddleware
@@ -140,6 +140,7 @@ def create_app_with_repository(
     app.include_router(tasks.router)
     app.include_router(runs.router)
     app.include_router(mcp_tools.router)
+    app.include_router(dev.router)
 
     @app.exception_handler(RunConflictError)
     def _run_conflict(request: Request, exc: RunConflictError) -> JSONResponse:
