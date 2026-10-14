@@ -631,3 +631,10 @@ class RunManager:
             stale = [rid for rid, st in self._states.items() if st.finished_at is not None and st.finished_at < cutoff]
             for rid in stale:
                 del self._states[rid]
+
+
+def run_summary(run: Run) -> Dict[str, Any]:
+    """Краткая сводка запуска для уведомлений."""
+    request = json.loads(run.request_json)
+    duration = run.finished_at - run.started_at
+    return {"id": run.id, "text": request["text"][:100], "duration_s": duration, "step": request["step"]}
