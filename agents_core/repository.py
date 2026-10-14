@@ -652,11 +652,16 @@ class Repository:
             raise NotFoundError(f"no such chat: {chat_id}")
         return chat
 
-    def create_chat(self, agent_id: str, title: Optional[str], source: str = "app") -> Chat:
+    def create_chat(
+        self, agent_id: str, title: Optional[str], source: str = "app", external_key: Optional[str] = None,
+        settings_overrides: Optional[dict] = None,
+    ) -> Chat:
         """`source` — кто создаёт чат: "app" (пользователь) | "scheduler"
-        (планировщик: «Запрос агенту»/«Задача агенту» в новый чат)."""
+        (планировщик: «Запрос агенту»/«Задача агенту» в новый чат) | "ci"
+        (ревью PR, `external_key` — ключ PR). `settings_overrides` — поля
+        настроек нового чата поверх настроек агента."""
         agent = self._require_agent(agent_id)
-        settings = dataclasses.replace(agent.settings)
+        settings = dataclasses.replace(agent.settings, **(settings_overrides or {}))
         # Имя по умолчанию — "Чат N", где N — порядковый номер чата ВНУТРИ
         # этого агента (число уже существующих чатов агента + 1).
         resolved_title = title if title and title.strip() else f"Чат {len(self._db.list_chats(agent_id)) + 1}"
@@ -666,6 +671,7 @@ class Repository:
         # дальше чат может выбрать другой профиль независимо от агента.
         chat = self._db.create_chat(
             agent_id, resolved_title, settings, active_profile_id=agent.default_profile_id, source=source,
+            external_key=external_key,
         )
         self._publish_chat_event("chat_created", chat.id, agent_id)
         return chat
@@ -3132,7 +3138,7 @@ class Repository:
             branch=branch or 0, status="streaming", run_id=run_id,
         ))
         self._db.touch_chat(chat_id)
-        if source == "scheduler":
+        if source in ("scheduler", "ci"):
             self._publish_unread(chat_id)
         return chat, user_msg, draft
 

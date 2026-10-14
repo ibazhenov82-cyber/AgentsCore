@@ -387,6 +387,7 @@ class Database:
                     invariant_ids TEXT,
                     last_read_message_id INTEGER NOT NULL DEFAULT 0,
                     source TEXT NOT NULL DEFAULT 'app',
+                    external_key TEXT,
                     {settings_cols_sql}
                 );
 
@@ -524,6 +525,8 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_chats_agent_id ON chats(agent_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chats_external_key
+                    ON chats(agent_id, external_key) WHERE external_key IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_branches_chat_id ON chat_branches(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_working_memory_chat_id ON working_memory(chat_id);
@@ -714,19 +717,20 @@ class Database:
 
     def create_chat(
         self, agent_id: str, title: str, settings: Settings, active_profile_id: Optional[str] = None,
-        source: str = "app",
+        source: str = "app", external_key: Optional[str] = None,
     ) -> Chat:
         chat_id = str(uuid.uuid4())
         now = int(time.time())
         row = _settings_to_row(settings)
         with self._connect() as conn:
-            columns = ["id", "agent_id", "title", "created_at", "updated_at", "active_profile_id", "source"] + list(row.keys())
-            values = [chat_id, agent_id, title, now, now, active_profile_id, source] + list(row.values())
+            columns = ["id", "agent_id", "title", "created_at", "updated_at", "active_profile_id", "source",
+                       "external_key"] + list(row.keys())
+            values = [chat_id, agent_id, title, now, now, active_profile_id, source, external_key] + list(row.values())
             placeholders = ", ".join("?" for _ in columns)
             conn.execute(f"INSERT INTO chats ({', '.join(columns)}) VALUES ({placeholders})", values)
         return Chat(
             id=chat_id, agent_id=agent_id, title=title, created_at=now, updated_at=now, settings=settings,
-            active_profile_id=active_profile_id, source=source,
+            active_profile_id=active_profile_id, source=source, external_key=external_key,
         )
 
     def _row_to_chat(self, r: sqlite3.Row) -> Chat:
@@ -737,6 +741,7 @@ class Database:
             invariant_ids=self._row_invariant_ids(r),
             last_read_message_id=r["last_read_message_id"],
             source=r["source"],
+            external_key=r["external_key"],
         )
 
     def get_chat(self, chat_id: str) -> Optional[Chat]:
@@ -753,6 +758,13 @@ class Database:
             else:
                 rows = conn.execute("SELECT * FROM chats ORDER BY updated_at DESC").fetchall()
             return [self._row_to_chat(r) for r in rows]
+
+    def find_chat_by_external_key(self, agent_id: str, external_key: str) -> Optional[Chat]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chats WHERE agent_id = ? AND external_key = ?", (agent_id, external_key),
+            ).fetchone()
+            return self._row_to_chat(row) if row is not None else None
 
     def find_latest_chat_by_title(self, agent_id: str, title: str) -> Optional[Chat]:
         with self._connect() as conn:
@@ -792,7 +804,7 @@ class Database:
                     FROM messages m JOIN chats c ON c.id = m.chat_id
                     WHERE m.id > COALESCE(c.last_read_message_id, 0)
                       AND ((m.role = 'assistant' AND m.status IN ({final}))
-                           OR (m.role = 'user' AND m.source = 'scheduler'))
+                           OR (m.role = 'user' AND m.source IN ('scheduler', 'ci')))
                       {where_chats}
                     GROUP BY m.chat_id""",
                 params,

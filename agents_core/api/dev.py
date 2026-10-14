@@ -10,12 +10,23 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, status
 
+from ..ci_review import CiReviewService
 from ..repository import Repository
-from ..schemas import CommandConfirmRequest, DevCommandOut, DevCommandsOut, MessageOut, ProjectOut
+from ..runs import RunManager
+from ..schemas import (
+    CiReviewOut,
+    CiReviewRequest,
+    CiReviewStartedOut,
+    CommandConfirmRequest,
+    DevCommandOut,
+    DevCommandsOut,
+    MessageOut,
+    ProjectOut,
+)
 from .converters import message_out, project_out
-from .deps import get_repository
+from .deps import get_repository, get_run_manager
 
 router = APIRouter(tags=["Developer assistant"])
 
@@ -73,3 +84,41 @@ def confirm_command(
 )
 def reject_command(chat_id: str, message_id: int, repo: Repository = Depends(get_repository)) -> MessageOut:
     return message_out(repo.reject_command(chat_id, message_id))
+
+
+# ---- «День 32»: ревью pull request'ов из CI -----------------------------------
+
+
+@router.post(
+    "/dev/reviews",
+    response_model=CiReviewStartedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Запросить ревью PR (для CI)",
+    description=(
+        "Вызывает GitHub Action на событие pull request. Находит чат PR агента по ключу "
+        "«хост/owner/repo#номер» (или создаёт его), отправляет в чат `/review pr:<номер> <репозиторий>` от "
+        "имени «GitHub Actions» и сразу возвращает `review_id`; результат — `GET /dev/reviews/{review_id}`. "
+        "Повтор для того же `head_sha` возвращает уже созданное ревью; ревью более старого коммита отменяется."
+    ),
+)
+def start_review(
+    payload: CiReviewRequest, repo: Repository = Depends(get_repository),
+    manager: RunManager = Depends(get_run_manager),
+) -> CiReviewStartedOut:
+    return CiReviewStartedOut(**CiReviewService(repo, manager).start(payload.model_dump()))
+
+
+@router.get(
+    "/dev/reviews/{review_id}",
+    response_model=CiReviewOut,
+    summary="Состояние и результат ревью PR",
+    description=(
+        "`status`: 'running' (опрашивать дальше), 'done' — `markdown`, разделы `bugs`, `architecture`, "
+        "`recommendations`, `files`, `sources` и готовый `comment_markdown` для PR; 'failed' — `error`; "
+        "'cancelled' — пришёл более новый коммит PR."
+    ),
+)
+def get_review(
+    review_id: str, repo: Repository = Depends(get_repository), manager: RunManager = Depends(get_run_manager),
+) -> CiReviewOut:
+    return CiReviewOut(**CiReviewService(repo, manager).get(review_id))

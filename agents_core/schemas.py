@@ -363,7 +363,7 @@ class MessageOut(BaseModel):
         ),
     )
     error: Optional[str] = Field(None, description="Текст ошибки для status='failed'")
-    source: str = Field("app", description="Кто отправил сообщение пользователя: 'app' | 'scheduler' | 'test_dialog' (вопрос тестового диалога)")
+    source: str = Field("app", description="Кто отправил сообщение пользователя: 'app' | 'scheduler' | 'test_dialog' (вопрос тестового диалога) | 'ci' (запрос ревью PR из CI)")
     rag: Optional[str] = Field(
         None,
         description=(
@@ -521,7 +521,9 @@ class ChatOut(BaseModel):
             "объединение этого списка и `AgentOut.invariant_ids` агента этого чата."
         ),
     )
-    source: str = Field("app", description="Кто создал чат: 'app' | 'scheduler'")
+    source: str = Field("app", description="Кто создал чат: 'app' | 'scheduler' | 'ci' (ревью PR)")
+    external_key: Optional[str] = Field(
+        None, description="Постоянный внешний ключ чата: у чата ревью PR — 'github.com/owner/repo#12'")
     active_run: Optional["RunBriefOut"] = Field(None, description="Идущий сейчас запуск в этом чате, если есть")
     unread_count: int = Field(0, description="Непрочитанные: ответы ассистента и запросы планировщика новее отметки прочтения")
     first_unread_message_id: Optional[int] = Field(None, description="К нему приложение прокручивает чат при открытии")
@@ -566,6 +568,67 @@ class DevCommandsOut(BaseModel):
     read_only: bool
     project: Optional[ProjectOut] = None
     commands: List[DevCommandOut]
+
+
+class CiReviewRequest(BaseModel):
+    """Запрос ревью PR из CI (GitHub Action)."""
+
+    agent_id: Optional[str] = Field(None, description="Агент-ревьюер (или `agent` — имя агента)")
+    agent: Optional[str] = Field(None, description="Имя агента, если `agent_id` не задан")
+    repo: str = Field(..., description="Ссылка на репозиторий: https://github.com/owner/repo")
+    pr: int = Field(..., ge=1, description="Номер pull request'а")
+    base: Optional[str] = Field(None, description="Базовая ветка PR (по умолчанию — ветка по умолчанию репозитория)")
+    head_sha: Optional[str] = Field(
+        None, description="Коммит PR: повтор для того же коммита возвращает готовое ревью, новый — отменяет старое")
+    title: Optional[str] = Field(None, description="Заголовок PR — в название чата при его создании")
+    author: Optional[str] = None
+    url: Optional[str] = Field(None, description="Ссылка на PR")
+
+
+class CiReviewStartedOut(BaseModel):
+    review_id: str = Field(..., description="Id ревью (запуска) — для GET /dev/reviews/{review_id}")
+    chat_id: str
+    chat_title: str
+    created_chat: bool = Field(..., description="Чат PR создан этим запросом (первое ревью PR)")
+    status: str = Field(..., description="'running' | 'done' | 'failed' | 'cancelled'")
+    key: str = Field(..., description="Ключ PR: 'github.com/owner/repo#12' (external_key чата)")
+    head_sha: Optional[str] = None
+
+
+class CiReviewFileOut(BaseModel):
+    path: str
+    status: Optional[str] = None
+    additions: Optional[int] = None
+    deletions: Optional[int] = None
+
+
+class CiReviewSourceOut(BaseModel):
+    n: Optional[int] = None
+    title: Optional[str] = None
+    section: Optional[str] = None
+    source: Optional[str] = None
+
+
+class CiReviewOut(BaseModel):
+    review_id: str
+    chat_id: str
+    chat_title: str
+    key: Optional[str] = None
+    head_sha: Optional[str] = None
+    status: str = Field(..., description="'running' | 'done' | 'failed' | 'cancelled' (пришёл более новый коммит)")
+    current_status: Optional[str] = Field(None, description="Фаза, пока ревью идёт: «Поиск в документации и коде проекта»…")
+    error: Optional[str] = None
+    markdown: Optional[str] = Field(None, description="Текст ревью (ответ модели)")
+    comment_markdown: Optional[str] = Field(None, description="Готовый комментарий для PR: ревью, источники, подпись")
+    summary: Optional[str] = None
+    bugs: List[str] = Field(default_factory=list, description="«Потенциальные баги»")
+    architecture: List[str] = Field(default_factory=list, description="«Архитектурные проблемы»")
+    recommendations: List[str] = Field(default_factory=list, description="«Рекомендации»")
+    files: List[CiReviewFileOut] = Field(default_factory=list, description="Изменённые файлы PR")
+    stats: Optional[Dict[str, Any]] = None
+    diff_title: Optional[str] = None
+    sources: List[CiReviewSourceOut] = Field(default_factory=list, description="Фрагменты базы знаний, на которые сослалось ревью")
+    model: Optional[str] = None
 
 
 class CommandConfirmRequest(BaseModel):

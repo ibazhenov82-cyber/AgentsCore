@@ -660,7 +660,7 @@ https://github.com/owner/repo/tree/feature-x
 | `/explain <путь или символ>` | модель, только чтение | объяснить файл, модуль, функцию |
 | `/history <путь>` | модель, только чтение | почему код стал таким: log, blame, коммиты |
 | `/diff [staged\|ветка\|a..b]` | без модели | diff как есть |
-| `/review [ветка\|a..b]` | модель, только чтение | код-ревью изменений или ветки |
+| `/review [ветка\|a..b\|pr:N]` | модель, только чтение | ревью изменений, ветки или PR: потенциальные баги, архитектурные проблемы, рекомендации |
 | `/commit [пожелание]` | модель + подтверждение | модель предлагает сообщение, коммит — после подтверждения |
 | `/undo` | подтверждение | откатить последний коммит `/commit` (`reset --soft`) |
 
@@ -710,6 +710,7 @@ request'ы и правка файлов моделью не поддержива
 | `GET /chats/{chat_id}/project` | проект чата с актуальным состоянием индексации |
 | `POST /chats/{chat_id}/messages/{message_id}/confirm` | подтвердить `/commit` (`{"message", "files"}`) или `/undo` |
 | `POST /chats/{chat_id}/messages/{message_id}/reject` | отменить |
+| `POST /dev/reviews`, `GET /dev/reviews/{id}` | ревью PR из CI — см. «Ревью pull request'ов из CI» |
 
 `Message.command` (JSON): у запроса — `{"name", "role": "request", "context"}`, у
 ответа — `{"name", "role": "result", "kind": "local"|"llm"|"confirm", "context",
@@ -725,6 +726,82 @@ request'ы и правка файлов моделью не поддержива
   и `MCP_PROJECT_ROOTS`;
 - AgentsCore: подключён mcp_server (`MCP_ENABLED`, `MCP_SERVERS`) и
   `KNOWLEDGE_SERVICE_URL`; `DEV_PROJECT_KB_INCLUDE` — маски файлов базы проекта.
+
+## Ревью pull request'ов из CI (День 32)
+
+Автоматическое AI-ревью: на открытие PR и каждый новый коммит GitHub Action
+запрашивает ревью у AgentsCore и публикует его комментарием в PR. Инициатор —
+событие PR в GitHub; ни в приложении, ни в чате ничего нажимать не нужно.
+
+```
+PR / push ─► GitHub Action ─► POST /dev/reviews ─► AgentsCore: чат PR, /review pr:N
+                  │                                   ├─ mcp_server: repo_open, repo_diff("pr:N"), чтение кода
+                  │                                   ├─ knowledge_service: документация + код по diff
+                  │                                   └─ модель: баги / архитектура / рекомендации
+                  └─ GET /dev/reviews/{id} (каждые 10 с) ─► комментарий в PR (один, обновляется)
+```
+
+**Алгоритм `POST /dev/reviews`** (`ci_review.py`):
+
+1. Агент — по `agent_id` или по имени (`agent`).
+2. Ключ PR — `"<хост>/<owner>/<repo>#<номер>"`, например `github.com/acme/widgets#12`.
+3. Чат PR ищется по `(agent_id, external_key)`. Нет — создаётся из настроек агента
+   («Команды разработчика» вкл., «Только чтение» вкл.) с названием
+   «PR owner/repo#12: <заголовок PR>», `source="ci"`, и ему присваивается
+   `external_key`. Ключ не меняется, переименование чата его не трогает; удалили
+   чат — следующее ревью создаст новый. Гонку двух запросов разрешают блокировка и
+   уникальный индекс. У разных агентов — свои чаты одного PR.
+4. Повтор для того же коммита (`head_sha`) возвращает уже созданное ревью
+   (`client_request_id = review:<ключ>@<sha>`) — модель второй раз не вызывается.
+5. Идущее в чате ревью более старого коммита отменяется; если в чате идёт другой
+   ответ (вы пишете в нём), сервис ждёт до 60 с, затем `409`.
+6. В чат от имени «GitHub Actions» уходит `/review pr:12 <репозиторий>/tree/<база>` —
+   дальше работает обычная команда `/review`:
+   - проект открывается по ссылке на базовую ветку (`repo_open`);
+   - `repo_diff("pr:12")` — изменения PR от точки ответвления (ветка PR догружается из
+     `refs/pull/12/head`, работают и PR из форков) и список изменённых файлов;
+   - поиск по базе знаний проекта запросами по diff: изменённые модули, функции и
+     классы из патча (`review_queries`) — документация и связанный код, до 3 запросов,
+     без повторов;
+   - модель с инструментами только для чтения (версию файлов из PR читает с
+     `ref="pr:12"`) пишет ответ в разделах «### Кратко», «### Потенциальные баги»,
+     «### Архитектурные проблемы», «### Рекомендации»; ответ разбирается в
+     структуру (`parse_review`, карточка `review` в `Message.command`).
+7. `GET /dev/reviews/{review_id}`: `status` — `running` | `done` | `failed` |
+   `cancelled` (пришёл более новый коммит). При `done` — `markdown`, `summary`,
+   `bugs`, `architecture`, `recommendations`, `files`, `sources` (фрагменты базы, на
+   которые сослалось ревью) и готовый `comment_markdown` для PR. Нет изменений или
+   проект не открылся — `failed` с причиной в `error`.
+
+**База знаний проекта для ревью** — документация (`DEV_PROJECT_KB_INCLUDE`) и код
+(`DEV_PROJECT_KB_CODE`, по умолчанию `.py .kt .kts .java .js .jsx .ts .tsx .go`).
+У уже созданной базы маски обновляются при следующем открытии проекта. Лимит
+документов источника — `KB_MAX_SOURCE_DOCUMENTS` knowledge_service (5000).
+
+**GitHub Action** — `ci/github/ai-review.yml`, скопировать в
+`.github/workflows/ai-review.yml` репозитория. Настройки репозитория (Settings →
+Secrets and variables → Actions):
+
+| Где | Имя | Значение |
+|---|---|---|
+| Secrets | `AGENTSCORE_URL` | адрес AgentsCore: `https://<домен>/core/` (через agents_proxy) |
+| Secrets | `AGENTSCORE_KEY` | ключ доступа прокси |
+| Variables | `AGENTSCORE_AGENT` | имя агента-ревьюера (или `AGENTSCORE_AGENT_ID` — его id) |
+
+Запуск — `pull_request_target` (opened, synchronize, reopened, ready_for_review;
+черновики пропускаются) и вручную (Actions → AI review → Run workflow, номер PR).
+`concurrency` отменяет прогон предыдущего коммита. Комментарий один, с меткой
+`<!-- agentscore-review -->`, при новых коммитах обновляется; публикует его сам Action
+встроенным `GITHUB_TOKEN`. Ошибка (сервис недоступен, таймаут 15 мин) — комментарий
+«Ревью не выполнено: …» и предупреждение, проверка PR не падает.
+`pull_request_target` даёт секреты и право комментировать и для PR из форков; это
+безопасно, потому что код PR в runner'е не скачивается и не выполняется — в AgentsCore
+уходят только номер PR и ссылка на репозиторий.
+
+**Агент-ревьюер** — обычный агент: модель, температура (0.2–0.3), системный prompt
+(например, правила команды для ревью), инварианты. «Команды разработчика» у чатов PR
+включаются сами. AgentsCore должен быть доступен из интернета (runner'ы GitHub — в
+облаке), mcp_server — с `MCP_REPOS_ENABLED`, папка клонов — в `KB_ROOTS`.
 
 ## Тестовые диалоги
 
@@ -948,6 +1025,8 @@ data: {"seq": 9, "type": "done", "message": {"id": 4, "role": "assistant", "cont
   (`read_chat`).
 - `dev_assistant.py` — ассистент разработчика: команды `/help`, `/ask`, `/diff`,
   `/commit`…, проект чата по ссылке, база знаний проекта, подтверждения.
+- `ci_review.py` — ревью pull request'ов из CI: чат PR по ключу, запуск
+  `/review pr:N`, результат для GitHub Action (`ci/github/ai-review.yml`).
 - `runs.py` — асинхронные запуски, в том числе цепочка тестового диалога.
 - `schemas.py` — Pydantic-модели запросов/ответов HTTP API.
 - `api/` — маршруты FastAPI, тонкая обёртка над `Repository`.

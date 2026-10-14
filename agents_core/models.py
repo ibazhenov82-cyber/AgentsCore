@@ -512,6 +512,10 @@ class Chat:
     last_read_message_id: int = 0
     #: Кто создал чат: "app" (пользователь) | "scheduler" (планировщик).
     source: str = "app"
+    #: «День 32» — постоянный внешний ключ чата (ревью PR из CI:
+    #: "github.com/owner/repo#12"); уникален в пределах агента, задаётся при
+    #: создании чата и не меняется.
+    external_key: Optional[str] = None
 
 
 @dataclass

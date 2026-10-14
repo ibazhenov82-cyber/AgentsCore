@@ -130,6 +130,10 @@ class FakeKnowledge:
         self.sources.setdefault(cid, []).append(src)
         return {"source": src, "job_id": "job1"}
 
+    def update_source_include(self, sid, include):
+        self.patched = (sid, include)
+        return {}
+
     def sync_source(self, sid):
         self.synced.append(sid)
         return {"job_id": "job2"}
@@ -419,3 +423,151 @@ class ApiTests(DevAssistantTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- «День 32»: ревью PR из CI ------------------------------------------------
+
+REVIEW_TEXT = """### Кратко
+PR меняет функцию plan.
+### Потенциальные баги
+- `app.py:2` — возвращается строка вместо числа → вернуть int [1]
+### Архитектурные проблемы
+- нет
+### Рекомендации
+- добавить тест на plan
+- обновить README
+"""
+
+
+class ReviewParsingTests(unittest.TestCase):
+    def test_parse_review_sections(self):
+        from agents_core.dev_assistant import parse_review
+
+        parsed = parse_review(REVIEW_TEXT)
+        self.assertEqual(parsed["summary"], "PR меняет функцию plan.")
+        self.assertEqual(len(parsed["bugs"]), 1)
+        self.assertEqual(parsed["architecture"], [])
+        self.assertEqual(parsed["recommendations"], ["добавить тест на plan", "обновить README"])
+        bold = parse_review("**Потенциальные баги:**\n1. ошибка\nпродолжение\n**Рекомендации**\n- тест")
+        self.assertEqual(bold["bugs"], ["ошибка продолжение"])
+
+    def test_review_queries_from_diff(self):
+        from agents_core.dev_assistant import review_queries
+
+        queries = review_queries({"files": [{"path": "agents_core/runs.py"}], "patch":
+                                  "@@ -1,2 +1,3 @@ class RunManager:\n+    def start_review(self):\n"})
+        self.assertIn("agents core runs", queries[0])
+        self.assertIn("RunManager", queries[1])
+        self.assertIn("start_review", queries[1])
+
+
+class CiReviewTests(DevAssistantTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        from fastapi.testclient import TestClient
+
+        from agents_core.api.app import create_app_with_repository
+
+        self.reviewer = self.repo.create_agent("Ревьюер", model=TEST_MODEL_ID)
+        self.client = TestClient(create_app_with_repository(self.repo))
+        self.client.__enter__()
+        self.provider.final_text = REVIEW_TEXT
+
+    def tearDown(self) -> None:
+        self.client.__exit__(None, None, None)
+        super().tearDown()
+
+    def _start(self, sha="a" * 40, **extra):
+        body = {"agent_id": self.reviewer.id, "repo": "https://github.com/acme/widgets", "pr": 12,
+                "base": "main", "head_sha": sha, "title": "Планировщик v2", **extra}
+        resp = self.client.post("/dev/reviews", json=body)
+        self.assertEqual(resp.status_code, 202, resp.text)
+        return resp.json()
+
+    def _wait(self, review_id):
+        import time
+
+        for _ in range(100):
+            data = self.client.get(f"/dev/reviews/{review_id}").json()
+            if data["status"] != "running":
+                return data
+            time.sleep(0.05)
+        self.fail("ревью не завершилось")
+
+    def test_review_flow(self):
+        started = self._start()
+        self.assertTrue(started["created_chat"])
+        self.assertEqual(started["key"], "github.com/acme/widgets#12")
+        result = self._wait(started["review_id"])
+        self.assertEqual(result["status"], "done", result)
+        self.assertEqual(result["bugs"], ["`app.py:2` — возвращается строка вместо числа → вернуть int [1]"])
+        self.assertEqual(len(result["recommendations"]), 2)
+        self.assertEqual(result["files"][0]["path"], "app.py")
+        self.assertEqual(result["sources"][0]["title"], "README.md")
+        self.assertIn("## AI-ревью · коммит aaaaaaa", result["comment_markdown"])
+        self.assertIn("### Потенциальные баги", result["comment_markdown"])
+        # mcp_server: проект — базовая ветка, diff — PR.
+        self.assertIn(("repo_open", {"link": "https://github.com/acme/widgets/tree/main"}), self.mcp.calls)
+        self.assertIn(("repo_diff", {"repo_id": REPO_ID, "spec": "pr:12", "max_chars": 24000}), self.mcp.calls)
+        # Поиск по базе знаний — запросами по diff (файлы и функции).
+        self.assertTrue(any("app" in q for q, _ in self.kb.queries))
+        # Чат PR: ключ, источник, команды включены, только чтение.
+        chat = self.repo.get_chat(started["chat_id"])
+        self.assertEqual(chat.external_key, "github.com/acme/widgets#12")
+        self.assertEqual(chat.source, "ci")
+        self.assertEqual(chat.title, "PR acme/widgets#12: Планировщик v2")
+        self.assertTrue(chat.settings.dev_commands_enabled)
+        self.assertTrue(chat.settings.dev_read_only)
+        user = [m for m in self.repo.list_messages(chat.id) if m.role == "user"][0]
+        self.assertEqual(user.source, "ci")
+        self.assertEqual(user.content, "/review pr:12 https://github.com/acme/widgets/tree/main")
+
+    def test_same_commit_is_idempotent_new_commit_reuses_chat(self):
+        first = self._start()
+        self._wait(first["review_id"])
+        calls = len(self.provider.calls_log)
+        again = self._start()
+        self.assertEqual(again["review_id"], first["review_id"])
+        self.assertFalse(again["created_chat"])
+        self.assertEqual(len(self.provider.calls_log), calls)
+        newer = self._start(sha="b" * 40)
+        self.assertNotEqual(newer["review_id"], first["review_id"])
+        self.assertEqual(newer["chat_id"], first["chat_id"])
+        self.assertEqual(self._wait(newer["review_id"])["status"], "done")
+        # Другой PR — другой чат; другой агент — свой чат того же PR.
+        other = self._start(pr=13)
+        self.assertNotEqual(other["chat_id"], first["chat_id"])
+        self._wait(other["review_id"])
+
+    def test_agent_by_name_and_errors(self):
+        body = {"agent": "ревьюер", "repo": "https://github.com/acme/widgets", "pr": 1}
+        resp = self.client.post("/dev/reviews", json=body)
+        self.assertEqual(resp.status_code, 202, resp.text)
+        self._wait(resp.json()["review_id"])
+        self.assertEqual(self.client.post("/dev/reviews", json={**body, "agent": "нет такого"}).status_code, 404)
+        self.assertEqual(self.client.post("/dev/reviews", json={**body, "repo": "ftp://x"}).status_code, 400)
+        self.assertEqual(self.client.post("/dev/reviews", json={**body, "head_sha": "zz"}).status_code, 400)
+        self.assertEqual(self.client.get("/dev/reviews/unknown").status_code, 404)
+
+    def test_no_changes_is_failed(self):
+        self.mcp.diff = {"title": "изменения PR #12", "files": [], "untracked": [], "patch": ""}
+        result = self._wait(self._start()["review_id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Нет изменений", result["error"])
+
+    def test_concurrent_find_or_create_single_chat(self):
+        import threading
+
+        from agents_core.ci_review import CiReviewService
+
+        service = CiReviewService(self.repo, None)
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            service.find_or_create_chat(self.reviewer, "github.com/acme/widgets#99", "acme/widgets", 99, None)))
+            for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len({chat.id for chat, _ in results}), 1)
+        self.assertEqual(sum(1 for _, created in results if created), 1)

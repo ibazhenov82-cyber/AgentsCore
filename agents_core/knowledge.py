@@ -181,6 +181,9 @@ class KnowledgeClient:
             "source": {"type": "path", "path": path}, "include": include, "title": title,
         })
 
+    def update_source_include(self, source_id: str, include: List[str]) -> Dict[str, Any]:
+        return self._call("PATCH", f"/sources/{source_id}", {"include": include})
+
     def sync_source(self, source_id: str) -> Dict[str, Any]:
         return self._call("POST", f"/sources/{source_id}/sync")
 

@@ -94,7 +94,7 @@ def chat_out(chat: Chat, stats: dict, repo=None) -> ChatOut:
         settings=settings_out(chat.settings, tools_sources=_tools_sources(repo, chat.settings, chat)),
         stats=chat_stats_out(stats),
         active_profile_id=chat.active_profile_id, invariant_ids=chat.invariant_ids,
-        source=chat.source, active_run=active_run, last_read_message_id=chat.last_read_message_id,
+        source=chat.source, external_key=chat.external_key, active_run=active_run, last_read_message_id=chat.last_read_message_id,
         unread_count=activity.get("unread_count") or 0,
         first_unread_message_id=activity.get("first_unread_message_id"),
         last_message_at=activity.get("last_message_at"),

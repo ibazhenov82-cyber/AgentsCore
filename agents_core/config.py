@@ -200,6 +200,14 @@ class AgentConfig:
             "**/schema*.yml,**/*.schema.json",
         ).split(",") if p.strip()
     ]
+    # Код проекта в той же базе знаний (День 32: RAG «документация + код» для
+    # ревью). Маски через запятую; пусто — только документация.
+    DEV_PROJECT_KB_CODE: List[str] = [
+        p.strip() for p in os.environ.get(
+            "DEV_PROJECT_KB_CODE",
+            "**/*.py,**/*.kt,**/*.kts,**/*.java,**/*.js,**/*.jsx,**/*.ts,**/*.tsx,**/*.go",
+        ).split(",") if p.strip()
+    ]
     # Сколько раундов вызова инструментов у /ask, /explain, /history, /review.
     DEV_MAX_TOOL_ROUNDS: int = int(os.environ.get("DEV_MAX_TOOL_ROUNDS", "10") or "10")
 
@@ -213,6 +221,14 @@ class AgentConfig:
     RUN_EVENTS_TTL: float = float(os.environ.get("AGENT_RUN_EVENTS_TTL", "600") or "600")
     # Сколько дней хранятся записи о завершённых запусках.
     RUN_RETENTION_DAYS: int = int(os.environ.get("AGENT_RUN_RETENTION_DAYS", "30") or "30")
+
+    @classmethod
+    def dev_project_kb_masks(cls) -> List[str]:
+        """Маски файлов базы знаний проекта: документация + код. Без масок
+        документации база не создаётся."""
+        if not cls.DEV_PROJECT_KB_INCLUDE:
+            return []
+        return list(dict.fromkeys(cls.DEV_PROJECT_KB_INCLUDE + cls.DEV_PROJECT_KB_CODE))
 
     @classmethod
     def is_deepseek_configured(cls) -> bool:

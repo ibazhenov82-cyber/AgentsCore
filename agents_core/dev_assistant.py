@@ -135,6 +135,72 @@ _LOCAL_RE = re.compile(r"(?:(?<=\s)|^)((?:~|[A-Za-z]:)?[/\\][^\s<>\"'`]*[/\\][^\
 DEFAULT_PROJECT_HOSTS = ("github.com", "gitlab.com", "gitea.com")
 
 
+#: Заголовки разделов ревью (/review и ревью PR из CI) — по ним ответ
+#: разбирается в структуру (`parse_review`).
+REVIEW_HEADINGS = {
+    "summary": "### Кратко",
+    "bugs": "### Потенциальные баги",
+    "architecture": "### Архитектурные проблемы",
+    "recommendations": "### Рекомендации",
+}
+#: Сколько поисковых запросов по diff.
+REVIEW_RAG_QUERIES = 3
+_SYMBOL_RE = re.compile(
+    r"\b(?:def|class|fun|func|function|interface|object|struct|enum|record)\s+([A-Za-z_][\w]*)")
+_HUNK_RE = re.compile(r"^@@[^@]*@@\s*(.*)$")
+
+
+def review_queries(diff: Dict[str, Any]) -> List[str]:
+    """Поисковые запросы к базе знаний по diff: изменённые файлы (модули) и
+    функции/классы, которые затрагивают изменения."""
+    files = [f.get("path") for f in diff.get("files") or [] if f.get("path")] + list(diff.get("untracked") or [])
+    symbols: List[str] = []
+    for line in (diff.get("patch") or "").splitlines():
+        hunk = _HUNK_RE.match(line)
+        text = hunk.group(1) if hunk else (line[1:] if line[:1] in "+-" and not line.startswith(("+++", "---")) else "")
+        for name in _SYMBOL_RE.findall(text):
+            if name not in symbols:
+                symbols.append(name)
+    queries = []
+    if files:
+        modules = sorted({re.sub(r"\.[^./]+$", "", p).replace("/", " ").replace("_", " ") for p in files})
+        queries.append("Назначение и устройство: " + "; ".join(modules[:8]))
+    if symbols:
+        queries.append("Функции и классы: " + ", ".join(symbols[:10]))
+        queries.append("Где используются " + ", ".join(symbols[:5]))
+    return queries[:REVIEW_RAG_QUERIES]
+
+
+def parse_review(text: str) -> Dict[str, Any]:
+    """Ответ ревью → {"summary", "bugs", "architecture", "recommendations"}:
+    разделы по заголовкам `REVIEW_HEADINGS`, пункты — строки списка
+    (продолжения строк приклеиваются к пункту). «нет» — пустой раздел."""
+    titles = {v.lstrip("# ").strip().lower(): k for k, v in REVIEW_HEADINGS.items()}
+    sections: Dict[str, Any] = {"summary": "", "bugs": [], "architecture": [], "recommendations": []}
+    current: Optional[str] = None
+    summary_lines: List[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        heading = re.match(r"^(?:#{1,6}\s*|\*\*)(.+?)(?:\*\*)?:?\s*$", line)
+        if heading and heading.group(1).strip(" *:").lower() in titles:
+            current = titles[heading.group(1).strip(" *:").lower()]
+            continue
+        if current is None or not line:
+            continue
+        if current == "summary":
+            summary_lines.append(line)
+            continue
+        item = re.match(r"^(?:[-*•]|\d+[.)])\s+(.*)$", line)
+        if item:
+            value = item.group(1).strip()
+            if value.lower().strip(".") not in ("нет", "не найдено", "замечаний нет"):
+                sections[current].append(value)
+        elif sections[current]:
+            sections[current][-1] += " " + line
+    sections["summary"] = " ".join(summary_lines).strip()
+    return sections
+
+
 class DevError(Exception):
     """Ожидаемая ошибка команды — показывается в чате как ответ."""
 
@@ -162,15 +228,17 @@ def _url_host(url: str) -> str:
     return (m.group(1) if m else "").lower()
 
 
-def find_link(text: str, hosts: Tuple[str, ...] = DEFAULT_PROJECT_HOSTS) -> Optional[str]:
+def find_link(text: str, hosts: Tuple[str, ...] = DEFAULT_PROJECT_HOSTS, any_host: bool = False) -> Optional[str]:
     """Ссылка на репозиторий в тексте: URL известного хостинга с путём
-    owner/repo или абсолютный локальный путь."""
+    owner/repo или абсолютный локальный путь. `any_host` — в аргументах явной
+    команды (`/review pr:12 https://git.example.com/o/r`) хост любой: какие
+    разрешены, решает mcp_server."""
     for match in _URL_RE.finditer(text or ""):
         url = match.group(0).rstrip(".,;:!?»")
         host = _url_host(url[4:] if url.startswith("git@") else url)
         if host.startswith("www."):
             host = host[4:]
-        if host not in hosts:
+        if host not in hosts and not any_host:
             continue
         path = re.sub(r"^(?:https?://[^/]+|git@[^:]+:)", "", url)
         if len([p for p in path.split("/") if p]) >= 2:
@@ -259,7 +327,7 @@ class DevAssistant:
             if name == "project":
                 return Route("project", args, link=args or None)
             if name in ("ask", "explain", "history", "review"):
-                link = find_link(args)
+                link = find_link(args, any_host=True)
                 if link:
                     return Route(name, _strip_link(args, link), link=link, link_auto=True)
             return Route(name, args)
@@ -377,13 +445,15 @@ class DevAssistant:
         репозитория (маски `DEV_PROJECT_KB_INCLUDE`); при повторном открытии —
         синхронизация (knowledge_service переиндексирует только изменённое)."""
         kb = self.repo._knowledge
-        include = list(AgentConfig.DEV_PROJECT_KB_INCLUDE)
+        include = AgentConfig.dev_project_kb_masks()
         if kb is None or not include or not project.path:
             project.index_status, project.index_error = "", None
             return
         try:
             if project.collection_id and project.source_id:
                 try:
+                    # Маски могли измениться (например, включили код) — источник обновляется.
+                    kb.update_source_include(project.source_id, include)
                     started = kb.sync_source(project.source_id)
                     project.index_job_id = started.get("job_id")
                     project.index_status, project.index_error = "indexing", None
@@ -415,6 +485,8 @@ class DevAssistant:
                 project.index_job_id = added.get("job_id")
             else:
                 project.source_id = source.get("id")
+                if list(source.get("include") or []) != include:
+                    kb.update_source_include(project.source_id, include)
                 project.index_job_id = kb.sync_source(project.source_id).get("job_id")
             project.index_status, project.index_error = "indexing", None
         except KnowledgeServiceError as exc:
@@ -821,11 +893,25 @@ class DevAssistant:
                     "repo_show, для важных строк — repo_blame. Дай хронологию значимых изменений (sha, дата, автор, "
                     "что и зачем изменилось — по сообщениям коммитов и диффам).")
         if cmd == "review":
+            pr = re.match(r"^(?:pr|mr)[:/#]?(\d+)$|^#(\d+)$", (args or "").strip(), re.I)
+            pr_hint = ""
+            if pr:
+                number = pr.group(1) or pr.group(2)
+                pr_hint = (f"Это pull request #{number}: рабочая копия — базовая ветка, поэтому код из PR читай с "
+                           f"ref=\"pr:{number}\" (repo_read_file, repo_grep).\n")
             return (
-                "Сделай код-ревью изменений ниже. Для контекста читай нужные файлы (repo_read_file, repo_grep).\n"
-                "Формат: 1) краткое резюме изменений; 2) замечания по важности — «Критично», «Важно», «Мелочи» — "
-                "с `файл:строка`, объяснением и предложением исправления; 3) что сделано хорошо. "
-                "Не придумывай проблем, которых нет; если замечаний нет — так и скажи.\n\n" + extra
+                "Сделай код-ревью изменений ниже. Фрагменты [n] — документация и связанный код проекта из базы "
+                "знаний; при необходимости читай файлы (repo_read_file, repo_grep).\n" + pr_hint
+                + "Ответ строго в формате (заголовки — ровно такие):\n"
+                f"{REVIEW_HEADINGS['summary']}\n1–3 предложения: что меняет PR.\n"
+                f"{REVIEW_HEADINGS['bugs']}\nошибки и риски на выполнении: неверная логика, граничные случаи, "
+                "исключения, гонки, безопасность, утечки ресурсов.\n"
+                f"{REVIEW_HEADINGS['architecture']}\nнарушение структуры и договорённостей проекта (по "
+                "документации [n]), связность, дублирование, неверный слой, несовместимость API.\n"
+                f"{REVIEW_HEADINGS['recommendations']}\nчто улучшить: тесты, читаемость, документация.\n"
+                "В каждом разделе — список «- `файл:строка` — проблема → как исправить», со ссылкой [n], если "
+                "опираешься на фрагмент. Пустой раздел — строка «- нет». Не придумывай проблем, которых нет.\n\n"
+                + extra
             )
         return args
 
@@ -842,6 +928,7 @@ class DevAssistant:
         if cmd.name == "ask" and not route.args:
             raise DevError("Задайте вопрос: `/ask <вопрос>`.")
         extra = ""
+        diff: Optional[Dict[str, Any]] = None
         if cmd.name == "review":
             yield {"type": "status", "status": "Получаю изменения для ревью"}
             diff = self.call("repo_diff", chat.id, repo_id=project.repo_id, spec=route.args or None,
@@ -871,8 +958,9 @@ class DevAssistant:
         acc = _TurnAccumulator()
         acc.inject_args = inject
         rag: Optional[RagOutcome] = None
-        if cmd.name in ("ask", "explain"):
-            rag = yield from self._search_docs(chat, project, route.args)
+        if cmd.name in ("ask", "explain", "review"):
+            queries = review_queries(diff) if diff is not None else [route.args]
+            rag = yield from self._search_docs(chat, project, route.args, queries=queries)
             if rag is not None:
                 acc.rag = rag.to_dict()
                 yield {"type": "rag_context", "rag": acc.rag}
@@ -901,12 +989,20 @@ class DevAssistant:
         if rag is not None:
             final_content = finalize_answer(final_content, rag)
             acc.rag = rag.to_dict()
-        if notes:
+        if notes and cmd.name != "review":
             final_content = "\n".join(notes) + "\n\n" + final_content
         if final_result.usage.prompt_tokens is not None:
             self._db.update_message_prompt_tokens(user_msg.id, final_result.usage.prompt_tokens)
         meta = {"name": cmd.name, "role": "result", "kind": "llm", "context": True,
                 "project": project.name, "implicit": route.implicit}
+        if diff is not None:
+            # Ревью — ещё и структурой: разделы, файлы diff (для CI и карточки).
+            meta["card"] = {
+                "type": "review", "title": diff.get("title"), "spec": route.args or None,
+                "files": [{k: f.get(k) for k in ("path", "status", "additions", "deletions")}
+                          for f in diff.get("files") or []],
+                "stats": diff.get("stats"), **parse_review(final_content),
+            }
         saved = repo._finalize_draft(
             draft, content=final_content, status="complete", result=final_result,
             duration_ms=int((time.monotonic() - started) * 1000), acc=acc, command=meta,
@@ -915,30 +1011,47 @@ class DevAssistant:
         yield {"type": "message_saved", "message": saved}
         yield {"type": "done", "message": saved}
 
-    def _search_docs(self, chat: Chat, project: ChatProject, query: str) -> Iterator[dict]:
-        """Поиск по базе знаний проекта (и базам агента, если у него включён
-        RAG). None — искать негде."""
+    def _search_docs(self, chat: Chat, project: ChatProject, query: str,
+                     queries: Optional[List[str]] = None) -> Iterator[dict]:
+        """Поиск по базе знаний проекта (документация и код) и базам агента,
+        если у него включён RAG. Несколько запросов (ревью — по файлам и
+        функциям из diff) объединяются: без повторов, лучшие сверху. None —
+        искать негде."""
         kb = self.repo._knowledge
         settings = chat.settings
         collections = [project.collection_id] if project.collection_id else []
         if settings.rag_enabled:
             collections += [c for c in settings.collection_ids if c not in collections]
-        if kb is None or not collections or not query.strip():
+        queries = [q.strip() for q in (queries or [query]) if q and q.strip()]
+        if kb is None or not collections or not queries:
             return None
-        yield {"type": "status", "status": "Поиск в документации проекта"}
-        outcome = RagOutcome(query=query.strip(), status=RAG_STATUS_OK, only_from_kb=False,
-                             original_query=query.strip(), quotes_required=False,
-                             params={"top_k": settings.rag_top_k, "score_threshold": settings.rag_score_threshold})
-        try:
-            found = kb.retrieve(query, collections, settings.rag_top_k, settings.rag_score_threshold,
-                                candidate_k=max(settings.rag_candidate_k, settings.rag_top_k),
-                                rerank=settings.rag_rerank, rerank_model=settings.rag_rerank_model or None,
-                                rerank_threshold=settings.rag_rerank_threshold)
-            outcome.stages = found.get("stages") or {}
-            outcome.rerank = found.get("rerank") or {}
-            outcome.sources = select_sources(found["results"], settings.rag_context_tokens)
-            if not outcome.sources:
-                outcome.status = RAG_STATUS_NOT_FOUND
-        except KnowledgeServiceError as exc:
-            outcome.status, outcome.error = RAG_STATUS_UNAVAILABLE, str(exc)
+        yield {"type": "status", "status": "Поиск в документации и коде проекта"}
+        outcome = RagOutcome(query=" | ".join(queries), status=RAG_STATUS_OK, only_from_kb=False,
+                             original_query=(query or queries[0]).strip(), quotes_required=False,
+                             params={"top_k": settings.rag_top_k, "score_threshold": settings.rag_score_threshold,
+                                     "queries": len(queries)})
+        merged: Dict[Any, Dict[str, Any]] = {}
+        errors = []
+        for q in queries:
+            try:
+                found = kb.retrieve(q, collections, settings.rag_top_k, settings.rag_score_threshold,
+                                    candidate_k=max(settings.rag_candidate_k, settings.rag_top_k),
+                                    rerank=settings.rag_rerank, rerank_model=settings.rag_rerank_model or None,
+                                    rerank_threshold=settings.rag_rerank_threshold)
+            except KnowledgeServiceError as exc:
+                errors.append(str(exc))
+                continue
+            outcome.stages = found.get("stages") or outcome.stages
+            outcome.rerank = found.get("rerank") or outcome.rerank
+            for item in found.get("results") or []:
+                key = item.get("chunk_id") or id(item)
+                if key not in merged or (item.get("score") or 0) > (merged[key].get("score") or 0):
+                    merged[key] = item
+        if errors and not merged:
+            outcome.status, outcome.error = RAG_STATUS_UNAVAILABLE, errors[0]
+            return outcome
+        ranked = sorted(merged.values(), key=lambda r: -(r.get("score") or 0))
+        outcome.sources = select_sources(ranked, settings.rag_context_tokens)
+        if not outcome.sources:
+            outcome.status = RAG_STATUS_NOT_FOUND
         return outcome
