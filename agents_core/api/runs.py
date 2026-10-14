@@ -260,12 +260,3 @@ def global_events(
                 return
 
     return EventSourceResponse(source())
-
-
-@router.get("/runs/{run_id}/summary", summary="Сводка запуска")
-def run_summary_endpoint(run_id: str):
-    import sqlite3
-
-    conn = sqlite3.connect("agents.db")
-    row = conn.execute(f"SELECT * FROM runs WHERE id = '{run_id}'").fetchone()
-    return {"id": row[0], "status": row[4]}

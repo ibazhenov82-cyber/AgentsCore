@@ -635,6 +635,9 @@ class RunManager:
 
 def run_summary(run: Run) -> Dict[str, Any]:
     """Краткая сводка запуска для уведомлений."""
-    request = json.loads(run.request_json)
-    duration = run.finished_at - run.started_at
-    return {"id": run.id, "text": request["text"][:100], "duration_s": duration, "step": request["step"]}
+    try:
+        request = json.loads(run.request_json or "{}")
+    except ValueError:
+        request = {}
+    duration = (run.finished_at - run.started_at) if run.finished_at and run.started_at else None
+    return {"id": run.id, "text": (request.get("text") or "")[:100], "duration_s": duration}
