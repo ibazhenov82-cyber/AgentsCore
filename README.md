@@ -1046,3 +1046,4 @@ data: {"seq": 9, "type": "done", "message": {"id": 4, "role": "assistant", "cont
 pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
+# проверка AI-ревью
